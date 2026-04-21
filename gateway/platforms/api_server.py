@@ -579,6 +579,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         memory_recall_callback=None,
+        # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+        continuation_callback=None,
+        # HERMES-HOOK-CONTINUATION-SSE-END
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> Any:
@@ -638,6 +641,9 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
             memory_recall_callback=memory_recall_callback,
+            # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+            continuation_callback=continuation_callback,
+            # HERMES-HOOK-CONTINUATION-SSE-END
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             **identity_kwargs,
@@ -907,6 +913,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             # HERMES-HOOK-MEMORY-RECALL-SSE-END
 
+            # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+            def _on_continuation(task_summary: str, **extra: Any) -> None:
+                """Push a continuation suggestion as a tagged SSE tuple.
+
+                Called (at most once per turn) from the continuation probe
+                thread when a memory provider with reasoning capability
+                reports that the user left a task incomplete in a prior
+                session. SSE writer dispatches ``("__continuation__",
+                payload)`` as ``event: hermes.continuation.suggested``.
+                """
+                if not task_summary:
+                    return
+                payload = {
+                    "task_summary": task_summary,
+                    "confidence": extra.get("confidence", "low"),
+                }
+                if "last_session_age_hours" in extra:
+                    payload["last_session_age_hours"] = extra["last_session_age_hours"]
+                _stream_q.put(("__continuation__", payload))
+            # HERMES-HOOK-CONTINUATION-SSE-END
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -919,6 +946,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_on_delta,
                     tool_progress_callback=_on_tool_progress,
                     memory_recall_callback=_on_memory_recall,
+                    # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+                    continuation_callback=_on_continuation,
+                    # HERMES-HOOK-CONTINUATION-SSE-END
                     agent_ref=agent_ref,
                     user_id=_caller_user_id,
                     tenant_id=_caller_tenant_id,
@@ -1089,6 +1119,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.memory.recalled\ndata: {event_data}\n\n".encode()
                     )
+                # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+                elif (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and item[0] == "__continuation__"
+                ):
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.continuation.suggested\ndata: {event_data}\n\n".encode()
+                    )
+                # HERMES-HOOK-CONTINUATION-SSE-END
                 else:
                     content_chunk = {
                         "id": completion_id,
@@ -2379,6 +2420,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         memory_recall_callback=None,
+        # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+        continuation_callback=None,
+        # HERMES-HOOK-CONTINUATION-SSE-END
         agent_ref: Optional[list] = None,
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
@@ -2405,6 +2449,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 memory_recall_callback=memory_recall_callback,
+                # HERMES-HOOK-CONTINUATION-SSE-BEGIN
+                continuation_callback=continuation_callback,
+                # HERMES-HOOK-CONTINUATION-SSE-END
                 user_id=user_id,
                 tenant_id=tenant_id,
             )

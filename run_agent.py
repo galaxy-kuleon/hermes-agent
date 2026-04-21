@@ -600,6 +600,9 @@ class AIAgent:
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
         memory_recall_callback: callable = None,
+        # HERMES-HOOK-CONTINUATION-HOOK-BEGIN
+        continuation_callback: callable = None,
+        # HERMES-HOOK-CONTINUATION-HOOK-END
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
@@ -797,6 +800,9 @@ class AIAgent:
         self.tool_start_callback = tool_start_callback
         self.tool_complete_callback = tool_complete_callback
         self.memory_recall_callback = memory_recall_callback
+        # HERMES-HOOK-CONTINUATION-HOOK-BEGIN
+        self.continuation_callback = continuation_callback
+        # HERMES-HOOK-CONTINUATION-HOOK-END
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
@@ -1440,6 +1446,30 @@ class AIAgent:
                         logger.info(
                             "Memory provider '%s' activated", _mem_provider_name
                         )
+                        # HERMES-HOOK-CONTINUATION-HOOK-BEGIN
+                        # Capability-gated continuation detection: if any registered
+                        # provider exposes a reasoning-style tool (honcho_reasoning or
+                        # similar *_reasoning), ask "did the user leave a task
+                        # incomplete last session?". Bounded-timeout background thread
+                        # so first-turn latency is unaffected. Skipped silently when
+                        # no capable provider is present (e.g. holographic-only runs).
+                        if self.continuation_callback is not None:
+                            try:
+                                from agent._continuation_probe import (
+                                    maybe_emit_continuation as _maybe_emit_cont,
+                                )
+                                _maybe_emit_cont(
+                                    self._memory_manager,
+                                    self.continuation_callback,
+                                    identity_kwargs={
+                                        k: _init_kwargs[k]
+                                        for k in ("user_id", "tenant_id")
+                                        if k in _init_kwargs
+                                    },
+                                )
+                            except Exception as _e:
+                                logger.debug("Continuation probe failed to dispatch: %s", _e)
+                        # HERMES-HOOK-CONTINUATION-HOOK-END
                     else:
                         logger.debug(
                             "Memory provider '%s' not found or not available",
