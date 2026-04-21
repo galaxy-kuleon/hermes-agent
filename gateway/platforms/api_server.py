@@ -2485,6 +2485,131 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    # HERMES-HOOK-MEMORY-TOOL-ROUTE-BEGIN
+    async def _handle_memory_tool(self, request: "web.Request") -> "web.Response":
+        """POST /v1/memory/tool — admin/inspection endpoint for memory providers.
+
+        Body JSON shape:
+            {
+              "tool_name": "fact_store",
+              "args": {"action": "list", "limit": 50},
+              "user_id": "alice",       # optional; scopes provider kwargs
+              "tenant_id": "acme"       # optional; scopes provider kwargs
+            }
+
+        Dispatches to memory_manager.handle_tool_call with the same user_id /
+        tenant_id kwarg contract as the chat-completion path (W1). Honours the
+        same "empty-as-absent" semantics — falsy scoping values are omitted so
+        providers fall back to their default peer resolution.
+
+        Does NOT go through AIAgent / run_agent — constructs a lightweight
+        MemoryManager + loads the configured provider on demand. Admin path,
+        no LLM in the loop.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body", err_type="invalid_request_error"),
+                status=400,
+            )
+
+        tool_name = body.get("tool_name", "").strip()
+        args = body.get("args") or {}
+        if not tool_name or not isinstance(args, dict):
+            return web.json_response(
+                _openai_error(
+                    "Missing required fields: tool_name (str) + args (dict)",
+                    err_type="invalid_request_error",
+                ),
+                status=400,
+            )
+
+        raw_user_id = (body.get("user_id") or "").strip() or None
+        raw_tenant_id = (body.get("tenant_id") or "").strip() or None
+
+        # Build kwargs with the same "falsy-elides, truthy-forwards" discipline
+        # established in W1 for AIAgent -> memory_manager.initialize_all.
+        identity_kwargs: Dict[str, str] = {}
+        if raw_user_id:
+            identity_kwargs["user_id"] = raw_user_id
+        if raw_tenant_id:
+            identity_kwargs["tenant_id"] = raw_tenant_id
+
+        # Build a lightweight MemoryManager, install the configured provider.
+        mgr = None
+        try:
+            from agent.memory_manager import MemoryManager
+            from plugins.memory import load_memory_provider
+
+            mgr = MemoryManager()
+
+            # Load the active external provider from config.yaml — mirrors the
+            # run_agent.py:1388-1395 registration path so the same tool schemas
+            # this endpoint accepts are exactly the ones the running agent uses.
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config()
+                provider_name = (cfg.get("memory") or {}).get("provider") or ""
+            except Exception:
+                provider_name = ""
+            if provider_name:
+                external = load_memory_provider(provider_name)
+                if external and external.is_available():
+                    try:
+                        mgr.add_provider(external)
+                    except Exception as e:
+                        logger.debug(
+                            "Memory provider '%s' registration failed for tool call: %s",
+                            provider_name, e,
+                        )
+
+            # Initialise providers with a synthetic session_id + identity kwargs.
+            # Synthetic session_id keeps admin calls out of the regular session
+            # history; providers that namespace by session will scope to this tag.
+            synthetic_session = f"admin-memory-tool-{int(time.time()*1000)}"
+            mgr.initialize_all(session_id=synthetic_session, **identity_kwargs)
+
+            # Dispatch the tool call. The MemoryManager routes by tool_name to
+            # whichever provider registered that tool schema.
+            result = mgr.handle_tool_call(tool_name, args, **identity_kwargs)
+
+            # Provider returns either a JSON string (most common in our
+            # codebase — see fact_store / honcho handlers) or a raw dict.
+            payload: Any
+            if isinstance(result, str):
+                try:
+                    payload = json.loads(result)
+                except Exception:
+                    payload = {"result": result}
+            else:
+                payload = result
+
+            return web.json_response({"result": payload})
+
+        except Exception as e:
+            logger.warning("Memory tool dispatch failed: %s", e, exc_info=True)
+            return web.json_response(
+                _openai_error(
+                    f"Memory tool failed: {e}",
+                    err_type="memory_tool_error",
+                ),
+                status=500,
+            )
+        finally:
+            # Best-effort cleanup for providers that opened threads.
+            if mgr is not None:
+                try:
+                    mgr.shutdown_all()
+                except Exception:
+                    pass
+
+    # HERMES-HOOK-MEMORY-TOOL-ROUTE-END
+
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         auth_err = self._check_auth(request)
@@ -2800,6 +2925,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/api/jobs/{job_id}/resume", self._handle_resume_job
             )
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # HERMES-HOOK-MEMORY-TOOL-ROUTE-BEGIN
+            self._app.router.add_post("/v1/memory/tool", self._handle_memory_tool)
+            # HERMES-HOOK-MEMORY-TOOL-ROUTE-END
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get(
