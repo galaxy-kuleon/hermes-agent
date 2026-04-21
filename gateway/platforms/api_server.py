@@ -578,6 +578,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        memory_recall_callback=None,
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> Any:
@@ -636,6 +637,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            memory_recall_callback=memory_recall_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             **identity_kwargs,
@@ -881,6 +883,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 )
 
+            # HERMES-HOOK-MEMORY-RECALL-SSE-BEGIN
+            def _on_memory_recall(prefetch_text: str):
+                """Push memory-recall context as a tagged SSE tuple.
+
+                Called once per turn from run_agent.py after prefetch_all()
+                returns non-empty text.  The SSE writer dispatches
+                ``("__memory_recall__", payload)`` as ``event: hermes.memory.recalled``.
+                No-op when prefetch_text is falsy (guard is in run_agent.py but
+                we double-check here for safety).
+                """
+                if not prefetch_text:
+                    return
+                _stream_q.put(
+                    (
+                        "__memory_recall__",
+                        {
+                            "provider": "holographic",
+                            "context_preview": prefetch_text[:200],
+                            "context_token_estimate": len(prefetch_text) // 4,
+                        },
+                    )
+                )
+            # HERMES-HOOK-MEMORY-RECALL-SSE-END
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -892,6 +918,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_on_delta,
                     tool_progress_callback=_on_tool_progress,
+                    memory_recall_callback=_on_memory_recall,
                     agent_ref=agent_ref,
                     user_id=_caller_user_id,
                     tenant_id=_caller_tenant_id,
@@ -1052,6 +1079,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                elif (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and item[0] == "__memory_recall__"
+                ):
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.memory.recalled\ndata: {event_data}\n\n".encode()
                     )
                 else:
                     content_chunk = {
@@ -2342,6 +2378,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        memory_recall_callback=None,
         agent_ref: Optional[list] = None,
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
@@ -2367,6 +2404,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                memory_recall_callback=memory_recall_callback,
                 user_id=user_id,
                 tenant_id=tenant_id,
             )

@@ -599,6 +599,7 @@ class AIAgent:
         tool_progress_callback: callable = None,
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
+        memory_recall_callback: callable = None,
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
@@ -795,6 +796,7 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.tool_start_callback = tool_start_callback
         self.tool_complete_callback = tool_complete_callback
+        self.memory_recall_callback = memory_recall_callback
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
@@ -9689,6 +9691,16 @@ class AIAgent:
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
             except Exception:
                 pass
+
+        # HERMES-HOOK-MEMORY-RECALL-SSE-BEGIN
+        # Emit memory recall event to any registered callback (e.g. api_server SSE writer).
+        # Only fires when prefetch returned non-empty context; silently skipped otherwise.
+        if _ext_prefetch_cache and self.memory_recall_callback:
+            try:
+                self.memory_recall_callback(_ext_prefetch_cache)
+            except Exception:
+                pass
+        # HERMES-HOOK-MEMORY-RECALL-SSE-END
 
         while (
             api_call_count < self.max_iterations and self.iteration_budget.remaining > 0
