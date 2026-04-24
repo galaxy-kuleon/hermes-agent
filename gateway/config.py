@@ -616,6 +616,8 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
+                if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
+                    os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
 
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
@@ -685,6 +687,11 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
+                if "group_allowed_chats" in telegram_cfg and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
+                    gac = telegram_cfg["group_allowed_chats"]
+                    if isinstance(gac, list):
+                        gac = ",".join(str(v) for v in gac)
+                    os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(gac)
                 if "disable_link_previews" in telegram_cfg:
                     plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
                     if not isinstance(plat_data, dict):
