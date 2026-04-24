@@ -2532,6 +2532,178 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    @staticmethod
+    def _parse_memory_tool_result(result: Any) -> Any:
+        """Normalize provider tool output into a plain dict/list payload."""
+        if isinstance(result, str):
+            try:
+                return json.loads(result)
+            except Exception:
+                return {"result": result}
+        return result
+
+    @staticmethod
+    def _extract_honcho_card(payload: Any) -> list[str]:
+        """Pull a plain list of card facts out of honcho_profile results."""
+        if not isinstance(payload, dict):
+            return []
+
+        direct_card = payload.get("card")
+        if isinstance(direct_card, list):
+            return [str(item) for item in direct_card if item]
+
+        result = payload.get("result")
+        if isinstance(result, list):
+            return [str(item) for item in result if item]
+
+        if isinstance(result, dict):
+            nested_card = result.get("card")
+            if isinstance(nested_card, list):
+                return [str(item) for item in nested_card if item]
+
+        return []
+
+    @staticmethod
+    def _format_fact_list(card: list[str]) -> dict[str, Any]:
+        facts = [{"id": idx, "content": fact} for idx, fact in enumerate(card, start=1)]
+        return {"facts": facts, "count": len(facts)}
+
+    def _dispatch_fact_store_honcho_compat(
+        self,
+        mgr: Any,
+        args: Dict[str, Any],
+        *,
+        identity_kwargs: Dict[str, str],
+    ) -> Any:
+        """Translate legacy fact_store admin calls onto honcho_* tools.
+
+        This keeps existing callers working after memory.provider switches from
+        holographic to honcho without reintroducing the legacy tool into the
+        agent-facing prompt/tool surface.
+        """
+
+        def call(tool_name: str, tool_args: Dict[str, Any]) -> Any:
+            return self._parse_memory_tool_result(
+                mgr.handle_tool_call(tool_name, tool_args, **identity_kwargs)
+            )
+
+        def maybe_error(payload: Any) -> Any | None:
+            if isinstance(payload, dict) and payload.get("error"):
+                return payload
+            return None
+
+        action = str(args.get("action") or "list").strip().lower()
+
+        if action == "list":
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+            return self._format_fact_list(self._extract_honcho_card(profile))
+
+        if action == "add":
+            content = str(args.get("content") or "").strip()
+            if not content:
+                return {"error": "Content is required for 'add' action."}
+
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+
+            card = self._extract_honcho_card(profile)
+            updated = list(card)
+            if content not in updated:
+                updated.append(content)
+
+            write = call("honcho_profile", {"peer": "user", "card": updated})
+            err = maybe_error(write)
+            if err is not None:
+                return err
+
+            return {
+                "fact_id": updated.index(content) + 1,
+                "status": "added" if len(updated) > len(card) else "exists",
+            }
+
+        if action == "remove":
+            fact_id_raw = args.get("fact_id")
+            try:
+                fact_id = int(fact_id_raw)
+            except (TypeError, ValueError):
+                return {"error": "fact_id must be an integer for 'remove' action."}
+
+            if fact_id < 1:
+                return {"removed": False}
+
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+
+            card = self._extract_honcho_card(profile)
+            if fact_id > len(card):
+                return {"removed": False}
+
+            updated = [fact for idx, fact in enumerate(card, start=1) if idx != fact_id]
+            write = call("honcho_profile", {"peer": "user", "card": updated})
+            err = maybe_error(write)
+            if err is not None:
+                return err
+
+            return {"removed": True}
+
+        if action == "search":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return {"error": "query is required for 'search' action."}
+
+            try:
+                limit = max(1, min(int(args.get("limit", 10)), 50))
+            except (TypeError, ValueError):
+                limit = 10
+
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+
+            card = self._extract_honcho_card(profile)
+            q_lower = query.lower()
+            card_hits = [fact for fact in card if q_lower in fact.lower()]
+            if card_hits:
+                results = [
+                    {"id": idx, "content": fact}
+                    for idx, fact in enumerate(card_hits[:limit], start=1)
+                ]
+                return {"results": results, "count": len(results)}
+
+            search = call("honcho_search", {"peer": "user", "query": query, "max_tokens": 2000})
+            err = maybe_error(search)
+            if err is not None:
+                return err
+
+            text = str(search.get("result") or "").strip()
+            if not text or text == "No relevant context found.":
+                return {"results": [], "count": 0}
+
+            seen: set[str] = set()
+            parsed: list[str] = []
+            for raw_line in text.splitlines():
+                line = raw_line.lstrip("-* ").strip()
+                if not line or line.startswith("##") or line in seen:
+                    continue
+                seen.add(line)
+                parsed.append(line)
+
+            results = [
+                {"id": idx, "content": line}
+                for idx, line in enumerate(parsed[:limit], start=1)
+            ]
+            return {"results": results, "count": len(results)}
+
+        return {"error": f"Unknown fact_store action: {action}"}
+
     # HERMES-HOOK-MEMORY-TOOL-ROUTE-BEGIN
     async def _handle_memory_tool(self, request: "web.Request") -> "web.Response":
         """POST /v1/memory/tool — admin/inspection endpoint for memory providers.
@@ -2623,18 +2795,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Dispatch the tool call. The MemoryManager routes by tool_name to
             # whichever provider registered that tool schema.
-            result = mgr.handle_tool_call(tool_name, args, **identity_kwargs)
-
-            # Provider returns either a JSON string (most common in our
-            # codebase — see fact_store / honcho handlers) or a raw dict.
             payload: Any
-            if isinstance(result, str):
-                try:
-                    payload = json.loads(result)
-                except Exception:
-                    payload = {"result": result}
+            if provider_name == "honcho" and tool_name == "fact_store":
+                payload = self._dispatch_fact_store_honcho_compat(
+                    mgr,
+                    args,
+                    identity_kwargs=identity_kwargs,
+                )
             else:
-                payload = result
+                result = mgr.handle_tool_call(tool_name, args, **identity_kwargs)
+                payload = self._parse_memory_tool_result(result)
 
             return web.json_response({"result": payload})
 

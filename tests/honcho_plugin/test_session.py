@@ -205,12 +205,12 @@ class TestPeerLookupHelpers:
 
     def test_get_peer_card_uses_direct_peer_lookup(self):
         mgr, session = self._make_cached_manager()
-        assistant_peer = MagicMock()
-        assistant_peer.get_card.return_value = ["Name: Robert"]
-        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+        user_peer = MagicMock()
+        user_peer.get_card.return_value = ["Name: Robert"]
+        mgr._get_or_create_peer = MagicMock(return_value=user_peer)
 
         assert mgr.get_peer_card(session.key) == ["Name: Robert"]
-        assistant_peer.get_card.assert_called_once_with(target=session.user_peer_id)
+        user_peer.get_card.assert_called_once_with()
 
     def test_search_context_uses_assistant_perspective_with_target(self):
         mgr, session = self._make_cached_manager()

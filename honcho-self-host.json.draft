@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "baseUrl": "http://127.0.0.1:8000",
+  "workspace": "hermes",
+  "recallMode": "hybrid",
+  "writeFrequency": "async",
+  "saveMessages": true,
+  "sessionStrategy": "per-directory",
+  "observationMode": "directional",
+  "dialecticReasoningLevel": "low",
+  "dialecticDynamic": true,
+  "dialecticMaxChars": 600,
+  "dialecticDepth": 1,
+  "messageMaxChars": 25000,
+  "dialecticMaxInputChars": 10000,
+  "hosts": {
+    "hermes": {
+      "enabled": true
+    }
+  }
+}

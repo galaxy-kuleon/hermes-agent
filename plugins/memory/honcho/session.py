@@ -1016,8 +1016,12 @@ class HonchoSessionManager:
             return []
 
         try:
-            observer_peer_id, target_peer_id = self._resolve_observer_target(session, peer)
-            return self._fetch_peer_card(observer_peer_id, target=target_peer_id)
+            target_peer_id = self._resolve_peer_id(session, peer)
+            if target_peer_id is None:
+                return []
+            # Keep reads aligned with set_peer_card(), which writes the peer's own
+            # card rather than the assistant's observer view of that peer.
+            return self._fetch_peer_card(target_peer_id)
         except Exception as e:
             logger.debug("Failed to fetch peer card from Honcho: %s", e)
             return []

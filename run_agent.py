@@ -1466,6 +1466,7 @@ class AIAgent:
                                         for k in ("user_id", "tenant_id")
                                         if k in _init_kwargs
                                     },
+                                    _synchronous=True,
                                 )
                             except Exception as _e:
                                 logger.debug("Continuation probe failed to dispatch: %s", _e)
