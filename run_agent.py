@@ -781,6 +781,8 @@ class AIAgent:
         tool_progress_callback: callable = None,
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
+        memory_recall_callback: callable = None,
+        continuation_callback: callable = None,
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
@@ -802,6 +804,7 @@ class AIAgent:
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        tenant_id: str | None = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -876,6 +879,7 @@ class AIAgent:
         self._chat_type = chat_type
         self._thread_id = thread_id
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self._tenant_id = tenant_id  # Tenancy scope for per-tenant memory isolation
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -986,6 +990,8 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.tool_start_callback = tool_start_callback
         self.tool_complete_callback = tool_complete_callback
+        self.memory_recall_callback = memory_recall_callback
+        self.continuation_callback = continuation_callback
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
@@ -1552,6 +1558,8 @@ class AIAgent:
                         # Thread gateway user identity for per-user memory scoping
                         if self._user_id:
                             _init_kwargs["user_id"] = self._user_id
+                        if self._tenant_id:
+                            _init_kwargs["tenant_id"] = self._tenant_id
                         if self._user_name:
                             _init_kwargs["user_name"] = self._user_name
                         if self._chat_id:
@@ -1574,6 +1582,26 @@ class AIAgent:
                         except Exception:
                             pass
                         self._memory_manager.initialize_all(**_init_kwargs)
+                        if self.continuation_callback is not None:
+                            try:
+                                from agent._continuation_probe import (
+                                    maybe_emit_continuation as _maybe_emit_cont,
+                                )
+
+                                _maybe_emit_cont(
+                                    self._memory_manager,
+                                    self.continuation_callback,
+                                    identity_kwargs={
+                                        k: _init_kwargs[k]
+                                        for k in ("user_id", "tenant_id")
+                                        if k in _init_kwargs
+                                    },
+                                    _synchronous=True,
+                                )
+                            except Exception as _e:
+                                logger.debug(
+                                    "Continuation probe failed to dispatch: %s", _e
+                                )
                         logger.info("Memory provider '%s' activated", _mem_provider_name)
                     else:
                         logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
@@ -9234,6 +9262,12 @@ class AIAgent:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+            except Exception:
+                pass
+
+        if _ext_prefetch_cache and self.memory_recall_callback:
+            try:
+                self.memory_recall_callback(_ext_prefetch_cache)
             except Exception:
                 pass
 

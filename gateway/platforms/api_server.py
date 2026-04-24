@@ -709,6 +709,10 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        memory_recall_callback=None,
+        continuation_callback=None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -735,6 +739,12 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
 
+        identity_kwargs: Dict[str, str] = {}
+        if user_id:
+            identity_kwargs["user_id"] = user_id
+        if tenant_id:
+            identity_kwargs["tenant_id"] = tenant_id
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -749,8 +759,11 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            memory_recall_callback=memory_recall_callback,
+            continuation_callback=continuation_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            **identity_kwargs,
         )
         return agent
 
@@ -909,6 +922,11 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        _raw_user_id = request.headers.get("X-Hermes-User-Id", "").strip()
+        _raw_tenant_id = request.headers.get("X-Hermes-Tenant-Id", "").strip()
+        _caller_user_id: Optional[str] = _raw_user_id if _raw_user_id else None
+        _caller_tenant_id: Optional[str] = _raw_tenant_id if _raw_tenant_id else None
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -959,6 +977,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     "label": label,
                 }))
 
+            def _on_memory_recall(prefetch_text: str):
+                if not prefetch_text:
+                    return
+                _stream_q.put((
+                    "__memory_recall__",
+                    {
+                        "provider": "holographic",
+                        "context_preview": prefetch_text[:200],
+                        "context_token_estimate": len(prefetch_text) // 4,
+                    },
+                ))
+
+            def _on_continuation(task_summary: str, **extra: Any) -> None:
+                if not task_summary:
+                    return
+                payload = {
+                    "task_summary": task_summary,
+                    "confidence": extra.get("confidence", "low"),
+                }
+                if "last_session_age_hours" in extra:
+                    payload["last_session_age_hours"] = extra["last_session_age_hours"]
+                _stream_q.put(("__continuation__", payload))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -969,7 +1010,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                memory_recall_callback=_on_memory_recall,
+                continuation_callback=_on_continuation,
                 agent_ref=agent_ref,
+                user_id=_caller_user_id,
+                tenant_id=_caller_tenant_id,
             ))
 
             return await self._write_sse_chat_completion(
@@ -984,6 +1029,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                user_id=_caller_user_id,
+                tenant_id=_caller_tenant_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1089,6 +1136,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__memory_recall__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.memory.recalled\ndata: {event_data}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__continuation__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.continuation.suggested\ndata: {event_data}\n\n".encode()
                     )
                 else:
                     content_chunk = {
@@ -2169,6 +2226,10 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        memory_recall_callback=None,
+        continuation_callback=None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2191,6 +2252,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                memory_recall_callback=memory_recall_callback,
+                continuation_callback=continuation_callback,
+                user_id=user_id,
+                tenant_id=tenant_id,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2255,6 +2320,301 @@ class APIServerAdapter(BasePlatformAdapter):
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
+
+    @staticmethod
+    def _parse_memory_tool_result(result: Any) -> Any:
+        """Normalize provider tool output into a plain dict/list payload."""
+        if isinstance(result, str):
+            try:
+                return json.loads(result)
+            except Exception:
+                return {"result": result}
+        return result
+
+    @staticmethod
+    def _extract_honcho_card(payload: Any) -> list[str]:
+        """Pull a plain list of card facts out of honcho_profile results."""
+        if not isinstance(payload, dict):
+            return []
+
+        direct_card = payload.get("card")
+        if isinstance(direct_card, list):
+            return [str(item) for item in direct_card if item]
+
+        result = payload.get("result")
+        if isinstance(result, list):
+            return [str(item) for item in result if item]
+
+        if isinstance(result, dict):
+            nested_card = result.get("card")
+            if isinstance(nested_card, list):
+                return [str(item) for item in nested_card if item]
+
+        return []
+
+    @staticmethod
+    def _format_fact_list(card: list[str]) -> dict[str, Any]:
+        facts = [{"id": idx, "content": fact} for idx, fact in enumerate(card, start=1)]
+        return {"facts": facts, "count": len(facts)}
+
+    def _dispatch_fact_store_honcho_compat(
+        self,
+        mgr: Any,
+        args: Dict[str, Any],
+        *,
+        identity_kwargs: Dict[str, str],
+    ) -> Any:
+        """Translate legacy fact_store admin calls onto honcho_* tools.
+
+        This keeps existing callers working after memory.provider switches from
+        holographic to honcho without reintroducing the legacy tool into the
+        agent-facing prompt/tool surface.
+        """
+
+        def call(tool_name: str, tool_args: Dict[str, Any]) -> Any:
+            return self._parse_memory_tool_result(
+                mgr.handle_tool_call(tool_name, tool_args, **identity_kwargs)
+            )
+
+        def maybe_error(payload: Any) -> Any | None:
+            if isinstance(payload, dict) and payload.get("error"):
+                return payload
+            return None
+
+        action = str(args.get("action") or "list").strip().lower()
+
+        if action == "list":
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+            return self._format_fact_list(self._extract_honcho_card(profile))
+
+        if action == "add":
+            content = str(args.get("content") or "").strip()
+            if not content:
+                return {"error": "Content is required for 'add' action."}
+
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+
+            card = self._extract_honcho_card(profile)
+            updated = list(card)
+            if content not in updated:
+                updated.append(content)
+
+            write = call("honcho_profile", {"peer": "user", "card": updated})
+            err = maybe_error(write)
+            if err is not None:
+                return err
+
+            return {
+                "fact_id": updated.index(content) + 1,
+                "status": "added" if len(updated) > len(card) else "exists",
+            }
+
+        if action == "remove":
+            fact_id_raw = args.get("fact_id")
+            try:
+                fact_id = int(fact_id_raw)
+            except (TypeError, ValueError):
+                return {"error": "fact_id must be an integer for 'remove' action."}
+
+            if fact_id < 1:
+                return {"removed": False}
+
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+
+            card = self._extract_honcho_card(profile)
+            if fact_id > len(card):
+                return {"removed": False}
+
+            updated = [fact for idx, fact in enumerate(card, start=1) if idx != fact_id]
+            write = call("honcho_profile", {"peer": "user", "card": updated})
+            err = maybe_error(write)
+            if err is not None:
+                return err
+
+            return {"removed": True}
+
+        if action == "search":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return {"error": "query is required for 'search' action."}
+
+            try:
+                limit = max(1, min(int(args.get("limit", 10)), 50))
+            except (TypeError, ValueError):
+                limit = 10
+
+            profile = call("honcho_profile", {"peer": "user"})
+            err = maybe_error(profile)
+            if err is not None:
+                return err
+
+            card = self._extract_honcho_card(profile)
+            q_lower = query.lower()
+            card_hits = [fact for fact in card if q_lower in fact.lower()]
+            if card_hits:
+                results = [
+                    {"id": idx, "content": fact}
+                    for idx, fact in enumerate(card_hits[:limit], start=1)
+                ]
+                return {"results": results, "count": len(results)}
+
+            search = call("honcho_search", {"peer": "user", "query": query, "max_tokens": 2000})
+            err = maybe_error(search)
+            if err is not None:
+                return err
+
+            text = str(search.get("result") or "").strip()
+            if not text or text == "No relevant context found.":
+                return {"results": [], "count": 0}
+
+            seen: set[str] = set()
+            parsed: list[str] = []
+            for raw_line in text.splitlines():
+                line = raw_line.lstrip("-* ").strip()
+                if not line or line.startswith("##") or line in seen:
+                    continue
+                seen.add(line)
+                parsed.append(line)
+
+            results = [
+                {"id": idx, "content": line}
+                for idx, line in enumerate(parsed[:limit], start=1)
+            ]
+            return {"results": results, "count": len(results)}
+
+        return {"error": f"Unknown fact_store action: {action}"}
+
+    # HERMES-HOOK-MEMORY-TOOL-ROUTE-BEGIN
+    async def _handle_memory_tool(self, request: "web.Request") -> "web.Response":
+        """POST /v1/memory/tool — admin/inspection endpoint for memory providers.
+
+        Body JSON shape:
+            {
+              "tool_name": "fact_store",
+              "args": {"action": "list", "limit": 50},
+              "user_id": "alice",       # optional; scopes provider kwargs
+              "tenant_id": "acme"       # optional; scopes provider kwargs
+            }
+
+        Dispatches to memory_manager.handle_tool_call with the same user_id /
+        tenant_id kwarg contract as the chat-completion path (W1). Honours the
+        same "empty-as-absent" semantics — falsy scoping values are omitted so
+        providers fall back to their default peer resolution.
+
+        Does NOT go through AIAgent / run_agent — constructs a lightweight
+        MemoryManager + loads the configured provider on demand. Admin path,
+        no LLM in the loop.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body", err_type="invalid_request_error"),
+                status=400,
+            )
+
+        tool_name = body.get("tool_name", "").strip()
+        args = body.get("args") or {}
+        if not tool_name or not isinstance(args, dict):
+            return web.json_response(
+                _openai_error(
+                    "Missing required fields: tool_name (str) + args (dict)",
+                    err_type="invalid_request_error",
+                ),
+                status=400,
+            )
+
+        raw_user_id = (body.get("user_id") or "").strip() or None
+        raw_tenant_id = (body.get("tenant_id") or "").strip() or None
+
+        # Build kwargs with the same "falsy-elides, truthy-forwards" discipline
+        # established in W1 for AIAgent -> memory_manager.initialize_all.
+        identity_kwargs: Dict[str, str] = {}
+        if raw_user_id:
+            identity_kwargs["user_id"] = raw_user_id
+        if raw_tenant_id:
+            identity_kwargs["tenant_id"] = raw_tenant_id
+
+        # Build a lightweight MemoryManager, install the configured provider.
+        mgr = None
+        try:
+            from agent.memory_manager import MemoryManager
+            from plugins.memory import load_memory_provider
+
+            mgr = MemoryManager()
+
+            # Load the active external provider from config.yaml — mirrors the
+            # run_agent.py:1388-1395 registration path so the same tool schemas
+            # this endpoint accepts are exactly the ones the running agent uses.
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config()
+                provider_name = (cfg.get("memory") or {}).get("provider") or ""
+            except Exception:
+                provider_name = ""
+            if provider_name:
+                external = load_memory_provider(provider_name)
+                if external and external.is_available():
+                    try:
+                        mgr.add_provider(external)
+                    except Exception as e:
+                        logger.debug(
+                            "Memory provider '%s' registration failed for tool call: %s",
+                            provider_name, e,
+                        )
+
+            # Initialise providers with a synthetic session_id + identity kwargs.
+            # Synthetic session_id keeps admin calls out of the regular session
+            # history; providers that namespace by session will scope to this tag.
+            synthetic_session = f"admin-memory-tool-{int(time.time()*1000)}"
+            mgr.initialize_all(session_id=synthetic_session, **identity_kwargs)
+
+            # Dispatch the tool call. The MemoryManager routes by tool_name to
+            # whichever provider registered that tool schema.
+            payload: Any
+            if provider_name == "honcho" and tool_name == "fact_store":
+                payload = self._dispatch_fact_store_honcho_compat(
+                    mgr,
+                    args,
+                    identity_kwargs=identity_kwargs,
+                )
+            else:
+                result = mgr.handle_tool_call(tool_name, args, **identity_kwargs)
+                payload = self._parse_memory_tool_result(result)
+
+            return web.json_response({"result": payload})
+
+        except Exception as e:
+            logger.warning("Memory tool dispatch failed: %s", e, exc_info=True)
+            return web.json_response(
+                _openai_error(
+                    f"Memory tool failed: {e}",
+                    err_type="memory_tool_error",
+                ),
+                status=500,
+            )
+        finally:
+            # Best-effort cleanup for providers that opened threads.
+            if mgr is not None:
+                try:
+                    mgr.shutdown_all()
+                except Exception:
+                    pass
+
+    # HERMES-HOOK-MEMORY-TOOL-ROUTE-END
 
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -2507,6 +2867,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # HERMES-HOOK-MEMORY-TOOL-ROUTE-BEGIN
+            self._app.router.add_post("/v1/memory/tool", self._handle_memory_tool)
+            # HERMES-HOOK-MEMORY-TOOL-ROUTE-END
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
