@@ -1978,7 +1978,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._endpoint = settings["endpoint"]
         self._api_key = settings["api_key"]
         self._account = settings["account"]
-        self._user = settings["user"]
+        # Per-user scoping (kg multi-user isolation): allow the caller (agent) to
+        # override the OpenViking user identity so each end-user gets isolated
+        # memory in multi-user org deployments. Falls back to the configured /
+        # env-derived user (settings["user"] already honors OPENVIKING_USER).
+        self._user = kwargs.get("user_id", "") or settings["user"]
         self._agent = settings["agent"]
         self._session_id = session_id
         self._turn_count = 0
