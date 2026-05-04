@@ -519,6 +519,76 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+# Allowed characters in OpenWebUI identity headers.  Conservative: alnum,
+# underscore, hyphen, dot.  Dots are allowed for email-style IDs but the
+# helper below rejects any value that contains `..` to block path-traversal
+# style misuse if the value is ever appended to a filesystem path or URL.
+_OWUI_ID_RE = re.compile(r"[^a-zA-Z0-9_\-\.]")
+_OWUI_ID_MAX = 64
+
+
+def _sanitize_owui_id(raw: str) -> str:
+    """Sanitise an OpenWebUI-supplied ID.  Returns ``""`` on suspicious input.
+
+    Strips control chars and anything outside ``[A-Za-z0-9_.-]``, caps at 64
+    chars, and rejects values that contain ``..`` (potential path traversal).
+    """
+    if not raw:
+        return ""
+    cleaned = _OWUI_ID_RE.sub("", raw.strip())[:_OWUI_ID_MAX]
+    if not cleaned or ".." in cleaned:
+        return ""
+    return cleaned
+
+
+def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
+    """Extract sanitised user_id / user_name / chat_id from request headers.
+
+    Always returns a dict with all three keys (empty string if header is
+    missing or fails sanitisation).  Callers decide whether to fail-closed on
+    missing user_id.
+    """
+    user_id = _sanitize_owui_id(request.headers.get("X-OpenWebUI-User-Id", ""))
+    chat_id = _sanitize_owui_id(request.headers.get("X-OpenWebUI-Chat-Id", ""))
+    raw_user_name = request.headers.get("X-OpenWebUI-User-Name", "").strip()
+    user_name = raw_user_name[:128] if raw_user_name else ""
+    return {"user_id": user_id, "user_name": user_name, "chat_id": chat_id}
+
+
+def _scope_session_id(base_session_id: str, scope: Dict[str, str]) -> str:
+    """Append per-user and per-chat scope suffixes to a base session ID.
+
+    Idempotent: passing an already-scoped session ID through with the same
+    scope yields the same result.  Scope is applied as ``-user-<id>`` and
+    ``-chat-<id>`` so two users (or two chats by the same user) cannot
+    collide on the conversation fingerprint alone.
+    """
+    out = base_session_id
+    user_id = scope.get("user_id", "")
+    chat_id = scope.get("chat_id", "")
+    if user_id and f"-user-{user_id}" not in out:
+        out = f"{out}-user-{user_id}"
+    if chat_id and f"-chat-{chat_id}" not in out:
+        out = f"{out}-chat-{chat_id}"
+    return out
+
+
+def _missing_user_id_error() -> "web.Response":
+    """Standard 400 response when the X-OpenWebUI-User-Id header is required."""
+    return web.json_response(
+        _openai_error(
+            "Missing X-OpenWebUI-User-Id header.  This Hermes API server is "
+            "configured for multi-user isolation; every request must identify "
+            "the end-user via the X-OpenWebUI-User-Id header so sessions and "
+            "memory stay scoped per user.  OpenWebUI sends this automatically "
+            "when ENABLE_FORWARD_USER_INFO_HEADERS=true.",
+            err_type="invalid_request_error",
+            param="X-OpenWebUI-User-Id",
+        ),
+        status=400,
+    )
+
+
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
@@ -531,6 +601,9 @@ def _derive_chat_session_id(
     them produces a deterministic session ID that lets the API server reuse
     the same Hermes session (and therefore the same Docker container sandbox
     directory) across turns.
+
+    Note: this base ID is NOT user/chat scoped.  Callers must run the result
+    through ``_scope_session_id()`` to add per-user / per-chat suffixes.
     """
     seed = f"{system_prompt or ''}\n{first_user_message}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
@@ -717,6 +790,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        user_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -753,6 +827,7 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            user_id=user_id,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -863,6 +938,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        # Per-user / per-chat scope.  Extracted up-front so that EVERY code
+        # path below (request body parse, session continuation, fingerprint
+        # derivation) sees the scoped session ID — otherwise history loaded
+        # from one user's session can leak into another's response stream.
+        scope = _extract_owui_scope(request)
+        if not scope["user_id"]:
+            return _missing_user_id_error()
+
         # Parse request body
         try:
             body = await request.json()
@@ -941,7 +1024,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
                     status=400,
                 )
-            session_id = provided_session_id
+            # Apply user/chat scope BEFORE loading history so the read and the
+            # subsequent writes share the same session ID.  Without this, an
+            # attacker who guesses another user's base session could pass it
+            # via X-Hermes-Session-Id and have the server silently load that
+            # user's history into their request.
+            session_id = _scope_session_id(provided_session_id, scope)
             try:
                 db = self._ensure_session_db()
                 if db is not None:
@@ -959,8 +1047,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = _scope_session_id(
+                _derive_chat_session_id(system_prompt, first_user),
+                scope,
+            )
             # history already set from request body above
+
+        user_id = scope["user_id"]
+        user_name = scope["user_name"]
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -1047,6 +1141,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                user_id=user_id,
             ))
 
             return await self._write_sse_chat_completion(
@@ -1061,13 +1156,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                user_id=user_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            # Per-user cache namespace: without this, two users sharing the
+            # API key but sending the same Idempotency-Key would receive each
+            # other's cached results.  Scope the cache key by user_id so the
+            # idempotency guarantee is per-user, not global.
+            scoped_idem_key = f"{user_id}:{idempotency_key}" if user_id else idempotency_key
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(scoped_idem_key, fp, _compute_completion)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -1366,6 +1467,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id,
+                "user_id": user_id,
             })
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
@@ -1751,6 +1853,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        scope = _extract_owui_scope(request)
+        if not scope["user_id"]:
+            return _missing_user_id_error()
+
         # Parse request body
         try:
             body = await request.json()
@@ -1827,6 +1933,18 @@ class APIServerAdapter(BasePlatformAdapter):
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
+            # Verify the stored response belongs to the requesting user.
+            # Without this check, any client with the API key could chain
+            # off of another user's response_id and harvest the prior
+            # conversation_history.  Treat ownership mismatch as not-found
+            # so we don't reveal that the response_id exists.
+            stored_user = stored.get("user_id", "")
+            if stored_user and stored_user != scope["user_id"]:
+                logger.warning(
+                    "previous_response_id %s belongs to user %r but request is from %r — denying",
+                    previous_response_id, stored_user, scope["user_id"],
+                )
+                return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
             # If no instructions provided, carry forward from previous
@@ -1847,8 +1965,13 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history = conversation_history[-100:]
 
         # Reuse session from previous_response_id chain so the dashboard
-        # groups the entire conversation under one session entry.
-        session_id = stored_session_id or str(uuid.uuid4())
+        # groups the entire conversation under one session entry.  Apply
+        # user/chat scope (idempotent — _scope_session_id() doesn't double-
+        # append if the suffix is already present, so chaining preserves
+        # continuity for the same user).
+        session_id = _scope_session_id(stored_session_id or str(uuid.uuid4()), scope)
+        user_id = scope["user_id"]
+        user_name = scope["user_name"]
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -1902,6 +2025,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                user_id=user_id,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -1930,6 +2054,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                user_id=user_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1938,8 +2063,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 body,
                 keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
             )
+            scoped_idem_key = f"{user_id}:{idempotency_key}" if user_id else idempotency_key
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                result, usage = await _idem_cache.get_or_set(scoped_idem_key, fp, _compute_response)
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -1998,6 +2124,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": session_id,
+                "user_id": user_id,
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
@@ -2016,9 +2143,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        scope = _extract_owui_scope(request)
+        if not scope["user_id"]:
+            return _missing_user_id_error()
+
         response_id = request.match_info["response_id"]
         stored = self._response_store.get(response_id)
         if stored is None:
+            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+
+        # Owner check — return 404 (not 403) on mismatch so we don't leak the
+        # existence of another user's response_id.
+        stored_user = stored.get("user_id", "")
+        if stored_user and stored_user != scope["user_id"]:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
         return web.json_response(stored["response"])
@@ -2029,7 +2166,21 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        scope = _extract_owui_scope(request)
+        if not scope["user_id"]:
+            return _missing_user_id_error()
+
         response_id = request.match_info["response_id"]
+        # Read-then-check-then-delete to enforce ownership.  Race window is
+        # acceptable: no security impact, the worst case is a concurrent
+        # delete by the same user winning twice.
+        stored = self._response_store.get(response_id)
+        if stored is None:
+            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+        stored_user = stored.get("user_id", "")
+        if stored_user and stored_user != scope["user_id"]:
+            return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
+
         deleted = self._response_store.delete(response_id)
         if not deleted:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
@@ -2326,6 +2477,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        user_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2348,6 +2500,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                user_id=user_id,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2440,6 +2593,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        scope = _extract_owui_scope(request)
+        if not scope["user_id"]:
+            return _missing_user_id_error()
+
         # Enforce concurrency limit
         if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
             return web.json_response(
@@ -2487,6 +2644,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
+                # Owner check: don't carry another user's history into this run.
+                stored_user = stored.get("user_id", "")
+                if stored_user and stored_user != scope["user_id"]:
+                    logger.warning(
+                        "previous_response_id %s belongs to user %r but request is from %r — denying",
+                        previous_response_id, stored_user, scope["user_id"],
+                    )
+                    return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
                 if instructions is None:
@@ -2507,8 +2672,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        user_id = scope["user_id"]
+
+        # Sanitize the optional client-supplied session_id so a hostile caller
+        # can't inject control characters or chase down another user's run.
+        raw_body_session = body.get("session_id")
+        body_session_id = ""
+        if isinstance(raw_body_session, str) and raw_body_session:
+            if re.search(r"[\r\n\x00]", raw_body_session):
+                return web.json_response(_openai_error("Invalid session_id"), status=400)
+            body_session_id = raw_body_session.strip()[:256]
+
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        # Always run user/chat scope through _scope_session_id so that whether
+        # the base came from the client, a stored response, or the auto-generated
+        # run_id, it ends with -user-<id>(-chat-<id>).
+        session_id = _scope_session_id(body_session_id or stored_session_id or run_id, scope)
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
@@ -2548,6 +2727,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    user_id=user_id,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():

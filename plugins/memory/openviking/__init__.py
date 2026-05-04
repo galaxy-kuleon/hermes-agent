@@ -313,7 +313,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._endpoint = os.environ.get("OPENVIKING_ENDPOINT", _DEFAULT_ENDPOINT)
         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
         self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
-        self._user = os.environ.get("OPENVIKING_USER", "default")
+        # Per-user scoping: allow the caller (agent) to override the OpenViking
+        # user identity so that each end-user gets isolated memory in multi-user
+        # org deployments. Falls back to the env var for backward compatibility.
+        self._user = kwargs.get("user_id", "") or os.environ.get("OPENVIKING_USER", "default")
         self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
         self._session_id = session_id
         self._turn_count = 0
