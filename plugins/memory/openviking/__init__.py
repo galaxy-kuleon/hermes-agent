@@ -2022,32 +2022,141 @@ class OpenVikingMemoryProvider(MemoryProvider):
         global _last_active_provider
         _last_active_provider = self
 
+    def _read_content(self, uri: str) -> str:
+        """Read full content (L2) of a viking:// URI.  Returns "" on miss."""
+        try:
+            resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+        except Exception:
+            return ""
+        # /api/v1/content/read returns {"status": "ok", "result": "<text>"}
+        # where result is the file body as a plain string.  On not-found
+        # the gateway returns {"status":"error", ...} which we treat as empty.
+        if (resp.get("status") or "ok") != "ok":
+            return ""
+        result = resp.get("result")
+        return result.strip() if isinstance(result, str) else ""
+
+    def _fetch_user_profile_block(self) -> str:
+        """Fetch the user's profile.md + preferences, if present.
+
+        These are the persistent facts the user has accumulated across
+        previous sessions (name, role, language preference, etc.).  We
+        embed them directly in the system prompt so the LLM applies them
+        unconditionally — relying on a similarity-scored prefetch alone
+        misses preferences that aren't topically related to the current
+        message (e.g. "tell me a fun fact" doesn't match "language=zh-TW"
+        very well).
+        """
+        if not self._client or not self._user:
+            return ""
+        base = f"viking://user/{self._user}/memories"
+        parts: List[str] = []
+
+        # 1. profile.md — the user's identity card.
+        profile = self._read_content(f"{base}/profile.md")
+        if profile:
+            parts.append("### Profile\n" + profile)
+
+        # 2. Each individual preference memory, read via content/read so
+        # the actual sentence ("default to zh-TW") shows up — fs/ls returns
+        # only an abstract field that the semantic processor populates
+        # asynchronously and is often blank for fresh memories.
+        try:
+            ls_resp = self._client.get(
+                "/api/v1/fs/ls", params={"uri": f"{base}/preferences"}
+            )
+        except Exception:
+            ls_resp = {}
+        if (ls_resp.get("status") or "ok") == "ok":
+            entries = ls_resp.get("result") or []
+            bullets = []
+            for e in entries:
+                if e.get("isDir"):
+                    continue
+                uri = e.get("uri", "")
+                if not uri or uri.endswith("/.overview.md"):
+                    continue
+                # Prefer the cached abstract (cheap), fall back to full read.
+                snippet = (e.get("abstract") or "").strip()
+                if not snippet:
+                    snippet = self._read_content(uri)
+                if snippet:
+                    bullets.append(f"- {snippet[:300]}")
+                if len(bullets) >= 10:
+                    break
+            if bullets:
+                parts.append("### Known preferences\n" + "\n".join(bullets))
+
+        return "\n\n".join(parts)
+
     def system_prompt_block(self) -> str:
         if not self._client:
             return ""
-        # Provide brief info about the knowledge base
+        # Build the standard "knowledge base is active" hint plus, when we
+        # already know things about this user, an "always apply" block
+        # carrying their persistent profile + preferences.  Without the
+        # second part the LLM has to call viking_search proactively to
+        # recall facts like "user prefers zh-TW", which it usually doesn't
+        # for unrelated questions.
+        # Imperative trigger for explicit-memorize commands.  Without this
+        # the LLM tends to "acknowledge" memorize-style requests verbally
+        # (e.g. "好的，我已經記住了") without actually persisting anything,
+        # so the next session has no record of the preference.  The list
+        # of trigger prefixes is deliberately broad — English and the two
+        # Chinese variants we've seen real users use.
+        memorize_rule = (
+            "## Mandatory: persist explicit memorize requests\n"
+            "When the user's message **starts with** any of these prefixes — "
+            "`memorize:`, `remember:`, `note:`, `記住:`, `記住：`, `記下:`, "
+            "`記下：` — you MUST call the `viking_remember` tool with the "
+            "content that follows the prefix.  Do this on the SAME turn, "
+            "BEFORE writing your conversational reply.  Choose the most "
+            "appropriate `category` (preference / entity / event / case / "
+            "pattern); for language / communication-style instructions use "
+            "`preference`.  Verbal acknowledgement alone does not persist "
+            "anything — the tool call is what writes to long-term memory."
+        )
+        kb_hint = ""
         try:
-            # Check what's in the knowledge base via a root listing
             resp = self._client.get("/api/v1/fs/ls", params={"uri": "viking://"})
             result = resp.get("result", [])
             children = len(result) if isinstance(result, list) else 0
-            if children == 0:
-                return ""
-            return (
-                "# OpenViking Knowledge Base\n"
-                f"Active. Endpoint: {self._endpoint}\n"
-                "Use viking_search to find information, viking_read for details "
-                "(abstract/overview/full), viking_browse to explore.\n"
-                "Use viking_remember to store facts, viking_add_resource to index URLs/docs."
-            )
+            if children > 0:
+                kb_hint = (
+                    "# OpenViking Knowledge Base\n"
+                    f"Active. Endpoint: {self._endpoint}\n"
+                    "Use viking_search to find information, viking_read for details "
+                    "(abstract/overview/full), viking_browse to explore.\n"
+                    "Use viking_remember to store facts, viking_add_resource to index URLs/docs.\n\n"
+                    + memorize_rule
+                )
         except Exception as e:
             logger.warning("OpenViking system_prompt_block failed: %s", e)
-            return (
+            kb_hint = (
                 "# OpenViking Knowledge Base\n"
                 f"Active. Endpoint: {self._endpoint}\n"
                 "Use viking_search, viking_read, viking_browse, "
-                "viking_remember, viking_add_resource."
+                "viking_remember, viking_add_resource.\n\n"
+                + memorize_rule
             )
+
+        try:
+            user_block = self._fetch_user_profile_block()
+        except Exception as e:
+            logger.debug("OpenViking _fetch_user_profile_block failed: %s", e)
+            user_block = ""
+
+        if user_block:
+            user_section = (
+                "# About this user (apply across this entire conversation)\n"
+                "These facts come from prior conversations with the SAME end-user. "
+                "Apply them whenever they are relevant.  In particular, when a "
+                "language / response-style preference is recorded below, default "
+                "to that style for every reply unless the user explicitly switches.\n\n"
+                + user_block
+            )
+            return (kb_hint + "\n\n" + user_section) if kb_hint else user_section
+        return kb_hint
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return prefetched results from the background thread."""
@@ -2058,7 +2167,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
         if not result:
             return ""
-        return f"## OpenViking Context\n{result}"
+        # Frame the prefetched memories as actionable context, not just a
+        # list — without this the LLM treats them as background trivia.
+        return (
+            "## Possibly-relevant context from prior sessions\n"
+            "The following memories were retrieved by similarity.  Apply any "
+            "preferences / facts that are relevant to the current message.\n\n"
+            + result
+        )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire a background search to pre-load relevant context."""
@@ -2078,20 +2194,36 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     self._endpoint, self._api_key,
                     account=self._account, user=self._user, agent=self._agent,
                 )
-                resp = client.post("/api/v1/search/find", {
-                    "query": query,
-                    "limit": 5,
-                })
-                result = resp.get("result", {})
-                parts = []
-                for ctx_type in ("memories", "resources"):
-                    items = result.get(ctx_type, [])
-                    for item in items[:3]:
+                # Two-pass scoped prefetch.  Without target_uri the search
+                # returns memories from EVERY user in the org (ROOT key
+                # bypasses per-user filtering server-side), so we explicitly
+                # restrict pass 1 to the caller's own namespace.  Pass 2
+                # opens up viking://resources/ for shared org documents
+                # which are intentionally cross-user.
+                parts: List[str] = []
+                user_target = (
+                    f"viking://user/{self._user}/" if self._user else None
+                )
+                queries = []
+                if user_target:
+                    queries.append((user_target, "memories"))
+                queries.append(("viking://resources/", "resources"))
+
+                for target_uri, ctx_type in queries:
+                    payload = {"query": query, "top_k": 5, "target_uri": target_uri}
+                    try:
+                        resp = client.post("/api/v1/search/find", payload)
+                    except Exception as e:
+                        logger.debug("OpenViking prefetch %s failed: %s", target_uri, e)
+                        continue
+                    items = (resp.get("result") or {}).get(ctx_type, [])[:3]
+                    for item in items:
                         uri = item.get("uri", "")
                         abstract = item.get("abstract", "")
                         score = item.get("score", 0)
                         if abstract:
                             parts.append(f"- [{score:.2f}] {abstract} ({uri})")
+
                 if parts:
                     with self._prefetch_lock:
                         if gen != self._prefetch_generation:
@@ -2919,8 +3051,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
+        if mode != "auto":
+            payload["mode"] = mode
+        # Multi-tenancy guard: OpenViking's `/api/v1/search/find` does NOT
+        # filter results by X-OpenViking-User when called with a ROOT key.
+        # Without an explicit target_uri the search returns memories from
+        # every user in the org account, which would let one end-user see
+        # another's preferences/profile/entities.  Default the scope to the
+        # caller's own user namespace; the LLM can still override via
+        # `scope` (e.g. "viking://resources/" for shared org documents).
         if args.get("scope"):
             payload["target_uri"] = args["scope"]
+        elif self._user:
+            payload["target_uri"] = f"viking://user/{self._user}/"
         if args.get("limit"):
             payload["limit"] = args["limit"]
 

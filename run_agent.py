@@ -520,7 +520,11 @@ class AIAgent:
                 model=self.model,
                 model_config=self._session_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                # kg multi-user isolation: persist the platform user_id so
+                # state.db sessions.user_id is non-NULL in api_server mode and
+                # analytics tooling can group runs by OpenWebUI account.
+                # ``agent._user_id`` is set by agent.agent_init.init_agent.
+                user_id=getattr(self, "_user_id", None) or None,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
             )
