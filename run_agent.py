@@ -1632,7 +1632,13 @@ class AIAgent:
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
                     },
-                    user_id=None,
+                    # Persist the platform user_id so dashboards can filter
+                    # state.db rows per end-user.  In api_server mode this
+                    # makes the sessions.user_id column non-NULL — without
+                    # this, isolation lives only inside the composite
+                    # session_id, and analytics tooling can't group runs by
+                    # OpenWebUI account.
+                    user_id=self._user_id or None,
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:

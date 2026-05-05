@@ -34,6 +34,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -313,10 +314,29 @@ class ResponseStore:
         )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
+                user_id TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                PRIMARY KEY (user_id, name)
             )"""
         )
+        # Forward-compat for DBs created before user_id was part of the
+        # conversations PK.  Older rows are keyed by name alone; bring the
+        # column in with a DEFAULT '' so existing pointers stay reachable
+        # only when the caller passes user_id="" (which fail-closed prevents
+        # for OpenWebUI-driven traffic).  PRAGMA table_info is cheap.
+        try:
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(conversations)").fetchall()}
+            if "user_id" not in cols:
+                self._conn.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+                # SQLite cannot redefine a PK in-place; the legacy PK stays
+                # on `name` for the migrated rows.  New rows go through the
+                # composite logic in get/set_conversation, so writes won't
+                # collide cross-user even when the schema isn't fully
+                # rebuilt.  Logging once at init for visibility.
+                logger.info("[api_server] Migrated ResponseStore.conversations to include user_id column")
+        except Exception as e:
+            logger.warning("[api_server] conversations migration skipped: %s", e)
         self._conn.commit()
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
@@ -357,18 +377,25 @@ class ResponseStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
-    def get_conversation(self, name: str) -> Optional[str]:
-        """Get the latest response_id for a conversation name."""
+    def get_conversation(self, name: str, user_id: str = "") -> Optional[str]:
+        """Get the latest response_id for (user_id, conversation name).
+
+        user_id defaults to "" only for backwards compatibility with callers
+        that have not been updated.  In multi-user deployments the OpenWebUI
+        path always supplies a non-empty user_id so two users can use the
+        same `conversation` name without overwriting each other's pointer.
+        """
         row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            "SELECT response_id FROM conversations WHERE user_id = ? AND name = ?",
+            (user_id, name),
         ).fetchone()
         return row[0] if row else None
 
-    def set_conversation(self, name: str, response_id: str) -> None:
-        """Map a conversation name to its latest response_id."""
+    def set_conversation(self, name: str, response_id: str, user_id: str = "") -> None:
+        """Map (user_id, conversation name) to its latest response_id."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
+            "INSERT OR REPLACE INTO conversations (user_id, name, response_id) VALUES (?, ?, ?)",
+            (user_id, name, response_id),
         )
         self._conn.commit()
 
@@ -668,6 +695,24 @@ class APIServerAdapter(BasePlatformAdapter):
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Per-session idle tracking → triggers OpenViking commit + memory
+        # extraction after IDLE_COMMIT_SECONDS of silence.  In api_server
+        # mode the AIAgent is short-lived (one per request) and never fires
+        # on_session_end on its own, so without this watcher OpenViking
+        # accumulates messages.jsonl forever and never extracts memories.
+        # Each entry: {"user_id", "chat_id", "last_seen": float, "committed": bool}
+        # Only mutated from the event loop, so no lock needed (mutations are
+        # `__setitem__` on existing keys + dict insertion, both atomic enough
+        # against the single-coroutine watcher).
+        self._session_activity: Dict[str, Dict[str, Any]] = {}
+        self._idle_commit_task: Optional["asyncio.Task"] = None
+        # Disk-backed activity table — survives container/process restarts
+        # so a user who walks away mid-conversation still gets memory
+        # extraction once the watcher resumes after restart.  Path is
+        # resolved lazily on first persist.
+        self._session_activity_path: Optional[Path] = None
+        import threading as _threading
+        self._session_activity_lock = _threading.Lock()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -790,6 +835,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         user_id: Optional[str] = None,
     ) -> Any:
         """
@@ -832,6 +878,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -1055,6 +1102,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_id = scope["user_id"]
         user_name = scope["user_name"]
+        # Register / refresh session activity so the idle-commit watcher
+        # fires OpenViking memory extraction once the user stops typing.
+        self._touch_session_activity(session_id, scope)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -1105,6 +1155,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
+                    "arguments": function_args,
                 }))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
@@ -1121,7 +1172,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
+                    "arguments": function_args,
+                    "result": function_result,
                 }))
+
+            def _on_reasoning(text):
+                """Forward incremental reasoning/thinking text to the SSE stream
+                so OpenWebUI can render a live ``<details type="reasoning">``
+                block. OpenWebUI's middleware natively consumes
+                ``delta.reasoning_content`` (open-webui middleware.py:4117) so
+                we just need to inject those chunks alongside the regular
+                content deltas.
+                """
+                if text:
+                    _stream_q.put(("__reasoning_delta__", text))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1140,6 +1204,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                reasoning_callback=_on_reasoning,
                 agent_ref=agent_ref,
                 user_id=user_id,
             ))
@@ -1253,29 +1318,137 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            # OpenWebUI compatibility state.  OpenWebUI's frontend ignores
+            # custom SSE event names and only reads ``data:`` chunks, so we
+            # need a second channel: tool-call lifecycle is mirrored as
+            # inline ``<details type="tool_calls">`` HTML inside
+            # ``delta.content`` (open-webui middleware.py:497-503), and
+            # reasoning is forwarded as ``delta.reasoning_content`` which
+            # OpenWebUI's backend natively converts to a live "Thinking…"
+            # block (open-webui middleware.py:4117-4150).
+            _owui_state = {"reasoning_open": False}
+            import html as _html_mod
+            _MAX_TOOL_RESULT_LEN = 4096
+
+            def _render_tool_call_html(payload: Dict[str, Any]) -> str:
+                """Build a ``<details type="tool_calls">`` block matching the
+                exact attribute shape OpenWebUI's marked-extension expects
+                (open-webui middleware.py:497 for done=true, :502 for
+                done=false).
+                """
+                name = payload.get("tool", "") or ""
+                call_id = payload.get("toolCallId", "") or ""
+                status = payload.get("status", "")
+                args = payload.get("arguments")
+                args_str = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+                args_attr = _html_mod.escape(json.dumps(args_str))
+
+                if status == "running":
+                    return (
+                        f'\n<details type="tool_calls" done="false" '
+                        f'id="{_html_mod.escape(call_id)}" '
+                        f'name="{_html_mod.escape(name)}" '
+                        f'arguments="{args_attr}">\n'
+                        f'<summary>Executing {_html_mod.escape(name)}…</summary>\n'
+                        f'</details>\n'
+                    )
+
+                # status == "completed"
+                raw_result = payload.get("result", "")
+                result_str = (
+                    raw_result if isinstance(raw_result, str)
+                    else json.dumps(raw_result, ensure_ascii=False, default=str)
+                )
+                if len(result_str) > _MAX_TOOL_RESULT_LEN:
+                    result_str = (
+                        result_str[:_MAX_TOOL_RESULT_LEN]
+                        + f"\n…[truncated, full output is {len(result_str)} chars]"
+                    )
+                result_body = _html_mod.escape(json.dumps(result_str, ensure_ascii=False))
+                return (
+                    f'\n<details type="tool_calls" done="true" '
+                    f'id="{_html_mod.escape(call_id)}" '
+                    f'name="{_html_mod.escape(name)}" '
+                    f'arguments="{args_attr}">\n'
+                    f'<summary>Tool Executed</summary>\n{result_body}\n</details>\n'
+                )
+
+            async def _write_content_delta(text: str) -> None:
+                """Send ``text`` as a standard OpenAI ``delta.content`` chunk."""
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
 
-                Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Three queue item shapes:
+
+                * ``("__tool_progress__", payload)`` — emitted in two
+                  channels: (a) the legacy custom
+                  ``event: hermes.tool.progress`` for native clients
+                  (TUI/ACP, see #6972/#16588); (b) an inline
+                  ``<details type="tool_calls">`` HTML block in
+                  ``delta.content`` so OpenWebUI users see live tool
+                  activity (its frontend drops custom SSE event names).
+                * ``("__reasoning_delta__", text)`` — sent as a
+                  ``delta.reasoning_content`` chunk; OpenWebUI converts
+                  these to a streaming ``<details type="reasoning">``
+                  block automatically.
+                * Plain strings — standard ``delta.content`` chunks.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
+                    payload = item[1]
+                    # (a) legacy custom event for native clients — fires
+                    # on BOTH running and completed so native UIs (TUI,
+                    # ACP) can show live tool start.
+                    event_data = json.dumps(payload)
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
-                else:
-                    content_chunk = {
+                    # (b) inline HTML for OpenWebUI — fires ONLY on
+                    # ``completed``.  We deliberately skip the running
+                    # placeholder: OpenWebUI's marked-extension snapshots
+                    # the ``done="false"`` attribute when the message
+                    # text stabilises, so a placeholder followed by a
+                    # completed block leaves the placeholder spinning
+                    # forever ("Executing… 🌀") because content is
+                    # append-only and we can never rewrite the prior
+                    # ``done="false"`` to ``done="true"``.  Single
+                    # ``done="true"`` block per tool gives a clean
+                    # checkmark + result, matching the pattern Claude
+                    # Desktop and the OpenAI Responses-API path use.
+                    if payload.get("status") == "completed":
+                        # Any non-empty content delta implicitly closes
+                        # a streaming reasoning block on OpenWebUI's
+                        # side (middleware.py:4153-4179).
+                        _owui_state["reasoning_open"] = False
+                        await _write_content_delta(_render_tool_call_html(payload))
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__reasoning_delta__":
+                    text = item[1]
+                    chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning_content": text},
+                            "finish_reason": None,
+                        }],
                     }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                    await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    _owui_state["reasoning_open"] = True
+                else:
+                    # Plain content delta — close any open reasoning block
+                    # first so OpenWebUI flips the "Thinking…" indicator
+                    # to "Thought for N seconds" before the answer text
+                    # arrives.
+                    if _owui_state["reasoning_open"]:
+                        _owui_state["reasoning_open"] = False
+                    await _write_content_delta(item)
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -1470,7 +1643,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "user_id": user_id,
             })
             if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+                self._response_store.set_conversation(conversation, response_id, user_id=user_id)
 
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
@@ -1879,9 +2052,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
 
-        # Resolve conversation name to latest response_id
+        # Resolve conversation name to latest response_id (scoped per user
+        # so two different end-users using the same `conversation` name
+        # cannot read each other's chain).
         if conversation:
-            previous_response_id = self._response_store.get_conversation(conversation)
+            previous_response_id = self._response_store.get_conversation(
+                conversation, user_id=scope["user_id"]
+            )
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
@@ -1972,6 +2149,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = _scope_session_id(stored_session_id or str(uuid.uuid4()), scope)
         user_id = scope["user_id"]
         user_name = scope["user_name"]
+        self._touch_session_activity(session_id, scope)
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -2127,9 +2305,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "user_id": user_id,
             })
             # Update conversation mapping so the next request with the same
-            # conversation name automatically chains to this response
+            # conversation name automatically chains to this response.
+            # Per-user scope: same conversation name from two end-users
+            # gets two independent pointers.
             if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+                self._response_store.set_conversation(conversation, response_id, user_id=user_id)
 
         return web.json_response(response_data)
 
@@ -2476,6 +2656,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
         user_id: Optional[str] = None,
     ) -> tuple:
@@ -2500,6 +2681,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                reasoning_callback=reasoning_callback,
                 user_id=user_id,
             )
             if agent_ref is not None:
@@ -2688,6 +2870,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # the base came from the client, a stored response, or the auto-generated
         # run_id, it ends with -user-<id>(-chat-<id>).
         session_id = _scope_session_id(body_session_id or stored_session_id or run_id, scope)
+        self._touch_session_activity(session_id, scope)
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
@@ -2931,7 +3114,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams_created.pop(run_id, None)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
-
+            # Also age out terminal run statuses we keep around for polling.
             stale_statuses = [
                 run_id
                 for run_id, status in list(self._run_statuses.items())
@@ -2940,6 +3123,326 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
             for run_id in stale_statuses:
                 self._run_statuses.pop(run_id, None)
+
+    # ------------------------------------------------------------------
+    # Per-session idle-commit watcher.
+    #
+    # The api_server platform is stateless: every chat-completion request
+    # spawns a fresh AIAgent that is dropped when the response returns.
+    # The OpenViking memory plugin's sync_turn() runs per-turn (so messages
+    # accumulate inside OpenViking), but on_session_end() — which posts
+    # /sessions/{id}/commit and triggers OpenViking's auto memory-extraction
+    # pipeline — only fires from AIAgent's explicit shutdown, which we
+    # never call in this platform.
+    #
+    # Without intervention every session sits at commit_count=0 forever and
+    # no memory is ever extracted.  This watcher closes the loop:
+    #
+    #   - Every chat handler calls _touch_session_activity() with the
+    #     scoped session_id, recording the user/chat and bumping last_seen.
+    #   - A background task scans every IDLE_SCAN_INTERVAL_S seconds.
+    #   - Sessions idle for ≥IDLE_COMMIT_SECONDS get committed once.
+    #   - When the same session becomes active again, we clear the
+    #     "committed" flag so a later idle period commits incrementally
+    #     (OpenViking dedupes / merges memories across multiple commits).
+    #
+    # Operators can also explicitly fire commit via
+    # POST /v1/sessions/{session_id}/end (e.g. on chat-switch in OpenWebUI).
+    # ------------------------------------------------------------------
+
+    IDLE_COMMIT_SECONDS = 30.0
+    IDLE_SCAN_INTERVAL_S = 5.0
+    SESSION_ACTIVITY_TTL_S = 86400.0  # forget about sessions after a day
+
+    def _session_activity_file(self) -> Path:
+        """Resolve the disk path for the persisted session-activity table."""
+        if self._session_activity_path is None:
+            try:
+                from hermes_constants import get_hermes_home
+                base = get_hermes_home()
+            except Exception:
+                base = Path.home() / ".hermes"
+            self._session_activity_path = base / "session_activity.json"
+        return self._session_activity_path
+
+    def _persist_session_activity(self) -> None:
+        """Atomically write _session_activity to disk.
+
+        Best-effort: any failure is logged at DEBUG and swallowed.
+        Writes via tmp-file + os.replace so a crash mid-write can't leave
+        a half-written JSON file.
+        """
+        path = self._session_activity_file()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._session_activity_lock:
+                snapshot = dict(self._session_activity)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("[api_server] persist session_activity failed: %s", exc)
+
+    def _load_session_activity(self) -> None:
+        """Reload _session_activity from disk on startup.
+
+        After this call the regular idle watcher will commit anything
+        whose ``last_seen`` is past ``IDLE_COMMIT_SECONDS`` on its first
+        scan — the disk file is the only mechanism that survives a
+        container restart, so without it a user who closed their browser
+        mid-conversation never gets their preference extracted.
+        """
+        path = self._session_activity_file()
+        if not path.exists():
+            return
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("[api_server] load session_activity failed: %s", exc)
+            return
+        if not isinstance(loaded, dict):
+            return
+        # Drop entries past TTL — across many restarts this dict could
+        # otherwise grow unbounded.
+        now = time.time()
+        kept = {
+            sid: info for sid, info in loaded.items()
+            if isinstance(info, dict)
+            and now - float(info.get("last_seen", 0) or 0) < self.SESSION_ACTIVITY_TTL_S
+        }
+        with self._session_activity_lock:
+            for sid, info in kept.items():
+                # Don't clobber any record the running process already
+                # has (defensive — load is called once at startup).
+                self._session_activity.setdefault(sid, info)
+        logger.info(
+            "[api_server] reloaded %d session activity records "
+            "(of %d on disk) from %s",
+            len(kept), len(loaded), path,
+        )
+
+    def _maybe_commit_sibling_sessions(self, session_id: str, user_id: str, chat_id: str) -> None:
+        """When the same user opens a different chat_id, immediately
+        schedule a commit on every uncommitted session for that user
+        whose chat_id differs from the new one.
+
+        OpenWebUI does not notify the gateway on chat-switch, but a new
+        chat_id arriving from the same user is the natural "I'm done
+        with the old one" signal — much faster than waiting 30s of
+        idle for the watcher.
+        """
+        if not user_id or not chat_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        snapshot = list(self._session_activity.items())
+        for sid, info in snapshot:
+            if sid == session_id:
+                continue
+            if info.get("committed"):
+                continue
+            if info.get("user_id") != user_id:
+                continue
+            if info.get("chat_id") == chat_id:
+                continue
+            # Mark committed up-front so the periodic watcher doesn't
+            # also fire its own commit before this in-flight task lands.
+            info["committed"] = True
+            if loop is not None:
+                loop.create_task(self._commit_session_async(sid, info.get("user_id", "")))
+                logger.info(
+                    "[api_server] chat-switch: scheduled commit of %s "
+                    "(prior chat=%s, current=%s)",
+                    sid, info.get("chat_id", ""), chat_id,
+                )
+
+    def _touch_session_activity(self, session_id: str, scope: Dict[str, str]) -> None:
+        """Record (or refresh) per-session activity for the idle-commit watcher.
+
+        Called from each scoped chat handler after the session_id has been
+        finalised.  Resetting "committed" lets the next idle window commit
+        again — OpenViking handles incremental commits cleanly.
+
+        Side-effects:
+        - Detects chat-switch and schedules immediate commit on prior chats
+          for the same user (P1).
+        - Persists the activity table so a container restart doesn't lose
+          any pending commits (P0).
+        """
+        if not session_id:
+            return
+        user_id = scope.get("user_id", "")
+        chat_id = scope.get("chat_id", "")
+        # P1: detect chat-switch BEFORE we register the new session, so
+        # we look at the dict in its pre-touch state.
+        self._maybe_commit_sibling_sessions(session_id, user_id, chat_id)
+        info = self._session_activity.get(session_id)
+        if info is None:
+            self._session_activity[session_id] = {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "last_seen": time.time(),
+                "committed": False,
+            }
+        else:
+            info["last_seen"] = time.time()
+            info["committed"] = False
+            # Refresh user/chat in case of re-binding (defensive)
+            if user_id:
+                info["user_id"] = user_id
+            if chat_id:
+                info["chat_id"] = chat_id
+        # P0: persist so a container restart doesn't lose pending commits.
+        self._persist_session_activity()
+
+    def _commit_openviking_session_sync(self, session_id: str, user_id: str) -> bool:
+        """Direct POST to OpenViking /api/v1/sessions/{id}/commit.
+
+        Bypasses AIAgent so we don't pay the full agent-init cost just to
+        run a single HTTP POST.  Returns True on a 2xx response, False on
+        any failure (logged at WARN; non-fatal for the watcher loop).
+        """
+        endpoint = (os.environ.get("OPENVIKING_ENDPOINT", "") or "").rstrip("/")
+        if not endpoint:
+            return False
+        try:
+            import httpx
+        except ImportError:
+            logger.debug("[api_server] httpx unavailable; cannot commit OpenViking session")
+            return False
+        api_key = os.environ.get("OPENVIKING_API_KEY", "")
+        account = os.environ.get("OPENVIKING_ACCOUNT", "default")
+        agent = os.environ.get("OPENVIKING_AGENT", "hermes")
+        viking_user = user_id or os.environ.get("OPENVIKING_USER", "default")
+        headers = {
+            "Content-Type": "application/json",
+            "X-OpenViking-Account": account,
+            "X-OpenViking-User": viking_user,
+            "X-OpenViking-Agent": agent,
+        }
+        if api_key:
+            headers["X-API-Key"] = api_key
+        url = f"{endpoint}/api/v1/sessions/{session_id}/commit"
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(url, headers=headers, json={})
+                if resp.status_code == 404:
+                    # Session never reached OpenViking (no sync_turn fired).
+                    # Not an error — just nothing to commit.
+                    logger.debug(
+                        "[api_server] OpenViking session %s has no messages; skipping commit",
+                        session_id,
+                    )
+                    return False
+                resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[api_server] OpenViking commit failed for session %s: %s",
+                session_id, exc,
+            )
+            return False
+
+    async def _commit_session_async(self, session_id: str, user_id: str) -> bool:
+        """Run _commit_openviking_session_sync in the default executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._commit_openviking_session_sync, session_id, user_id
+        )
+
+    async def _session_idle_watcher(self) -> None:
+        """Background task: commit sessions idle ≥ IDLE_COMMIT_SECONDS."""
+        while True:
+            try:
+                await asyncio.sleep(self.IDLE_SCAN_INTERVAL_S)
+            except asyncio.CancelledError:
+                break
+            try:
+                now = time.time()
+                # Snapshot to avoid mutating during iteration.
+                snapshot = list(self._session_activity.items())
+                stale = [
+                    (sid, info) for sid, info in snapshot
+                    if not info.get("committed")
+                    and now - info.get("last_seen", now) >= self.IDLE_COMMIT_SECONDS
+                ]
+                # GC very old sessions so the dict doesn't grow unbounded
+                gc_keys = [
+                    sid for sid, info in snapshot
+                    if now - info.get("last_seen", now) >= self.SESSION_ACTIVITY_TTL_S
+                ]
+                for sid in gc_keys:
+                    self._session_activity.pop(sid, None)
+
+                for sid, info in stale:
+                    ok = await self._commit_session_async(sid, info.get("user_id", ""))
+                    # Mark committed even on False so we don't retry forever
+                    # for sessions OpenViking doesn't know about.  A new chat
+                    # turn will reset this via _touch_session_activity.
+                    info["committed"] = True
+                    if ok:
+                        logger.info(
+                            "[api_server] auto-committed idle session %s (user=%s, chat=%s)",
+                            sid, info.get("user_id", ""), info.get("chat_id", ""),
+                        )
+                # P0: persist after every scan iteration that mutated the
+                # table — saves both committed-flag flips and gc removals.
+                if stale or gc_keys:
+                    self._persist_session_activity()
+            except Exception as exc:
+                logger.warning("[api_server] idle-watcher iteration failed: %s", exc)
+
+    async def _handle_end_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/end — explicitly commit a session.
+
+        Designed for clients (e.g. OpenWebUI chat-switch hook) that want
+        memory extraction to happen NOW rather than after the 30s idle
+        window.  The caller must own the session — we verify by checking
+        that the session_id ends with the same -user-<id> suffix the
+        request's X-OpenWebUI-User-Id sanitises to.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        scope = _extract_owui_scope(request)
+        if not scope["user_id"]:
+            return _missing_user_id_error()
+
+        session_id = request.match_info["session_id"]
+        # Ownership: session_id must contain "-user-{caller}".  Returning 404
+        # rather than 403 to avoid revealing whether the session exists.
+        if f"-user-{scope['user_id']}" not in session_id:
+            return web.json_response(
+                _openai_error(f"Session not found: {session_id}"), status=404,
+            )
+
+        info = self._session_activity.get(session_id)
+        user_id_for_commit = (info or {}).get("user_id") or scope["user_id"]
+
+        ok = await self._commit_session_async(session_id, user_id_for_commit)
+        if info is not None:
+            info["committed"] = True
+            # P0: persist the flip so a restart doesn't double-commit
+            # this session.
+            self._persist_session_activity()
+        if not ok:
+            return web.json_response(
+                _openai_error(
+                    f"Commit failed for session {session_id} "
+                    "(session may not have any messages in OpenViking yet)",
+                    err_type="server_error",
+                ),
+                status=502,
+            )
+
+        return web.json_response({
+            "id": session_id,
+            "object": "session.end",
+            "committed": True,
+        })
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -2978,6 +3481,23 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Explicit session-end (commit + memory extraction).  Pair with the
+            # idle watcher below — clients that know they're done (e.g. on
+            # chat-switch) can call this to fire commit immediately.
+            self._app.router.add_post("/v1/sessions/{session_id}/end", self._handle_end_session)
+            # P0: restore the activity table from disk so a container
+            # restart doesn't lose pending commits.  Must run BEFORE the
+            # watcher starts so its first scan sees the loaded entries.
+            self._load_session_activity()
+            # Background watcher: commits OpenViking sessions after 30s idle so
+            # auto memory-extraction actually happens.  See _session_idle_watcher.
+            self._idle_commit_task = asyncio.create_task(self._session_idle_watcher())
+            try:
+                self._background_tasks.add(self._idle_commit_task)
+            except TypeError:
+                pass
+            if hasattr(self._idle_commit_task, "add_done_callback"):
+                self._idle_commit_task.add_done_callback(self._background_tasks.discard)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -3050,6 +3570,18 @@ class APIServerAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop the aiohttp web server."""
         self._mark_disconnected()
+        # Stop the idle-commit watcher first so we don't fire commits at
+        # OpenViking after the network is being torn down.  Best-effort —
+        # the watcher swallows CancelledError.
+        if self._idle_commit_task is not None and not self._idle_commit_task.done():
+            self._idle_commit_task.cancel()
+            try:
+                await asyncio.wait_for(self._idle_commit_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
+                pass
+            self._idle_commit_task = None
         if self._site:
             await self._site.stop()
             self._site = None
