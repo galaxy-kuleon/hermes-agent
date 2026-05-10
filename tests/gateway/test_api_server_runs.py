@@ -41,9 +41,32 @@ def _make_adapter(api_key: str = "") -> APIServerAdapter:
     return adapter
 
 
-def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
+_TEST_OPENWEBUI_USER_ID = "test-openwebui-user"
+
+
+def _scoped_session_id(base: str) -> str:
+    return f"{base}-user-{_TEST_OPENWEBUI_USER_ID}"
+
+
+@web.middleware
+async def _test_openwebui_user_middleware(request, handler):
+    """Mirror OpenWebUI's forwarded user header for success-path run tests."""
+    if "X-OpenWebUI-User-Id" not in request.headers:
+        headers = request.headers.copy()
+        headers["X-OpenWebUI-User-Id"] = _TEST_OPENWEBUI_USER_ID
+        request = request.clone(headers=headers)
+    return await handler(request)
+
+
+def _create_runs_app(
+    adapter: APIServerAdapter, *, default_openwebui_user: bool = True
+) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    mws = [
+        mw for mw in (cors_middleware, security_headers_middleware) if mw is not None
+    ]
+    if default_openwebui_user:
+        mws.append(_test_openwebui_user_middleware)
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
@@ -100,6 +123,15 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_start_missing_openwebui_user_header_returns_400(self, adapter):
+        app = _create_runs_app(adapter, default_openwebui_user=False)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs", json={"input": "hello"})
+            assert resp.status == 400
+            data = await resp.json()
+            assert "X-OpenWebUI-User-Id" in data["error"]["message"]
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -253,11 +285,10 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                # task_id stays "default" so the Runs API shares one sandbox
-                # container with CLI/gateway; session_id is surfaced in status
-                # for external UIs to correlate runs with their own session IDs.
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "default"
-                assert status["session_id"] == "space-session"
+                assert mock_agent.run_conversation.call_args.kwargs[
+                    "task_id"
+                ] == _scoped_session_id("space-session")
+                assert status["session_id"] == _scoped_session_id("space-session")
 
     @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):
@@ -421,7 +452,9 @@ class TestStopRun:
             with patch.object(adapter, "_create_agent") as mock_create:
                 mock_agent, agent_ready, _ = _make_slow_agent()
                 # Override the interrupt side_effect to raise
-                mock_agent.interrupt = MagicMock(side_effect=RuntimeError("interrupt failed"))
+                mock_agent.interrupt = MagicMock(
+                    side_effect=RuntimeError("interrupt failed")
+                )
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})

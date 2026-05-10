@@ -28,7 +28,9 @@ class _CapturingAgent:
         type(self).last_init = dict(kwargs)
         self.tools = []
 
-    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+    def run_conversation(
+        self, user_message: str, conversation_history=None, task_id=None
+    ):
         return {
             "final_response": "ok",
             "messages": [],
@@ -85,7 +87,9 @@ def _explode_runtime_resolution():
 def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution
+    )
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = _CapturingAgent
@@ -103,7 +107,10 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     )
     session_key = "agent:main:local:dm"
     runner._session_model_overrides[session_key] = _codex_override()
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_reasoning_overrides[session_key] = {
+        "enabled": True,
+        "effort": "high",
+    }
 
     result = asyncio.run(
         runner._run_agent(
@@ -121,15 +128,24 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
     assert _CapturingAgent.last_init["provider"] == "openai-codex"
     assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
-    assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert (
+        _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
+    )
     assert _CapturingAgent.last_init["api_key"] == "***"
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "high",
+    }
 
 
 @pytest.mark.asyncio
-async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
+async def test_background_task_prefers_session_override_over_global_runtime(
+    monkeypatch,
+):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution
+    )
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = _CapturingAgent
@@ -152,7 +168,10 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     )
     session_key = runner._session_key_for_source(source)
     runner._session_model_overrides[session_key] = _codex_override()
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_reasoning_overrides[session_key] = {
+        "enabled": True,
+        "effort": "high",
+    }
 
     await runner._run_background_task("say hello", source, "bg_test")
 
@@ -160,6 +179,75 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     assert _CapturingAgent.last_init["model"] == "gpt-5.4"
     assert _CapturingAgent.last_init["provider"] == "openai-codex"
     assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
-    assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert (
+        _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
+    )
     assert _CapturingAgent.last_init["api_key"] == "***"
-    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert _CapturingAgent.last_init["reasoning_config"] == {
+        "enabled": True,
+        "effort": "high",
+    }
+
+
+def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
+    """Regression: fallback provider must not inherit the primary model.
+
+    If primary openai-codex auth fails and fallback_providers selects
+    OpenRouter/minimax, the gateway must instantiate AIAgent with the fallback
+    model, not the primary config model (e.g. gpt-5.5). Otherwise OpenRouter
+    receives an unintended GPT request.
+    """
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+model:
+  default: gpt-5.5
+  provider: openai-codex
+fallback_providers:
+  - provider: openrouter
+    model: minimax/minimax-m2.7
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    def fake_resolve_runtime_provider(
+        *, requested=None, explicit_base_url=None, explicit_api_key=None
+    ):
+        if requested in (None, "", "openai-codex"):
+            from hermes_cli.auth import AuthError
+
+            raise AuthError(
+                "No Codex credentials stored. Run `hermes auth` to authenticate."
+            )
+        assert requested == "openrouter"
+        return {
+            "api_key": "sk-openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        }
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(
+        runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider
+    )
+
+    runner = _make_runner()
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key="agent:main:telegram:group:-1003715515980:63",
+        user_config={
+            "model": {"default": "gpt-5.5", "provider": "openai-codex"},
+            "fallback_providers": [
+                {"provider": "openrouter", "model": "minimax/minimax-m2.7"}
+            ],
+        },
+    )
+
+    assert model == "minimax/minimax-m2.7"
+    assert runtime_kwargs["provider"] == "openrouter"
+    assert runtime_kwargs["api_key"] == "sk-openrouter"

@@ -27,9 +27,16 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import mimetypes
 import os
+import tempfile
 import threading
+import uuid
+import zipfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -38,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
+_REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 
 
 # ---------------------------------------------------------------------------
@@ -68,10 +76,12 @@ atexit.register(_atexit_commit_sessions)
 # HTTP helper — uses httpx to avoid requiring the openviking SDK
 # ---------------------------------------------------------------------------
 
+
 def _get_httpx():
     """Lazy import httpx."""
     try:
         import httpx
+
         return httpx
     except ImportError:
         return None
@@ -80,8 +90,14 @@ def _get_httpx():
 class _VikingClient:
     """Thin HTTP client for the OpenViking REST API."""
 
-    def __init__(self, endpoint: str, api_key: str = "",
-                 account: str = "", user: str = "", agent: str = ""):
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str = "",
+        account: str = "",
+        user: str = "",
+        agent: str = "",
+    ):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
@@ -92,38 +108,99 @@ class _VikingClient:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
 
     def _headers(self) -> dict:
+        # Only send tenant headers when the user actually configured them.
+        # Legacy installs had account/user defaulted to the literal string
+        # "default" — treat that as unset so authenticated remote servers
+        # that derive tenancy from the Bearer key aren't overridden by a
+        # bogus tenant value.
         h = {
             "Content-Type": "application/json",
-            "X-OpenViking-Account": self._account,
-            "X-OpenViking-User": self._user,
             "X-OpenViking-Agent": self._agent,
         }
+        if self._account and self._account != "default":
+            h["X-OpenViking-Account"] = self._account
+        if self._user and self._user != "default":
+            h["X-OpenViking-User"] = self._user
         if self._api_key:
             h["X-API-Key"] = self._api_key
+            h["Authorization"] = "Bearer " + self._api_key
         return h
 
     def _url(self, path: str) -> str:
         return f"{self._endpoint}{path}"
 
+    def _multipart_headers(self) -> dict:
+        headers = self._headers()
+        headers.pop("Content-Type", None)
+        return headers
+
+    def _parse_response(self, resp) -> dict:
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+
+        if resp.status_code >= 400:
+            if isinstance(data, dict):
+                error = data.get("error")
+                if isinstance(error, dict):
+                    code = error.get("code", "HTTP_ERROR")
+                    message = error.get("message", resp.text)
+                    raise RuntimeError(f"{code}: {message}")
+                if data.get("status") == "error":
+                    raise RuntimeError(str(data))
+            resp.raise_for_status()
+
+        if isinstance(data, dict) and data.get("status") == "error":
+            error = data.get("error")
+            if isinstance(error, dict):
+                code = error.get("code", "OPENVIKING_ERROR")
+                message = error.get("message", "")
+                raise RuntimeError(f"{code}: {message}")
+            raise RuntimeError(str(data))
+
+        if data is None:
+            return {}
+        return data
+
     def get(self, path: str, **kwargs) -> dict:
         resp = self._httpx.get(
             self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
         )
-        resp.raise_for_status()
-        return resp.json()
+        return self._parse_response(resp)
 
     def post(self, path: str, payload: dict = None, **kwargs) -> dict:
         resp = self._httpx.post(
-            self._url(path), json=payload or {}, headers=self._headers(),
-            timeout=_TIMEOUT, **kwargs
+            self._url(path),
+            json=payload or {},
+            headers=self._headers(),
+            timeout=_TIMEOUT,
+            **kwargs,
         )
-        resp.raise_for_status()
-        return resp.json()
+        return self._parse_response(resp)
+
+    def upload_temp_file(self, file_path: Path) -> str:
+        mime_type = (
+            mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        )
+        with file_path.open("rb") as f:
+            resp = self._httpx.post(
+                self._url("/api/v1/resources/temp_upload"),
+                files={"file": (file_path.name, f, mime_type)},
+                headers=self._multipart_headers(),
+                timeout=_TIMEOUT,
+            )
+        data = self._parse_response(resp)
+        result = data.get("result", {})
+        temp_file_id = result.get("temp_file_id", "")
+        if not temp_file_id:
+            raise RuntimeError("OpenViking temp upload did not return temp_file_id")
+        return temp_file_id
 
     def health(self) -> bool:
         try:
             resp = self._httpx.get(
-                self._url("/health"), timeout=3.0
+                self._url("/health"), headers=self._headers(), timeout=3.0
             )
             return resp.status_code == 200
         except Exception:
@@ -147,7 +224,8 @@ SEARCH_SCHEMA = {
         "properties": {
             "query": {"type": "string", "description": "Search query."},
             "mode": {
-                "type": "string", "enum": ["auto", "fast", "deep"],
+                "type": "string",
+                "enum": ["auto", "fast", "deep"],
                 "description": "Search depth (default: auto).",
             },
             "scope": {
@@ -174,7 +252,8 @@ READ_SCHEMA = {
         "properties": {
             "uri": {"type": "string", "description": "viking:// URI to read."},
             "level": {
-                "type": "string", "enum": ["abstract", "overview", "full"],
+                "type": "string",
+                "enum": ["abstract", "overview", "full"],
                 "description": "Detail level (default: overview).",
             },
         },
@@ -194,7 +273,8 @@ BROWSE_SCHEMA = {
         "type": "object",
         "properties": {
             "action": {
-                "type": "string", "enum": ["tree", "list", "stat"],
+                "type": "string",
+                "enum": ["tree", "list", "stat"],
                 "description": "Browse action.",
             },
             "path": {
@@ -216,7 +296,10 @@ REMEMBER_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "content": {"type": "string", "description": "The information to remember."},
+            "content": {
+                "type": "string",
+                "description": "The information to remember.",
+            },
             "category": {
                 "type": "string",
                 "enum": ["preference", "entity", "event", "case", "pattern"],
@@ -230,17 +313,41 @@ REMEMBER_SCHEMA = {
 ADD_RESOURCE_SCHEMA = {
     "name": "viking_add_resource",
     "description": (
-        "Add a URL or document to the OpenViking knowledge base. "
-        "Supports web pages, GitHub repos, PDFs, markdown, code files. "
+        "Add a remote URL or local file/directory to the OpenViking knowledge base. "
+        "Remote resources must be public http(s), git, or ssh URLs. "
+        "Local files are uploaded first using OpenViking temp_upload. "
         "The system automatically parses, indexes, and generates summaries."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "url": {"type": "string", "description": "URL or path of the resource to add."},
+            "url": {
+                "type": "string",
+                "description": "Remote URL or local file/directory path to add.",
+            },
             "reason": {
                 "type": "string",
                 "description": "Why this resource is relevant (improves search).",
+            },
+            "to": {
+                "type": "string",
+                "description": "Optional target viking:// URI for the resource.",
+            },
+            "parent": {
+                "type": "string",
+                "description": "Optional parent viking:// URI. Cannot be used with to.",
+            },
+            "instruction": {
+                "type": "string",
+                "description": "Optional processing instruction for semantic extraction.",
+            },
+            "wait": {
+                "type": "boolean",
+                "description": "Whether to wait for processing to complete.",
+            },
+            "timeout": {
+                "type": "number",
+                "description": "Timeout in seconds when wait is true.",
             },
         },
         "required": ["url"],
@@ -248,9 +355,55 @@ ADD_RESOURCE_SCHEMA = {
 }
 
 
+def _zip_directory(dir_path: Path) -> Path:
+    """Create a temporary zip file containing a directory tree."""
+    zip_path = Path(tempfile.gettempdir()) / f"openviking_upload_{uuid.uuid4().hex}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file_path in dir_path.rglob("*"):
+            if file_path.is_file():
+                arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
+                zipf.write(file_path, arcname=arcname)
+    return zip_path
+
+
+def _is_windows_absolute_path(value: str) -> bool:
+    return (
+        len(value) >= 3
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in ("/", "\\")
+    )
+
+
+def _is_remote_resource_source(value: str) -> bool:
+    return value.startswith(_REMOTE_RESOURCE_PREFIXES)
+
+
+def _is_local_path_reference(value: str) -> bool:
+    if not value or "\n" in value or "\r" in value:
+        return False
+    if _is_remote_resource_source(value):
+        return False
+    if _is_windows_absolute_path(value):
+        return True
+    return (
+        value.startswith(("/", "./", "../", "~/", ".\\", "..\\", "~\\"))
+        or "/" in value
+        or "\\" in value
+    )
+
+
+def _path_from_file_uri(uri: str) -> Path | str:
+    parsed = urlparse(uri)
+    if parsed.netloc not in ("", "localhost"):
+        return f"Unsupported non-local file URI: {uri}"
+    return Path(url2pathname(parsed.path)).expanduser()
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
+
 
 class OpenVikingMemoryProvider(MemoryProvider):
     """Full bidirectional memory via OpenViking context database."""
@@ -259,6 +412,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._client: Optional[_VikingClient] = None
         self._endpoint = ""
         self._api_key = ""
+        self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
+        self._user = os.environ.get("OPENVIKING_USER", "default")
+        self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
         self._session_id = ""
         self._turn_count = 0
         self._sync_thread: Optional[threading.Thread] = None
@@ -316,18 +472,25 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # Per-user scoping: allow the caller (agent) to override the OpenViking
         # user identity so that each end-user gets isolated memory in multi-user
         # org deployments. Falls back to the env var for backward compatibility.
-        self._user = kwargs.get("user_id", "") or os.environ.get("OPENVIKING_USER", "default")
+        self._user = kwargs.get("user_id", "") or os.environ.get(
+            "OPENVIKING_USER", "default"
+        )
         self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
         self._session_id = session_id
         self._turn_count = 0
 
         try:
             self._client = _VikingClient(
-                self._endpoint, self._api_key,
-                account=self._account, user=self._user, agent=self._agent,
+                self._endpoint,
+                self._api_key,
+                account=self._account,
+                user=self._user,
+                agent=self._agent,
             )
             if not self._client.health():
-                logger.warning("OpenViking server at %s is not reachable", self._endpoint)
+                logger.warning(
+                    "OpenViking server at %s is not reachable", self._endpoint
+                )
                 self._client = None
         except ImportError:
             logger.warning("httpx not installed — OpenViking plugin disabled")
@@ -451,8 +614,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "# OpenViking Knowledge Base\n"
                 f"Active. Endpoint: {self._endpoint}\n"
                 "Use viking_search, viking_read, viking_browse, "
-                "viking_remember, viking_add_resource.\n\n"
-                + memorize_rule
+                "viking_remember, viking_add_resource.\n\n" + memorize_rule
             )
 
         try:
@@ -487,8 +649,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return (
             "## Possibly-relevant context from prior sessions\n"
             "The following memories were retrieved by similarity.  Apply any "
-            "preferences / facts that are relevant to the current message.\n\n"
-            + result
+            "preferences / facts that are relevant to the current message.\n\n" + result
         )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -499,8 +660,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         def _run():
             try:
                 client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
+                    self._endpoint,
+                    self._api_key,
+                    account=self._account,
+                    user=self._user,
+                    agent=self._agent,
                 )
                 # Two-pass scoped prefetch.  Without target_uri the search
                 # returns memories from EVERY user in the org (ROOT key
@@ -509,9 +673,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 # opens up viking://resources/ for shared org documents
                 # which are intentionally cross-user.
                 parts: List[str] = []
-                user_target = (
-                    f"viking://user/{self._user}/" if self._user else None
-                )
+                user_target = f"viking://user/{self._user}/" if self._user else None
                 queries = []
                 if user_target:
                     queries.append((user_target, "memories"))
@@ -543,7 +705,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self, user_content: str, assistant_content: str, *, session_id: str = ""
+    ) -> None:
         """Record the conversation turn in OpenViking's session (non-blocking)."""
         if not self._client:
             return
@@ -553,21 +717,30 @@ class OpenVikingMemoryProvider(MemoryProvider):
         def _sync():
             try:
                 client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
+                    self._endpoint,
+                    self._api_key,
+                    account=self._account,
+                    user=self._user,
+                    agent=self._agent,
                 )
                 sid = self._session_id
 
                 # Add user message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
-                    "role": "user",
-                    "content": user_content[:4000],  # trim very long messages
-                })
+                client.post(
+                    f"/api/v1/sessions/{sid}/messages",
+                    {
+                        "role": "user",
+                        "content": user_content[:4000],  # trim very long messages
+                    },
+                )
                 # Add assistant message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
-                    "role": "assistant",
-                    "content": assistant_content[:4000],
-                })
+                client.post(
+                    f"/api/v1/sessions/{sid}/messages",
+                    {
+                        "role": "assistant",
+                        "content": assistant_content[:4000],
+                    },
+                )
             except Exception as e:
                 logger.debug("OpenViking sync_turn failed: %s", e)
 
@@ -600,7 +773,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         try:
             self._client.post(f"/api/v1/sessions/{self._session_id}/commit")
-            logger.info("OpenViking session %s committed (%d turns)", self._session_id, self._turn_count)
+            logger.info(
+                "OpenViking session %s committed (%d turns)",
+                self._session_id,
+                self._turn_count,
+            )
         except Exception as e:
             logger.warning("OpenViking session commit failed: %s", e)
 
@@ -612,17 +789,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
         def _write():
             try:
                 client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
+                    self._endpoint,
+                    self._api_key,
+                    account=self._account,
+                    user=self._user,
+                    agent=self._agent,
                 )
                 # Add as a user message with memory context so the commit
                 # picks it up as an explicit memory during extraction
-                client.post(f"/api/v1/sessions/{self._session_id}/messages", {
-                    "role": "user",
-                    "parts": [
-                        {"type": "text", "text": f"[Memory note — {target}] {content}"},
-                    ],
-                })
+                client.post(
+                    f"/api/v1/sessions/{self._session_id}/messages",
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "type": "text",
+                                "text": f"[Memory note — {target}] {content}",
+                            },
+                        ],
+                    },
+                )
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
 
@@ -630,7 +816,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
         t.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
+        return [
+            SEARCH_SCHEMA,
+            READ_SCHEMA,
+            BROWSE_SCHEMA,
+            REMEMBER_SCHEMA,
+            ADD_RESOURCE_SCHEMA,
+        ]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._client:
@@ -749,10 +941,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
         scored_entries.sort(key=lambda x: x[0], reverse=True)
         formatted = [entry for _, entry in scored_entries]
 
-        return json.dumps({
-            "results": formatted,
-            "total": result.get("total", len(formatted)),
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "results": formatted,
+                "total": result.get("total", len(formatted)),
+            },
+            ensure_ascii=False,
+        )
 
     def _tool_read(self, args: dict) -> str:
         uri = args.get("uri", "")
@@ -814,7 +1009,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
             max_len = 1200
 
         if len(content) > max_len:
-            content = content[:max_len] + "\n\n[... truncated, use a more specific URI or full level]"
+            content = (
+                content[:max_len]
+                + "\n\n[... truncated, use a more specific URI or full level]"
+            )
 
         payload = {
             "uri": uri,
@@ -832,7 +1030,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         path = args.get("path", "viking://")
 
         # Map action to the correct fs endpoint (all GET with uri= param)
-        endpoint_map = {"tree": "/api/v1/fs/tree", "list": "/api/v1/fs/ls", "stat": "/api/v1/fs/stat"}
+        endpoint_map = {
+            "tree": "/api/v1/fs/tree",
+            "list": "/api/v1/fs/ls",
+            "stat": "/api/v1/fs/stat",
+        }
         endpoint = endpoint_map.get(action, "/api/v1/fs/ls")
         resp = self._client.get(endpoint, params={"uri": path})
         result = self._unwrap_result(resp)
@@ -841,21 +1043,36 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if action in ("list", "tree"):
             raw_entries = result
             if isinstance(result, dict):
-                raw_entries = result.get("entries") or result.get("items") or result.get("children") or []
+                raw_entries = (
+                    result.get("entries")
+                    or result.get("items")
+                    or result.get("children")
+                    or []
+                )
 
             if isinstance(raw_entries, list):
                 entries = []
                 for e in raw_entries[:50]:  # cap at 50 entries
                     uri = e.get("uri", "")
-                    name = e.get("rel_path") or e.get("name") or (uri.rsplit("/", 1)[-1] if uri else "")
-                    is_dir = bool(e.get("isDir") or e.get("is_dir") or e.get("type") == "dir")
-                    entries.append({
-                        "name": name,
-                        "uri": uri,
-                        "type": "dir" if is_dir else "file",
-                        "abstract": e.get("abstract", ""),
-                    })
-                return json.dumps({"path": path, "entries": entries}, ensure_ascii=False)
+                    name = (
+                        e.get("rel_path")
+                        or e.get("name")
+                        or (uri.rsplit("/", 1)[-1] if uri else "")
+                    )
+                    is_dir = bool(
+                        e.get("isDir") or e.get("is_dir") or e.get("type") == "dir"
+                    )
+                    entries.append(
+                        {
+                            "name": name,
+                            "uri": uri,
+                            "type": "dir" if is_dir else "file",
+                            "abstract": e.get("abstract", ""),
+                        }
+                    )
+                return json.dumps(
+                    {"path": path, "entries": entries}, ensure_ascii=False
+                )
 
         return json.dumps(result, ensure_ascii=False)
 
@@ -871,40 +1088,89 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if category:
             text = f"[Remember — {category}] {content}"
 
-        self._client.post(f"/api/v1/sessions/{self._session_id}/messages", {
-            "role": "user",
-            "parts": [
-                {"type": "text", "text": text},
-            ],
-        })
+        self._client.post(
+            f"/api/v1/sessions/{self._session_id}/messages",
+            {
+                "role": "user",
+                "parts": [
+                    {"type": "text", "text": text},
+                ],
+            },
+        )
 
-        return json.dumps({
-            "status": "stored",
-            "message": "Memory recorded. Will be extracted and indexed on session commit.",
-        })
+        return json.dumps(
+            {
+                "status": "stored",
+                "message": "Memory recorded. Will be extracted and indexed on session commit.",
+            }
+        )
 
     def _tool_add_resource(self, args: dict) -> str:
         url = args.get("url", "")
         if not url:
             return tool_error("url is required")
 
-        payload: Dict[str, Any] = {"path": url}
-        if args.get("reason"):
-            payload["reason"] = args["reason"]
+        if args.get("to") and args.get("parent"):
+            return tool_error("Cannot specify both 'to' and 'parent'")
 
-        resp = self._client.post("/api/v1/resources", payload)
-        result = resp.get("result", {})
+        payload: Dict[str, Any] = {}
+        for key in ("reason", "to", "parent", "instruction", "wait", "timeout"):
+            if key in args and args[key] not in (None, ""):
+                payload[key] = args[key]
 
-        return json.dumps({
-            "status": "added",
-            "root_uri": result.get("root_uri", ""),
-            "message": "Resource queued for processing. Use viking_search after a moment to find it.",
-        }, ensure_ascii=False)
+        parsed_url = urlparse(url)
+        if _is_remote_resource_source(url):
+            source_path = None
+        elif parsed_url.scheme == "file":
+            source_path = _path_from_file_uri(url)
+            if isinstance(source_path, str):
+                return tool_error(source_path)
+        elif parsed_url.scheme and not _is_windows_absolute_path(url):
+            source_path = None
+        else:
+            source_path = Path(url).expanduser()
+
+        cleanup_path: Optional[Path] = None
+        try:
+            if source_path is not None:
+                if source_path.exists():
+                    if source_path.is_dir():
+                        payload["source_name"] = source_path.name
+                        cleanup_path = _zip_directory(source_path)
+                        upload_path = cleanup_path
+                    elif source_path.is_file():
+                        payload["source_name"] = source_path.name
+                        upload_path = source_path
+                    else:
+                        return tool_error(f"Unsupported local resource path: {url}")
+                    payload["temp_file_id"] = self._client.upload_temp_file(upload_path)
+                elif _is_local_path_reference(url):
+                    return tool_error(f"Local resource path does not exist: {url}")
+                else:
+                    payload["path"] = url
+            else:
+                payload["path"] = url
+
+            resp = self._client.post("/api/v1/resources", payload)
+            result = resp.get("result", {})
+        finally:
+            if cleanup_path:
+                cleanup_path.unlink(missing_ok=True)
+
+        return json.dumps(
+            {
+                "status": "added",
+                "root_uri": result.get("root_uri", ""),
+                "message": "Resource queued for processing. Use viking_search after a moment to find it.",
+            },
+            ensure_ascii=False,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
+
 
 def register(ctx) -> None:
     """Register OpenViking as a memory provider plugin."""
