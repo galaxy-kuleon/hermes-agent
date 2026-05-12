@@ -78,8 +78,10 @@ RUN chmod -R a+rX /opt/hermes && \
 # If HERMES_UID is unset, the entrypoint drops to the default hermes user (10000).
 
 # ---------- Python virtualenv ----------
-RUN uv venv && \
-    uv pip install --no-cache-dir -e ".[all]"
+# Use the committed lockfile. `pyproject.toml` intentionally uses a relative
+# exclude-newer window, so resolving during image builds can drift away from
+# the lock and fail on package availability.
+RUN uv sync --frozen --extra all --no-cache
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
