@@ -760,6 +760,10 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._openwebui_bridge_key: str = extra.get(
+            "openwebui_bridge_key",
+            os.getenv("OPENWEBUI_BRIDGE_API_KEY", ""),
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -793,11 +797,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # against the single-coroutine watcher).
         self._session_activity: Dict[str, Dict[str, Any]] = {}
         self._idle_commit_task: Optional["asyncio.Task"] = None
+        self._sweep_task: Optional["asyncio.Task"] = None
         # Disk-backed activity table — survives container/process restarts
         # so a user who walks away mid-conversation still gets memory
         # extraction once the watcher resumes after restart.  Path is
         # resolved lazily on first persist.
         self._session_activity_path: Optional[Path] = None
+        self._openwebui_bridge_service: Optional[Any] = None
+        self._dreaming_scheduler_task: Optional["asyncio.Task"] = None
         import threading as _threading
 
         self._session_activity_lock = _threading.Lock()
@@ -899,6 +906,256 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             status=401,
         )
+
+    def _check_strict_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Require an API key for sensitive internal bridge routes."""
+        if not self._openwebui_bridge_key:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "OPENWEBUI_BRIDGE_API_KEY required for internal OpenWebUI bridge routes",
+                        "type": "invalid_request_error",
+                        "code": "api_key_required",
+                    }
+                },
+                status=401,
+            )
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            if hmac.compare_digest(token, self._openwebui_bridge_key):
+                return None
+
+        return web.json_response(
+            {
+                "error": {
+                    "message": "Invalid OpenWebUI bridge API key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+            status=401,
+        )
+
+    # ------------------------------------------------------------------
+    # OpenWebUI memory/dreaming bridge
+    # ------------------------------------------------------------------
+
+    def _openwebui_bridge(self) -> Any:
+        """Lazy-load the OpenWebUI bridge service.
+
+        Importing lazily keeps the existing OpenAI-compatible API surface
+        unchanged for deployments that never call the internal bridge routes.
+        """
+        if self._openwebui_bridge_service is None:
+            from gateway.openwebui_bridge import OpenWebUIBridgeService
+
+            self._openwebui_bridge_service = OpenWebUIBridgeService.from_env()
+        return self._openwebui_bridge_service
+
+    def _require_owui_scope(
+        self, request: "web.Request"
+    ) -> tuple[Optional[Dict[str, str]], Optional["web.Response"]]:
+        auth_err = self._check_strict_auth(request)
+        if auth_err:
+            return None, auth_err
+        scope = _extract_owui_scope(request)
+        if not scope.get("user_id"):
+            return None, _missing_user_id_error()
+        return scope, None
+
+    def _require_owui_admin(self, request: "web.Request") -> Optional["web.Response"]:
+        auth_err = self._check_strict_auth(request)
+        if auth_err:
+            return auth_err
+        if request.headers.get("X-OpenWebUI-User-Role", "").strip().lower() != "admin":
+            return web.json_response({"error": "admin role required"}, status=403)
+        return None
+
+    @staticmethod
+    def _json_error(message: str, status: int = 400) -> "web.Response":
+        return web.json_response({"error": message}, status=status)
+
+    @staticmethod
+    def _event_user_ids(event: Dict[str, Any]) -> set[str]:
+        user_ids = set()
+        for value in (event.get("user_id"),):
+            if isinstance(value, str) and value.strip():
+                user_ids.add(value.strip())
+        feedback = event.get("feedback") if isinstance(event.get("feedback"), dict) else {}
+        previous = event.get("previous_feedback") if isinstance(event.get("previous_feedback"), dict) else {}
+        for payload in (feedback, previous):
+            value = payload.get("user_id")
+            if isinstance(value, str) and value.strip():
+                user_ids.add(value.strip())
+        return user_ids
+
+    async def _handle_openwebui_feedback_events(self, request: "web.Request") -> "web.Response":
+        """POST /api/openwebui/feedback-events.
+
+        Accepts at-least-once OpenWebUI outbox deliveries and stores one raw
+        signal per user/event idempotently in OpenViking.
+        """
+        scope, err = self._require_owui_scope(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                return self._json_error("JSON object body required")
+            if not body.get("event_id"):
+                idem = request.headers.get("Idempotency-Key", "").strip()
+                if idem:
+                    body["event_id"] = idem
+            mismatched_users = self._event_user_ids(body) - {scope["user_id"]}
+            if mismatched_users:
+                return self._json_error("feedback event user_id does not match authenticated scope", status=400)
+            result = await self._openwebui_bridge().ingest_feedback(scope["user_id"], body)
+            return web.json_response(result)
+        except ValueError as exc:
+            return self._json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception("OpenWebUI feedback ingestion failed")
+            return self._json_error(str(exc), status=500)
+
+    async def _handle_openwebui_list_memories(self, request: "web.Request") -> "web.Response":
+        """GET /api/openwebui/memories."""
+        scope, err = self._require_owui_scope(request)
+        if err:
+            return err
+        limit_raw = request.query.get("limit")
+        limit = None
+        if limit_raw:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                return self._json_error("limit must be an integer", status=400)
+            if limit <= 0:
+                return self._json_error("limit must be greater than zero", status=400)
+        try:
+            memories = await self._openwebui_bridge().list_memories(
+                scope["user_id"],
+                memory_type=request.query.get("type") or None,
+                query=request.query.get("q") or request.query.get("query") or None,
+                limit=limit,
+            )
+            complete = limit is None or len(memories) < limit
+            return web.json_response(
+                {
+                    "memories": memories,
+                    "total": len(memories) if complete else None,
+                    "has_more": not complete,
+                    "truncated": not complete,
+                }
+            )
+        except ValueError as exc:
+            return self._json_error(str(exc), status=400)
+        except Exception as exc:
+            from gateway.openwebui_bridge import OpenVikingListingTruncated
+
+            if isinstance(exc, OpenVikingListingTruncated):
+                return web.json_response(
+                    {
+                        "memories": [],
+                        "total": 0,
+                        "has_more": True,
+                        "truncated": True,
+                        "error": str(exc),
+                    }
+                )
+            logger.exception("OpenWebUI memory list failed")
+            return self._json_error(str(exc), status=500)
+
+    async def _handle_openwebui_upsert_memory(self, request: "web.Request") -> "web.Response":
+        """POST /api/openwebui/memories."""
+        scope, err = self._require_owui_scope(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                return self._json_error("JSON object body required")
+            memory = await self._openwebui_bridge().upsert_memory(scope["user_id"], body)
+            return web.json_response({"memory": memory})
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if exc.__class__.__name__ == "OpenVikingNotFound":
+                status = 404
+            else:
+                status = 409 if "tombstone" in error_text or "retracted" in error_text else 400
+            return self._json_error(str(exc), status=status)
+
+    async def _handle_openwebui_delete_memory(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/openwebui/memories/{memory_id} or ?memory_id=..."""
+        scope, err = self._require_owui_scope(request)
+        if err:
+            return err
+        memory_id = (
+            request.match_info.get("memory_id")
+            or request.query.get("memory_id")
+            or request.query.get("id")
+            or ""
+        ).strip()
+        if not memory_id:
+            return self._json_error("memory_id is required")
+        try:
+            result = await self._openwebui_bridge().delete_memory(scope["user_id"], memory_id)
+            return web.json_response(result)
+        except ValueError as exc:
+            return self._json_error(str(exc), status=400)
+        except Exception as exc:
+            return self._json_error(str(exc), status=500)
+
+    async def _handle_dreaming_run_now(self, request: "web.Request") -> "web.Response":
+        """POST /api/dreaming/run-now."""
+        auth_err = self._check_strict_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json() if request.can_read_body else {}
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            body = {}
+
+        scope_mode = str(body.get("scope") or request.query.get("scope") or "user").lower()
+        org = scope_mode in {"org", "global", "organization"}
+        if org:
+            admin_err = self._require_owui_admin(request)
+            if admin_err:
+                return admin_err
+            try:
+                return web.json_response(await self._openwebui_bridge().run_nightly_pipeline())
+            except Exception as exc:
+                logger.exception("Org dreaming run failed")
+                return self._json_error(str(exc), status=500)
+
+        scope, scope_err = self._require_owui_scope(request)
+        if scope_err:
+            return scope_err
+        try:
+            return web.json_response(await self._openwebui_bridge().run_now(user_id=scope["user_id"]))
+        except ValueError as exc:
+            return self._json_error(str(exc), status=400)
+        except Exception as exc:
+            logger.exception("User dreaming run failed")
+            return self._json_error(str(exc), status=500)
+
+    async def _handle_dreaming_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/dreaming/status."""
+        auth_err = self._check_strict_auth(request)
+        if auth_err:
+            return auth_err
+        scope_mode = str(request.query.get("scope") or "user").lower()
+        if scope_mode in {"org", "global", "organization"}:
+            admin_err = self._require_owui_admin(request)
+            if admin_err:
+                return admin_err
+            return web.json_response(self._openwebui_bridge().status(org=True))
+        scope, scope_err = self._require_owui_scope(request)
+        if scope_err:
+            return scope_err
+        return web.json_response(self._openwebui_bridge().status(user_id=scope["user_id"]))
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -4390,6 +4647,29 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete(
                 "/v1/responses/{response_id}", self._handle_delete_response
             )
+            # OpenWebUI internal bridge APIs (user-scoped memory + dreaming).
+            self._app.router.add_post(
+                "/api/openwebui/feedback-events",
+                self._handle_openwebui_feedback_events,
+            )
+            self._app.router.add_get(
+                "/api/openwebui/memories",
+                self._handle_openwebui_list_memories,
+            )
+            self._app.router.add_post(
+                "/api/openwebui/memories",
+                self._handle_openwebui_upsert_memory,
+            )
+            self._app.router.add_delete(
+                "/api/openwebui/memories",
+                self._handle_openwebui_delete_memory,
+            )
+            self._app.router.add_delete(
+                "/api/openwebui/memories/{memory_id}",
+                self._handle_openwebui_delete_memory,
+            )
+            self._app.router.add_post("/api/dreaming/run-now", self._handle_dreaming_run_now)
+            self._app.router.add_get("/api/dreaming/status", self._handle_dreaming_status)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
@@ -4416,28 +4696,6 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/end", self._handle_end_session
             )
-            # P0: restore the activity table from disk so a container
-            # restart doesn't lose pending commits.  Must run BEFORE the
-            # watcher starts so its first scan sees the loaded entries.
-            self._load_session_activity()
-            # Background watcher: commits OpenViking sessions after 30s idle so
-            # auto memory-extraction actually happens.  See _session_idle_watcher.
-            self._idle_commit_task = asyncio.create_task(self._session_idle_watcher())
-            try:
-                self._background_tasks.add(self._idle_commit_task)
-            except TypeError:
-                pass
-            if hasattr(self._idle_commit_task, "add_done_callback"):
-                self._idle_commit_task.add_done_callback(self._background_tasks.discard)
-            # Start background sweep to clean up orphaned (unconsumed) run streams
-            sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
-            try:
-                self._background_tasks.add(sweep_task)
-            except TypeError:
-                pass
-            if hasattr(sweep_task, "add_done_callback"):
-                sweep_task.add_done_callback(self._background_tasks.discard)
-
             # Refuse to start network-accessible without authentication
             if is_network_accessible(self._host) and not self._api_key:
                 logger.error(
@@ -4486,6 +4744,47 @@ class APIServerAdapter(BasePlatformAdapter):
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
 
+            # P0: restore the activity table from disk so a container
+            # restart doesn't lose pending commits.  Must run BEFORE the
+            # watcher starts so its first scan sees the loaded entries.
+            self._load_session_activity()
+            # Background watcher: commits OpenViking sessions after 30s idle so
+            # auto memory-extraction actually happens.  See _session_idle_watcher.
+            self._idle_commit_task = asyncio.create_task(self._session_idle_watcher())
+            try:
+                self._background_tasks.add(self._idle_commit_task)
+            except TypeError:
+                pass
+            if hasattr(self._idle_commit_task, "add_done_callback"):
+                self._idle_commit_task.add_done_callback(self._background_tasks.discard)
+            # Start background sweep to clean up orphaned (unconsumed) run streams.
+            self._sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
+            try:
+                self._background_tasks.add(self._sweep_task)
+            except TypeError:
+                pass
+            if hasattr(self._sweep_task, "add_done_callback"):
+                self._sweep_task.add_done_callback(self._background_tasks.discard)
+
+            if os.getenv("HERMES_DREAMING_ENABLED", "false").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                from gateway.openwebui_bridge import dreaming_scheduler_loop
+
+                poll_seconds = float(os.getenv("HERMES_DREAMING_POLL_SECONDS", "300"))
+                self._dreaming_scheduler_task = asyncio.create_task(
+                    dreaming_scheduler_loop(self._openwebui_bridge(), poll_seconds=poll_seconds)
+                )
+                try:
+                    self._background_tasks.add(self._dreaming_scheduler_task)
+                except TypeError:
+                    pass
+                if hasattr(self._dreaming_scheduler_task, "add_done_callback"):
+                    self._dreaming_scheduler_task.add_done_callback(self._background_tasks.discard)
+
             self._mark_connected()
             if not self._api_key:
                 logger.warning(
@@ -4506,6 +4805,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
+            try:
+                await self.disconnect()
+            except Exception:
+                pass
             return False
 
     async def disconnect(self) -> None:
@@ -4514,15 +4817,44 @@ class APIServerAdapter(BasePlatformAdapter):
         # Stop the idle-commit watcher first so we don't fire commits at
         # OpenViking after the network is being torn down.  Best-effort —
         # the watcher swallows CancelledError.
-        if self._idle_commit_task is not None and not self._idle_commit_task.done():
-            self._idle_commit_task.cancel()
-            try:
-                await asyncio.wait_for(self._idle_commit_task, timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            except Exception:
-                pass
+        if self._idle_commit_task is not None:
+            if not self._idle_commit_task.done():
+                self._idle_commit_task.cancel()
+                try:
+                    await asyncio.wait_for(self._idle_commit_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:
+                    pass
             self._idle_commit_task = None
+        if self._sweep_task is not None:
+            if not self._sweep_task.done():
+                self._sweep_task.cancel()
+                try:
+                    await asyncio.wait_for(self._sweep_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:
+                    pass
+            self._sweep_task = None
+        if self._dreaming_scheduler_task is not None:
+            if not self._dreaming_scheduler_task.done():
+                self._dreaming_scheduler_task.cancel()
+                try:
+                    await asyncio.wait_for(self._dreaming_scheduler_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:
+                    pass
+            self._dreaming_scheduler_task = None
+        if self._openwebui_bridge_service is not None:
+            client = getattr(self._openwebui_bridge_service, "client", None)
+            close = getattr(client, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    pass
         if self._site:
             await self._site.stop()
             self._site = None
