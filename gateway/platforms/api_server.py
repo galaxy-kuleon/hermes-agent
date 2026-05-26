@@ -33,6 +33,7 @@ Requires:
 
 import asyncio
 import hashlib
+import html
 import hmac
 import json
 import logging
@@ -92,6 +93,14 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+HANDOFF_DIR = Path(os.environ.get("SKIP_RAG_HANDOFF_DIR", "/handoff")).resolve()
+HANDOFF_MARKDOWN_CHAR_BUDGET = int(
+    os.environ.get("HERMES_HANDOFF_MARKDOWN_CHAR_BUDGET", "500000")
+)
+HANDOFF_SIGNING_KEY = os.environ.get(
+    "SKIP_RAG_HANDOFF_SIGNING_KEY",
+    os.environ.get("OPENWEBUI_BRIDGE_API_KEY", ""),
+)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -193,6 +202,170 @@ def _normalize_chat_content(
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
     except Exception:
         return ""
+
+
+_FILES_BLOCK_RE = re.compile(r"<files>\s*(?P<body>.*?)\s*</files>", re.DOTALL)
+_FILE_TAG_RE = re.compile(r"<file\b(?P<attrs>[^>]*)/?>", re.DOTALL)
+_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _sign_handoff_entry(user_id: str, chat_id: str, original_path: str, markdown_path: str) -> str:
+    """Return the expected OWUI handoff HMAC for one file entry."""
+    if not HANDOFF_SIGNING_KEY:
+        return ""
+    payload = "\0".join([user_id, chat_id, original_path, markdown_path]).encode("utf-8")
+    return hmac.new(HANDOFF_SIGNING_KEY.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _safe_handoff_path(path_text: str, scope: Dict[str, str]) -> Optional[Path]:
+    """Return a resolved caller-scoped /handoff path, or None if invalid."""
+    if not path_text:
+        return None
+    try:
+        candidate = Path(html.unescape(path_text)).resolve()
+    except (OSError, RuntimeError):
+        return None
+    user_id = scope.get("user_id", "")
+    chat_id = scope.get("chat_id", "") or "nochat"
+    allowed_root = (HANDOFF_DIR / "user" / user_id / "chat" / chat_id).resolve()
+    if candidate == allowed_root or allowed_root in candidate.parents:
+        return candidate
+    logger.warning(
+        "Rejecting skip-rag handoff path outside scoped root %s: %s",
+        allowed_root,
+        candidate,
+    )
+    return None
+
+
+def _parse_handoff_file_entries(text: str) -> List[Dict[str, str]]:
+    """Parse OWUI skip-rag <files><file .../></files> entries from a message."""
+    entries: List[Dict[str, str]] = []
+    for block in _FILES_BLOCK_RE.finditer(text or ""):
+        for tag in _FILE_TAG_RE.finditer(block.group("body")):
+            attrs = {
+                key: html.unescape(value)
+                for key, value in _ATTR_RE.findall(tag.group("attrs"))
+            }
+            name = attrs.get("name", "file")
+            original = attrs.get("original", "")
+            markdown = attrs.get("markdown", "")
+            if original or markdown:
+                entries.append(
+                    {
+                        "name": name,
+                        "original": original,
+                        "markdown": markdown,
+                        "user": attrs.get("user", ""),
+                        "chat": attrs.get("chat", ""),
+                        "sig": attrs.get("sig", ""),
+                    }
+                )
+    return entries
+
+
+def _verify_handoff_entry(entry: Dict[str, str], scope: Dict[str, str]) -> bool:
+    """Verify user/chat scope and OWUI HMAC before reading a handoff entry."""
+    user_id = scope.get("user_id", "")
+    chat_id = scope.get("chat_id", "") or "nochat"
+    if not user_id:
+        logger.warning("Rejecting skip-rag handoff: missing OpenWebUI user scope")
+        return False
+    if entry.get("user") != user_id or (entry.get("chat") or "nochat") != chat_id:
+        logger.warning(
+            "Rejecting skip-rag handoff: entry scope user=%r chat=%r does not match request user=%r chat=%r",
+            entry.get("user"),
+            entry.get("chat"),
+            user_id,
+            chat_id,
+        )
+        return False
+    if not HANDOFF_SIGNING_KEY:
+        logger.warning("Rejecting skip-rag handoff: SKIP_RAG_HANDOFF_SIGNING_KEY is not configured")
+        return False
+    expected = _sign_handoff_entry(user_id, chat_id, entry.get("original", ""), entry.get("markdown", ""))
+    if not hmac.compare_digest(expected, entry.get("sig", "")):
+        logger.warning("Rejecting skip-rag handoff: invalid signature for user=%s chat=%s", user_id, chat_id)
+        return False
+    return True
+
+
+def _build_handoff_context(entries: List[Dict[str, str]], scope: Dict[str, str]) -> str:
+    """
+    Hydrate skip-rag handoff file entries into bounded markdown context.
+
+    OpenWebUI Path B writes original+markdown files into the shared /handoff
+    volume and sends only paths in a transient <files> block. Hermes consumes
+    that contract here so the agent can answer from the markdown without OWUI
+    embedding or persisting file contents.
+    """
+    if not entries:
+        return ""
+
+    remaining = max(0, HANDOFF_MARKDOWN_CHAR_BUDGET)
+    sections: List[str] = [
+        '<file_contents source="openwebui-skip-rag-handoff">',
+        "The user attached files. Markdown was read from the shared /handoff volume; original paths are listed for tool use.",
+    ]
+    accepted = 0
+
+    for entry in entries:
+        name = entry.get("name") or "file"
+        original_path = entry.get("original") or ""
+        markdown_path = entry.get("markdown") or ""
+        if not _verify_handoff_entry(entry, scope):
+            continue
+        safe_md = _safe_handoff_path(markdown_path, scope)
+        safe_orig = _safe_handoff_path(original_path, scope)
+
+        sections.append(
+            f'<file name="{html.escape(name)}"'
+            f' original="{html.escape(str(safe_orig) if safe_orig else original_path)}"'
+            f' markdown="{html.escape(str(safe_md) if safe_md else markdown_path)}">'
+        )
+
+        if not safe_md:
+            sections.append("[markdown path missing or rejected]")
+            sections.append("</file>")
+            continue
+        try:
+            md = safe_md.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logger.warning("Failed to read skip-rag handoff markdown %s: %s", safe_md, exc)
+            sections.append(f"[failed to read markdown: {exc}]")
+            sections.append("</file>")
+            continue
+        accepted += 1
+
+        if remaining <= 0:
+            sections.append("[omitted: handoff markdown character budget exhausted]")
+        else:
+            snippet = md[:remaining]
+            remaining -= len(snippet)
+            sections.append("```markdown")
+            sections.append(snippet)
+            if len(snippet) < len(md):
+                sections.append("\n[...truncated by Hermes handoff reader budget...]")
+            sections.append("```")
+        sections.append("</file>")
+
+    if accepted == 0:
+        return ""
+    sections.append("</file_contents>")
+    return "\n".join(sections)
+
+
+def _augment_message_with_handoff_context(user_message: Any, scope: Optional[Dict[str, str]] = None) -> Any:
+    """Append hydrated /handoff markdown context to a user message when present."""
+    if not isinstance(user_message, str) or "<files>" not in user_message:
+        return user_message
+    scope = scope or {}
+    entries = _parse_handoff_file_entries(user_message)
+    context = _build_handoff_context(entries, scope)
+    if not context:
+        return user_message
+    logger.info("Hydrated %d skip-rag handoff file(s) from %s", len(entries), HANDOFF_DIR)
+    return f"{user_message}\n\n{context}"
 
 
 # Content part type aliases used by the OpenAI Chat Completions and Responses
@@ -2177,6 +2350,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if conversation_messages:
             user_message = conversation_messages[-1].get("content", "")
             history = conversation_messages[:-1]
+
+        user_message = _augment_message_with_handoff_context(user_message, scope)
 
         if not _content_has_visible_payload(user_message):
             return web.json_response(
