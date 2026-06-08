@@ -29,6 +29,13 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Non-interactive mode detection (for Docker builds, CI, etc.)
+if [ "${CI:-}" = "true" ] || [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ] || [ "${DOCKER_BUILD:-}" = "true" ]; then
+    NON_INTERACTIVE=true
+else
+    NON_INTERACTIVE=false
+fi
+
 # Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
@@ -271,14 +278,109 @@ fi
 # Optional: ripgrep (for faster file search)
 # ============================================================================
 
+# ============================================================================
+# Node.js setup (via nvm if available)
+# ============================================================================
+
+echo -e "${CYAN}→${NC} Checking Node.js..."
+
+if command -v node &> /dev/null; then
+    NODE_VERSION=$(node --version 2>/dev/null)
+    echo -e "${GREEN}✓${NC} Node.js $NODE_VERSION found"
+elif [ -f "$HOME/.nvm/nvm.sh" ]; then
+    echo -e "${CYAN}→${NC} Loading nvm..."
+    export NVM_DIR="$HOME/.nvm"
+    . "$NVM_DIR/nvm.sh"
+    if command -v node &> /dev/null; then
+        NODE_VERSION=$(node --version 2>/dev/null)
+        echo -e "${GREEN}✓${NC} Node.js $NODE_VERSION found (via nvm)"
+    else
+        echo -e "${CYAN}→${NC} Installing Node.js LTS via nvm..."
+        nvm install --lts
+        NODE_VERSION=$(node --version 2>/dev/null)
+        echo -e "${GREEN}✓${NC} Node.js $NODE_VERSION installed"
+    fi
+else
+    echo -e "${YELLOW}⚠${NC} Node.js not found (web UI/TUI builds will be skipped)"
+fi
+
+# ============================================================================
+# npm dependencies + Playwright + web builds
+# ============================================================================
+
+if command -v npm &> /dev/null; then
+    echo -e "${CYAN}→${NC} Installing npm dependencies..."
+
+    # npm global prefix (if not already set)
+    NPM_PREFIX=$(npm config get prefix 2>/dev/null)
+    if [ "$NPM_PREFIX" = "/usr" ] || [ "$NPM_PREFIX" = "/usr/local" ]; then
+        NPM_GLOBAL_DIR="$HOME/.npm-global"
+        mkdir -p "$NPM_GLOBAL_DIR"
+        npm config set prefix "$NPM_GLOBAL_DIR"
+        export PATH="$NPM_GLOBAL_DIR/bin:$PATH"
+        echo -e "${GREEN}✓${NC} npm global prefix set to $NPM_GLOBAL_DIR"
+    fi
+
+    # Install root deps
+    npm install --no-audit 2>/dev/null || npm install
+
+    # Install web deps
+    if [ -d "web" ] && [ -f "web/package.json" ]; then
+        echo -e "${CYAN}→${NC} Installing web dependencies..."
+        (cd web && npm install --no-audit 2>/dev/null || cd web && npm install)
+    fi
+
+    # Install ui-tui deps
+    if [ -d "ui-tui" ] && [ -f "ui-tui/package.json" ]; then
+        echo -e "${CYAN}→${NC} Installing ui-tui dependencies..."
+        (cd ui-tui && npm install --no-audit 2>/dev/null || cd ui-tui && npm install)
+    fi
+
+    echo -e "${GREEN}✓${NC} npm dependencies installed"
+
+    # Playwright
+    if [ -n "${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-}" ] && [ -x "${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH}" ]; then
+        echo -e "${GREEN}✓${NC} Using system Chromium at $PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH (skipping Playwright browser download)"
+    else
+        echo -e "${CYAN}→${NC} Installing Playwright Chromium..."
+        npx playwright install --with-deps chromium --only-shell || {
+            echo -e "${YELLOW}⚠${NC} Playwright install failed (browser tools may not work)"
+        }
+    fi
+
+    # Build web UI
+    if [ -d "web" ] && [ -f "web/package.json" ]; then
+        echo -e "${CYAN}→${NC} Building web UI..."
+        (cd web && npm run build 2>/dev/null) || echo -e "${YELLOW}⚠${NC} Web build failed"
+    fi
+
+    # Build TUI
+    if [ -d "ui-tui" ] && [ -f "ui-tui/package.json" ]; then
+        echo -e "${CYAN}→${NC} Building TUI..."
+        (cd ui-tui && npm run build 2>/dev/null) || echo -e "${YELLOW}⚠${NC} TUI build failed"
+    fi
+
+    # Clean npm cache
+    npm cache clean --force 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} npm cache cleaned"
+fi
+
+# ============================================================================
+# Optional: ripgrep (for faster file search)
+# ============================================================================
+
 echo -e "${CYAN}→${NC} Checking ripgrep (optional, for faster search)..."
 
 if command -v rg &> /dev/null; then
     echo -e "${GREEN}✓${NC} ripgrep found"
 else
     echo -e "${YELLOW}⚠${NC} ripgrep not found (file search will use grep fallback)"
-    read -p "Install ripgrep for faster search? [Y/n] " -n 1 -r
-    echo
+    if [ "$NON_INTERACTIVE" = true ]; then
+        REPLY=n
+    else
+        read -p "Install ripgrep for faster search? [Y/n] " -n 1 -r
+        echo
+    fi
     if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
         INSTALLED=false
 
@@ -453,8 +555,12 @@ echo "  hermes doctor        # Diagnose issues"
 echo ""
 
 # Ask if they want to run setup wizard now
-read -p "Would you like to run the setup wizard now? [Y/n] " -n 1 -r
-echo
+if [ "$NON_INTERACTIVE" = true ]; then
+    REPLY=n
+else
+    read -p "Would you like to run the setup wizard now? [Y/n] " -n 1 -r
+    echo
+fi
 if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
     echo ""
     # Run directly with venv Python (no activation needed)
