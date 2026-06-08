@@ -40,7 +40,13 @@ fi
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
 
-PYTHON_VERSION="3.11"
+# In Docker builds, use whatever system python is available (>= 3.11)
+# instead of requiring a specific version
+if [ "${DOCKER_BUILD:-}" = "true" ]; then
+    PYTHON_VERSION="3"
+else
+    PYTHON_VERSION="3.11"
+fi
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
@@ -160,6 +166,11 @@ else
         PYTHON_PATH=$($UV_CMD python find "$PYTHON_VERSION")
         PYTHON_FOUND_VERSION=$($PYTHON_PATH --version 2>/dev/null)
         echo -e "${GREEN}✓${NC} $PYTHON_FOUND_VERSION found"
+    elif [ "${UV_PYTHON_PREFERENCE:-}" = "only-system" ] || [ "${DOCKER_BUILD:-}" = "true" ]; then
+        # In Docker builds with only-system preference, don't try to install
+        echo -e "${RED}✗${NC} Python $PYTHON_VERSION not found and UV_PYTHON_PREFERENCE=only-system"
+        echo "    Install python3 and python3-venv via system package manager"
+        exit 1
     else
         echo -e "${CYAN}→${NC} Python $PYTHON_VERSION not found, installing via uv..."
         $UV_CMD python install "$PYTHON_VERSION"
