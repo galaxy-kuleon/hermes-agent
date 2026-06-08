@@ -39,10 +39,10 @@ if [ "$(id -u)" = "0" ]; then
         # by the mapped user on the host side.
         chown -R hermes:hermes "$HERMES_HOME" 2>/dev/null || \
             echo "Warning: chown failed (rootless container?) — continuing anyway"
-        # The .venv must also be re-chowned when UID is remapped, otherwise
+        # The venv must also be re-chowned when UID is remapped, otherwise
         # lazy_deps.py cannot install platform packages (discord.py, etc.).
-        chown -R hermes:hermes "$INSTALL_DIR/.venv" 2>/dev/null || \
-            echo "Warning: chown .venv failed (rootless container?) — continuing anyway"
+        chown -R hermes:hermes "$INSTALL_DIR/venv" 2>/dev/null || true
+        chown -R hermes:hermes "$INSTALL_DIR/.venv" 2>/dev/null || true
     fi
 
     # Ensure config.yaml is readable by the hermes runtime user even if it was
@@ -54,12 +54,27 @@ if [ "$(id -u)" = "0" ]; then
         chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
     fi
 
+    # Ensure local document export store is writable by the hermes user.
+    # The hermes-handoff shared volume is created root:root by Docker; without
+    # this the first export fails with EACCES before any artifacts can be written.
+    if [ -d "/handoff" ]; then
+        mkdir -p /handoff/exports
+        chown hermes:hermes /handoff/exports
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
 
 # --- Running as hermes from here ---
-source "${INSTALL_DIR}/.venv/bin/activate"
+# Activate virtualenv by prepending to PATH
+if [ -d "$INSTALL_DIR/venv/bin" ]; then
+    export PATH="$INSTALL_DIR/venv/bin:$PATH"
+    export VIRTUAL_ENV="$INSTALL_DIR/venv"
+elif [ -d "$INSTALL_DIR/.venv/bin" ]; then
+    export PATH="$INSTALL_DIR/.venv/bin:$PATH"
+    export VIRTUAL_ENV="$INSTALL_DIR/.venv"
+fi
 
 # Create essential directory structure.  Cache and platform directories
 # (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
