@@ -183,8 +183,8 @@ TOOLSETS = {
 
     
     "file": {
-        "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        "description": "File manipulation tools: read, write, patch (with fuzzy matching), search, and local document export",
+        "tools": ["read_file", "write_file", "patch", "search_files", "local_document_export"],
         "includes": []
     },
     
@@ -355,7 +355,7 @@ TOOLSETS = {
             # Terminal + process management
             "terminal", "process",
             # File manipulation
-            "read_file", "write_file", "patch", "search_files",
+            "read_file", "write_file", "patch", "search_files", "local_document_export",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # Skills

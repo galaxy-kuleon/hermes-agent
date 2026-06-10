@@ -36,6 +36,7 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -67,9 +68,6 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 HANDOFF_DIR = Path(os.environ.get("SKIP_RAG_HANDOFF_DIR", "/handoff")).resolve()
-HANDOFF_MARKDOWN_CHAR_BUDGET = int(
-    os.environ.get("HERMES_HANDOFF_MARKDOWN_CHAR_BUDGET", "500000")
-)
 HANDOFF_SIGNING_KEY = os.environ.get(
     "SKIP_RAG_HANDOFF_SIGNING_KEY",
     os.environ.get("OPENWEBUI_BRIDGE_API_KEY", ""),
@@ -166,10 +164,28 @@ def _normalize_chat_content(
 _FILES_BLOCK_RE = re.compile(r"<files>\s*(?P<body>.*?)\s*</files>", re.DOTALL)
 _FILE_TAG_RE = re.compile(r"<file\b(?P<attrs>[^>]*)/?>", re.DOTALL)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
-def _sign_handoff_entry(user_id: str, chat_id: str, original_path: str, markdown_path: str) -> str:
+def _sign_handoff_entry(
+    user_id: str,
+    chat_id: str,
+    original_path: str,
+    file_id: str = "",
+    sha256: str = "",
+) -> str:
     """Return the expected OWUI handoff HMAC for one file entry."""
+    if not HANDOFF_SIGNING_KEY:
+        return ""
+    parts = [user_id, chat_id, original_path]
+    if file_id or sha256:
+        parts.extend([file_id, sha256])
+    payload = "\0".join(parts).encode("utf-8")
+    return hmac.new(HANDOFF_SIGNING_KEY.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _sign_legacy_handoff_entry(user_id: str, chat_id: str, original_path: str, markdown_path: str) -> str:
+    """Return the legacy original+markdown handoff HMAC for backward compatibility."""
     if not HANDOFF_SIGNING_KEY:
         return ""
     payload = "\0".join([user_id, chat_id, original_path, markdown_path]).encode("utf-8")
@@ -208,13 +224,15 @@ def _parse_handoff_file_entries(text: str) -> List[Dict[str, str]]:
             }
             name = attrs.get("name", "file")
             original = attrs.get("original", "")
-            markdown = attrs.get("markdown", "")
-            if original or markdown:
+            markdown = attrs.get("markdown", "")  # legacy only; never hydrated
+            if original:
                 entries.append(
                     {
                         "name": name,
                         "original": original,
                         "markdown": markdown,
+                        "file_id": attrs.get("file_id", ""),
+                        "sha256": attrs.get("sha256", ""),
                         "user": attrs.get("user", ""),
                         "chat": attrs.get("chat", ""),
                         "sig": attrs.get("sig", ""),
@@ -224,26 +242,60 @@ def _parse_handoff_file_entries(text: str) -> List[Dict[str, str]]:
 
 
 def _verify_handoff_entry(entry: Dict[str, str], scope: Dict[str, str]) -> bool:
-    """Verify user/chat scope and OWUI HMAC before reading a handoff entry."""
+    """Verify user/chat scope and OWUI HMAC before accepting a handoff entry."""
     user_id = scope.get("user_id", "")
     chat_id = scope.get("chat_id", "") or "nochat"
     if not user_id:
         logger.warning("Rejecting skip-rag handoff: missing OpenWebUI user scope")
         return False
-    if entry.get("user") != user_id or (entry.get("chat") or "nochat") != chat_id:
+    # New-format OWUI entries may omit user/chat attrs. In that case the HMAC
+    # below binds the entry to the trusted request user_id/chat_id scope.
+    entry_user = entry.get("user", "")
+    entry_chat = entry.get("chat", "")
+    if entry_user and entry_user != user_id:
         logger.warning(
-            "Rejecting skip-rag handoff: entry scope user=%r chat=%r does not match request user=%r chat=%r",
-            entry.get("user"),
-            entry.get("chat"),
+            "Rejecting skip-rag handoff: entry user=%r does not match request user=%r",
+            entry_user,
             user_id,
+        )
+        return False
+    if entry_chat and (entry_chat or "nochat") != chat_id:
+        logger.warning(
+            "Rejecting skip-rag handoff: entry chat=%r does not match request chat=%r",
+            entry_chat,
             chat_id,
         )
         return False
     if not HANDOFF_SIGNING_KEY:
         logger.warning("Rejecting skip-rag handoff: SKIP_RAG_HANDOFF_SIGNING_KEY is not configured")
         return False
-    expected = _sign_handoff_entry(user_id, chat_id, entry.get("original", ""), entry.get("markdown", ""))
-    if not hmac.compare_digest(expected, entry.get("sig", "")):
+    file_id = entry.get("file_id", "")
+    sha256 = entry.get("sha256", "")
+    has_identity_metadata = bool(file_id or sha256)
+    if sha256 and not _SHA256_RE.fullmatch(sha256):
+        logger.warning("Rejecting skip-rag handoff: invalid sha256 metadata for user=%s chat=%s", user_id, chat_id)
+        return False
+
+    expected = _sign_handoff_entry(
+        user_id,
+        chat_id,
+        entry.get("original", ""),
+        file_id=file_id,
+        sha256=sha256,
+    )
+    supplied_sig = entry.get("sig", "")
+    legacy_expected = ""
+    if entry.get("markdown") and not has_identity_metadata:
+        legacy_expected = _sign_legacy_handoff_entry(
+            user_id,
+            chat_id,
+            entry.get("original", ""),
+            entry.get("markdown", ""),
+        )
+    if not (
+        hmac.compare_digest(expected, supplied_sig)
+        or (legacy_expected and hmac.compare_digest(legacy_expected, supplied_sig))
+    ):
         logger.warning("Rejecting skip-rag handoff: invalid signature for user=%s chat=%s", user_id, chat_id)
         return False
     return True
@@ -251,80 +303,78 @@ def _verify_handoff_entry(entry: Dict[str, str], scope: Dict[str, str]) -> bool:
 
 def _build_handoff_context(entries: List[Dict[str, str]], scope: Dict[str, str]) -> str:
     """
-    Hydrate skip-rag handoff file entries into bounded markdown context.
+    Validate skip-rag handoff file entries and expose path metadata only.
 
-    OpenWebUI Path B writes original+markdown files into the shared /handoff
-    volume and sends only paths in a transient <files> block. Hermes consumes
-    that contract here so the agent can answer from the markdown without OWUI
-    embedding or persisting file contents.
+    OpenWebUI Path B writes uploaded original files into the shared /handoff
+    volume and sends signed paths in a transient <files> block. Hermes must not
+    pre-read or hydrate file contents here: Origin Agent should decide which
+    tool(s) to use for each uploaded file.
     """
     if not entries:
         return ""
 
-    remaining = max(0, HANDOFF_MARKDOWN_CHAR_BUDGET)
     sections: List[str] = [
-        '<file_contents source="openwebui-skip-rag-handoff">',
-        "The user attached files. Markdown was read from the shared /handoff volume; original paths are listed for tool use.",
+        '<attached_files source="openwebui-skip-rag-handoff">',
+        "The user attached files. These are signed /handoff paths only; file contents were not pre-read or converted. Use tools to inspect files when needed.",
     ]
     accepted = 0
 
     for entry in entries:
-        name = entry.get("name") or "file"
         original_path = entry.get("original") or ""
-        markdown_path = entry.get("markdown") or ""
         if not _verify_handoff_entry(entry, scope):
             continue
-        safe_md = _safe_handoff_path(markdown_path, scope)
         safe_orig = _safe_handoff_path(original_path, scope)
-
-        sections.append(
-            f'<file name="{html.escape(name)}"'
-            f' original="{html.escape(str(safe_orig) if safe_orig else original_path)}"'
-            f' markdown="{html.escape(str(safe_md) if safe_md else markdown_path)}">'
-        )
-
-        if not safe_md:
-            sections.append("[markdown path missing or rejected]")
-            sections.append("</file>")
+        if not safe_orig:
             continue
-        try:
-            md = safe_md.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            logger.warning("Failed to read skip-rag handoff markdown %s: %s", safe_md, exc)
-            sections.append(f"[failed to read markdown: {exc}]")
-            sections.append("</file>")
-            continue
+
+        attrs = [f'original="{html.escape(str(safe_orig), quote=True)}"']
+        if entry.get("file_id"):
+            attrs.append(f'file_id="{html.escape(entry["file_id"], quote=True)}"')
+        if entry.get("sha256"):
+            attrs.append(f'sha256="{html.escape(entry["sha256"], quote=True)}"')
+
+        sections.append(f'<file {" ".join(attrs)}/>')
         accepted += 1
-
-        if remaining <= 0:
-            sections.append("[omitted: handoff markdown character budget exhausted]")
-        else:
-            snippet = md[:remaining]
-            remaining -= len(snippet)
-            sections.append("```markdown")
-            sections.append(snippet)
-            if len(snippet) < len(md):
-                sections.append("\n[...truncated by Hermes handoff reader budget...]")
-            sections.append("```")
-        sections.append("</file>")
 
     if accepted == 0:
         return ""
-    sections.append("</file_contents>")
+    sections.append("</attached_files>")
     return "\n".join(sections)
 
 
-def _augment_message_with_handoff_context(user_message: Any, scope: Optional[Dict[str, str]] = None) -> Any:
-    """Append hydrated /handoff markdown context to a user message when present."""
-    if not isinstance(user_message, str) or "<files>" not in user_message:
-        return user_message
+def _augment_handoff_text(text: str, scope: Dict[str, str]) -> str:
+    """Strip raw <files> blocks and append validated path-only metadata."""
+    if "<files>" not in text:
+        return text
     scope = scope or {}
-    entries = _parse_handoff_file_entries(user_message)
+    entries = _parse_handoff_file_entries(text)
     context = _build_handoff_context(entries, scope)
+    message_without_raw_files = _FILES_BLOCK_RE.sub("", text).rstrip()
     if not context:
-        return user_message
-    logger.info("Hydrated %d skip-rag handoff file(s) from %s", len(entries), HANDOFF_DIR)
-    return f"{user_message}\n\n{context}"
+        return message_without_raw_files
+    logger.info("Accepted %d skip-rag handoff file path(s) from %s", len(entries), HANDOFF_DIR)
+    return f"{message_without_raw_files}\n\n{context}"
+
+
+def _augment_message_with_handoff_context(user_message: Any, scope: Optional[Dict[str, str]] = None) -> Any:
+    """Replace raw signed /handoff blocks with validated path-only metadata."""
+    scope = scope or {}
+    if isinstance(user_message, str):
+        return _augment_handoff_text(user_message, scope)
+    if isinstance(user_message, list):
+        augmented_parts: List[Any] = []
+        for part in user_message:
+            if isinstance(part, dict):
+                part_type = str(part.get("type") or "").strip().lower()
+                text = part.get("text")
+                if part_type in _TEXT_PART_TYPES and isinstance(text, str):
+                    new_part = dict(part)
+                    new_part["text"] = _augment_handoff_text(text, scope)
+                    augmented_parts.append(new_part)
+                    continue
+            augmented_parts.append(part)
+        return augmented_parts
+    return user_message
 
 
 # Content part type aliases used by the OpenAI Chat Completions and Responses
@@ -1618,6 +1668,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "chat_completions_streaming": True,
                     "responses_api": True,
                     "responses_streaming": True,
+                    "artifact_downloads": True,
                     "run_submission": True,
                     "run_status": True,
                     "run_events_sse": True,
@@ -1638,6 +1689,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "path": "/v1/chat/completions",
                     },
                     "responses": {"method": "POST", "path": "/v1/responses"},
+                    "artifact_download": {
+                        "method": "GET",
+                        "path": "/v1/artifacts/{artifact_id}/{filename}",
+                    },
                     "runs": {"method": "POST", "path": "/v1/runs"},
                     "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                     "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -1648,6 +1703,51 @@ class APIServerAdapter(BasePlatformAdapter):
                     "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 },
             }
+        )
+
+    async def _handle_artifact_download(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/artifacts/{artifact_id}/{filename} via signed URL."""
+        from tools.local_document_export_tool import resolve_local_export_download
+
+        expires = request.query.get("expires", "")
+        sig = request.query.get("sig", "")
+        if "expires_epoch" in request.match_info:
+            try:
+                expires = (
+                    datetime.fromtimestamp(
+                        int(request.match_info.get("expires_epoch", "")),
+                        timezone.utc,
+                    )
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z")
+                )
+            except (TypeError, ValueError, OSError, OverflowError):
+                expires = ""
+            sig = request.match_info.get("sig", "")
+        elif not sig and "sig" not in request.query:
+            sig = request.query.get("amp;sig", "")
+
+        result = resolve_local_export_download(
+            artifact_id=request.match_info.get("artifact_id", ""),
+            filename=request.match_info.get("filename", ""),
+            expires=expires,
+            sig=sig,
+        )
+        if not result.get("ok"):
+            return web.json_response(
+                {"error": result.get("error", "artifact download failed")},
+                status=int(result.get("status", 404)),
+            )
+
+        filename = result["filename"]
+        return web.FileResponse(
+            path=result["path"],
+            headers={
+                "Content-Type": result["mime"],
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store, no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -1804,6 +1904,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # history already set from request body above
 
         user_id = scope["user_id"]
+        chat_id = scope.get("chat_id", "")
         user_name = scope["user_name"]
         # Register / refresh session activity so the idle-commit watcher
         # fires OpenViking memory extraction once the user stops typing.
@@ -1927,6 +2028,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     reasoning_callback=_on_reasoning,
                     agent_ref=agent_ref,
                     user_id=user_id,
+                    chat_id=chat_id,
                     gateway_session_key=gateway_session_key,
                 )
             )
@@ -1954,6 +2056,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 user_id=user_id,
+                chat_id=chat_id,
                 gateway_session_key=gateway_session_key,
             )
 
@@ -3263,6 +3366,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message: Any = (
             input_messages[-1].get("content", "") if input_messages else ""
         )
+        user_message = _augment_message_with_handoff_context(user_message, scope)
         if not _content_has_visible_payload(user_message):
             return web.json_response(
                 _openai_error("No user message found in input"), status=400
@@ -3279,6 +3383,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # continuity for the same user).
         session_id = _scope_session_id(stored_session_id or str(uuid.uuid4()), scope)
         user_id = scope["user_id"]
+        chat_id = scope.get("chat_id", "")
         user_name = scope["user_name"]
         self._touch_session_activity(session_id, scope)
 
@@ -3349,6 +3454,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=_on_tool_complete,
                     agent_ref=agent_ref,
                     user_id=user_id,
+                    chat_id=chat_id,
                     gateway_session_key=gateway_session_key,
                 )
             )
@@ -3385,6 +3491,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 user_id=user_id,
+                chat_id=chat_id,
                 gateway_session_key=gateway_session_key,
             )
 
@@ -3942,6 +4049,7 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_callback=None,
         agent_ref: Optional[list] = None,
         user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None,
     ) -> tuple:
         """
@@ -3958,37 +4066,54 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                reasoning_callback=reasoning_callback,
-                user_id=user_id,
-                gateway_session_key=gateway_session_key,
+            from tools.local_document_export_tool import (
+                reset_trusted_export_context,
+                set_trusted_export_context,
             )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
+
+            export_context_token = set_trusted_export_context(
+                {
+                    "platform": "api_server",
+                    "user_id": user_id or "",
+                    "chat_id": chat_id or "",
+                    "session_id": session_id or "",
+                    "gateway_session_key": gateway_session_key or "",
+                }
             )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    reasoning_callback=reasoning_callback,
+                    user_id=user_id,
+                    gateway_session_key=gateway_session_key,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                # Include the effective session ID in the result so callers
+                # (e.g. X-Hermes-Session-Id header) can track compression-
+                # triggered session rotations. (#16938)
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                reset_trusted_export_context(export_context_token)
 
         return await loop.run_in_executor(None, _run)
 
@@ -4119,6 +4244,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
             )
         )
+        user_message = _augment_message_with_handoff_context(user_message, scope)
         if not user_message:
             return web.json_response(
                 _openai_error("No user message found in input"), status=400
@@ -4206,6 +4332,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
 
         user_id = scope["user_id"]
+        chat_id = scope.get("chat_id", "")
 
         # Sanitize the optional client-supplied session_id so a hostile caller
         # can't inject control characters or chase down another user's run.
@@ -4295,6 +4422,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars, set_session_vars
+                    from tools.local_document_export_tool import (
+                        reset_trusted_export_context,
+                        set_trusted_export_context,
+                    )
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -4304,12 +4435,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     effective_task_id = session_id or run_id
                     approval_token = None
+                    export_context_token = None
                     session_tokens = []
                     try:
                         # Bind approval/session identity for this API run via
                         # contextvars so concurrent runs do not share process
                         # environment state.
                         approval_token = set_current_session_key(approval_session_key)
+                        export_context_token = set_trusted_export_context(
+                            {
+                                "platform": "api_server",
+                                "user_id": user_id or "",
+                                "chat_id": chat_id or "",
+                                "session_id": session_id or "",
+                                "gateway_session_key": gateway_session_key or "",
+                            }
+                        )
                         session_tokens = set_session_vars(
                             platform="api_server",
                             session_key=approval_session_key,
@@ -4332,6 +4473,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             if session_tokens:
                                 try:
                                     clear_session_vars(session_tokens)
+                                except Exception:
+                                    pass
+                            if export_context_token is not None:
+                                try:
+                                    reset_trusted_export_context(export_context_token)
                                 except Exception:
                                     pass
                     u = {
@@ -5065,6 +5211,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/v1/chat/completions", self._handle_chat_completions
             )
             self._app.router.add_post("/v1/responses", self._handle_responses)
+            self._app.router.add_get(
+                "/v1/artifacts/{artifact_id}/{filename}",
+                self._handle_artifact_download,
+            )
+            self._app.router.add_get(
+                "/v1/artifacts/{artifact_id}/{filename}/download/{expires_epoch}/{sig}",
+                self._handle_artifact_download,
+            )
             self._app.router.add_get(
                 "/v1/responses/{response_id}", self._handle_get_response
             )
