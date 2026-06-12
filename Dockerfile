@@ -59,6 +59,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# ── Install OpenCode CLI system-wide ─────────────────────────────────────────
+# Use /usr/local as HOME so the official installer does not write under
+# /home/hermes, which is volume-mounted and would be hidden at runtime.
+RUN set -eux; \
+    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; \
+    curl -fsSL https://opencode.ai/install | HOME=/usr/local bash -s -- --no-modify-path; \
+    ln -sf /usr/local/.opencode/bin/opencode /usr/local/bin/opencode; \
+    /usr/local/bin/opencode --version
+
 # ── Copy hermes-agent source ─────────────────────────────────────────────────
 WORKDIR /opt/hermes
 COPY --chown=hermes:hermes . .

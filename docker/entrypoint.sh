@@ -62,6 +62,13 @@ if [ "$(id -u)" = "0" ]; then
         chown hermes:hermes /handoff/exports
     fi
 
+    # OpenCode reads ~/.config/opencode/opencode.json and creates the config
+    # directory on first run.  Some older runtime copies left ~/.config
+    # root-owned, which makes `opencode --version` fail with EACCES after the
+    # privilege drop even though the binary is installed correctly.
+    mkdir -p "$HERMES_HOME/.config/opencode" 2>/dev/null || true
+    chown -R hermes:hermes "$HERMES_HOME/.config" 2>/dev/null || true
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
