@@ -62,12 +62,27 @@ if [ "$(id -u)" = "0" ]; then
         chown hermes:hermes /handoff/exports
     fi
 
-    # OpenCode reads ~/.config/opencode/opencode.json and creates the config
-    # directory on first run.  Some older runtime copies left ~/.config
+    # OpenCode reads ~/.config/opencode/opencode.json. Hermes intentionally
+    # gives subprocesses a separate HOME at $HERMES_HOME/home, so external CLIs
+    # launched by Hermes tools may look under BOTH paths:
+    #   1. $HERMES_HOME/.config/opencode/opencode.json
+    #   2. $HERMES_HOME/home/.config/opencode/opencode.json
+    # Keep both directories writable and seed the subprocess-HOME config from
+    # the primary config when present. Some older runtime copies left ~/.config
     # root-owned, which makes `opencode --version` fail with EACCES after the
     # privilege drop even though the binary is installed correctly.
-    mkdir -p "$HERMES_HOME/.config/opencode" 2>/dev/null || true
-    chown -R hermes:hermes "$HERMES_HOME/.config" 2>/dev/null || true
+    primary_opencode_cfg="$HERMES_HOME/.config/opencode/opencode.json"
+    subprocess_opencode_cfg="$HERMES_HOME/home/.config/opencode/opencode.json"
+    mkdir -p "$HERMES_HOME/.config/opencode" "$HERMES_HOME/home/.config/opencode" 2>/dev/null || true
+    if [ -f "$primary_opencode_cfg" ]; then
+        if [ ! -f "$subprocess_opencode_cfg" ] || ! cmp -s "$primary_opencode_cfg" "$subprocess_opencode_cfg"; then
+            cp -p "$primary_opencode_cfg" "$subprocess_opencode_cfg" 2>/dev/null || true
+        fi
+    elif [ -f "$subprocess_opencode_cfg" ]; then
+        cp -p "$subprocess_opencode_cfg" "$primary_opencode_cfg" 2>/dev/null || true
+    fi
+    chmod 600 "$primary_opencode_cfg" "$subprocess_opencode_cfg" 2>/dev/null || true
+    chown -R hermes:hermes "$HERMES_HOME/.config" "$HERMES_HOME/home" 2>/dev/null || true
 
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
