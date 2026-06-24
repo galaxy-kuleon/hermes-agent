@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "description": "Curated smoke/battle-test manifest for pdf-docx-five-turn-refiner. Keep paths local to Noel's machine; skip missing files gracefully in scripts.",
+  "items": [
+    {
+      "id": "demo_text",
+      "path": "/Users/admin/Works/pdf2docx/test/samples/demo-text.pdf",
+      "category": "digital_text",
+      "route": "xa",
+      "max_pages": 1,
+      "expect_tables_min": 0,
+      "notes": "Small born-digital text/style PDF; useful for fast render/editability smoke."
+    },
+    {
+      "id": "demo_table",
+      "path": "/Users/admin/Works/pdf2docx/test/samples/demo-table.pdf",
+      "category": "digital_table",
+      "route": "xa",
+      "max_pages": 1,
+      "expect_tables_min": 1,
+      "notes": "Small table-heavy pdf2docx fixture for table geometry and native table checks."
+    },
+    {
+      "id": "large_first3",
+      "path": "/Users/admin/Works/pdf-to-docx-v5/examples/large.pdf",
+      "category": "multi_page_digital_table",
+      "route": "xa",
+      "max_pages": 3,
+      "expect_tables_min": 1,
+      "requires_compact_on_overflow": true,
+      "notes": "80-page digital PDF; first three pages reproduce overflow 5->3 and table normalization behavior."
+    },
+    {
+      "id": "ocr_test_first1",
+      "path": "/Users/admin/Works/docling/tests/data_scanned/ocr_test.pdf",
+      "category": "scanned_ocr",
+      "route": "xb",
+      "max_pages": 1,
+      "expect_tables_min": 0,
+      "slow": true,
+      "notes": "Scanned/OCR smoke; run only with --include-xb or explicit battle mode."
+    },
+    {
+      "id": "demo_table_lattice",
+      "path": "/Users/admin/Works/pdf2docx/test/samples/demo-table-lattice.pdf",
+      "category": "digital_table_lattice",
+      "route": "xa",
+      "max_pages": 1,
+      "expect_tables_min": 1,
+      "notes": "Table lattice fixture for future bbox/column threshold tuning."
+    },
+    {
+      "id": "real_contract_en3",
+      "path": "/Users/admin/Works/KuleonOpenWebUIWorkSpace/anything-to-docx-v3/test-inputs/contract_en3.pdf",
+      "category": "real_contract_digital_tables_images",
+      "route": "xa",
+      "max_pages": 3,
+      "expect_tables_min": 2,
+      "requires_compact_on_overflow": true,
+      "notes": "Freshly discovered under ~/Works in Round10. Realistic English contract with logo/confidential stamp/table; current loop still overflows 3 source pages -> 6 rendered pages and table_count_delta 3."
+    },
+    {
+      "id": "real_contract_zh3",
+      "path": "/Users/admin/Works/KuleonOpenWebUIWorkSpace/anything-to-docx-v3/test-inputs/contract_zh3.pdf",
+      "category": "real_cjk_contract_digital_tables_images",
+      "route": "xa",
+      "max_pages": 3,
+      "expect_tables_min": 2,
+      "requires_compact_on_overflow": true,
+      "notes": "Freshly discovered Round10. CJK contract with images/tables; current loop overflows 3 -> 6 pages and table_count_delta 6."
+    },
+    {
+      "id": "hk_ip_decision_303713184_first3",
+      "path": "/Users/admin/Works/Tmp/NEW_DIR_20250910_VER/Hong Kong IPD Decision/Declaration of invalidity/2021/303713184.pdf",
+      "category": "real_legal_decision_tables_images",
+      "route": "xa",
+      "max_pages": 3,
+      "expect_tables_min": 2,
+      "requires_compact_on_overflow": true,
+      "notes": "Freshly discovered Round10 high-risk real HK IP decision: many images/tables. Page count OK but table_count_delta 4 and geometry drift."
+    },
+    {
+      "id": "mixed_commercial_level5",
+      "path": "/Users/admin/Works/docling/tests/data/vlm_docx_battle/level_5_commercial_mixed_multipage.pdf",
+      "category": "mixed_native_raster_commercial",
+      "route": "auto",
+      "max_pages": 2,
+      "expect_tables_min": 1,
+      "requires_compact_on_overflow": true,
+      "notes": "Mixed native/raster commercial sample; current route chooses XA, page count OK but table_count_delta 2 and medium raster risk."
+    },
+    {
+      "id": "non_digital_07_first1",
+      "path": "/Users/admin/Works/glm-ocr-latest-test/input/07_non-digital.pdf",
+      "category": "real_scanned_non_digital",
+      "route": "xb",
+      "max_pages": 1,
+      "expect_tables_min": 0,
+      "slow": true,
+      "notes": "Freshly discovered Round10 scanned/non-digital Chinese company doc. XB OCR produced editable text and 1:1 page count, but visual layout is simple text not high-fidelity."
+    }
+  ]
+}
