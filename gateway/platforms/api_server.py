@@ -3150,6 +3150,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -3951,6 +3952,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
             )
 
         async def _compute_response():
