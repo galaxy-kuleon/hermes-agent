@@ -1,0 +1,357 @@
+"""Tests for issue #13 — prevent file/terminal BYPASS of /home/hermes/skills.
+
+Covers (1) toolset coupling: non-manage api_server users lose `terminal` and
+write-capable `file` (keep read-only `file_read`); manage users keep both;
+(2) the `file` toolset split (backward compatible); and (3) the protected-path
+guard at the file-tool execution layer — WRITE bypass (needs manage), READ
+bypass (needs read), manage allowed, non-protected allowed, traversal
+normalized, non-api_server/disabled exempt, and fail-CLOSED on error.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from gateway.session_context import clear_session_vars, set_session_vars
+import tools.skill_acl as skill_acl
+import tools.file_tools as ft
+from tools.file_operations import SearchMatch, SearchResult
+from gateway.platforms.api_server import _apply_skill_acl_toolset_minimization as minim
+from toolsets import resolve_toolset
+
+G_READERS = "grp-readers"          # read
+G_EDITORS = "grp-editors"          # read, create, update (manage, no delete)
+
+ENABLED_ACL = {
+    "enabled": True,
+    "roles": {"admin": {"read", "create", "update", "delete"}, "user": set()},
+    "groups": {G_READERS: {"read"}, G_EDITORS: {"read", "create", "update"}},
+    "protect_paths": [],
+    "error": None,
+}
+
+
+def _acl_cfg(protect):
+    cfg = dict(ENABLED_ACL)
+    cfg["protect_paths"] = [str(protect)]
+    return cfg
+
+
+@pytest.fixture
+def acl_enabled(monkeypatch):
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: ENABLED_ACL)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_session():
+    tokens = set_session_vars()
+    try:
+        yield
+    finally:
+        clear_session_vars(tokens)
+
+
+@pytest.fixture
+def identity_resolve(monkeypatch):
+    # Isolate the guard's containment logic from path-resolution quirks.
+    monkeypatch.setattr(ft, "_resolve_path_for_task", lambda p, task_id="default": Path(p))
+    yield
+
+
+def _scope(role="", groups="", platform="api_server"):
+    return set_session_vars(platform=platform, user_role=role, user_groups=groups)
+
+
+def _denied(result: str) -> bool:
+    # file_tools use tool_error(msg) (no success field); the ACL reason in the
+    # error message is the reliable denial signal.
+    obj = json.loads(result)
+    return "skills acl" in obj.get("error", "").lower()
+
+
+# ── file toolset split (backward compatible) ─────────────────────────────────
+
+def test_file_toolset_split_backward_compatible():
+    assert set(resolve_toolset("file_read")) == {"read_file", "search_files", "local_document_export"}
+    assert set(resolve_toolset("file_write")) == {"write_file", "patch"}
+    assert set(resolve_toolset("file")) == {
+        "read_file", "search_files", "local_document_export", "write_file", "patch",
+    }
+
+
+# ── (1) toolset coupling ─────────────────────────────────────────────────────
+
+def test_coupling_reader_loses_terminal_and_write_file(acl_enabled):
+    out = minim(["web", "terminal", "file", "skills", "todo"], "user", G_READERS)
+    assert "terminal" not in out
+    assert "file" not in out and "file_write" not in out
+    assert "file_read" in out                 # read-only file kept
+    assert "skills_read" in out and "skills_manage" not in out
+    assert "web" in out and "todo" in out
+
+
+def test_coupling_no_perm_keeps_only_read_file(acl_enabled):
+    out = minim(["web", "terminal", "file", "skills"], "user", "")
+    assert "terminal" not in out
+    assert "skills_read" not in out and "skills_manage" not in out
+    assert "file" not in out and "file_write" not in out
+    assert "file_read" in out                 # read-only file cannot mutate skills
+    assert "web" in out
+
+
+def test_coupling_manage_keeps_terminal_and_file(acl_enabled):
+    out_editor = minim(["web", "terminal", "file", "skills"], "user", G_EDITORS)
+    assert "terminal" in out_editor and "file" in out_editor
+    assert "skills_read" in out_editor and "skills_manage" in out_editor
+    out_admin = minim(["web", "terminal", "file", "skills"], "admin", "")
+    assert "terminal" in out_admin and "file" in out_admin
+
+
+def test_coupling_disabled_unchanged():
+    base = ["web", "terminal", "file", "skills"]
+    assert minim(base, "user", "") == base
+
+
+def test_coupling_failsafe_keeps_only_read_file(monkeypatch):
+    def _raise(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", _raise)
+    out = minim(["web", "terminal", "file", "skills", "skills_manage"], "admin", "")
+    assert "terminal" not in out
+    assert "skills" not in out and "skills_manage" not in out
+    assert "file" not in out and "file_write" not in out
+    assert "file_read" in out                 # fail-safe keeps read-only file
+    assert "web" in out
+
+
+# ── (3) protected-path guard ─────────────────────────────────────────────────
+
+def test_protected_write_denied_for_reader_read_allowed(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups=G_READERS)  # read, NOT manage
+    try:
+        target = str(protect / "foo" / "SKILL.md")
+        assert ft._acl_protected_path_block(target, mode="write") is not None  # write denied
+        assert ft._acl_protected_path_block(target, mode="read") is None       # read allowed
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_protected_read_denied_for_no_read(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="")  # no perms => READ bypass must be denied
+    try:
+        target = str(protect / "secret" / "SKILL.md")
+        assert ft._acl_protected_path_block(target, mode="read") is not None
+        assert ft._acl_protected_path_block(target, mode="write") is not None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_protected_write_allowed_for_manage(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    for role, groups in [("user", G_EDITORS), ("admin", "")]:
+        tokens = _scope(role=role, groups=groups)
+        try:
+            assert ft._acl_protected_path_block(str(protect / "x" / "SKILL.md"), mode="write") is None
+        finally:
+            clear_session_vars(tokens)
+
+
+def test_non_protected_path_allowed(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="")
+    try:
+        other = str(tmp_path / "other" / "doc.txt")
+        assert ft._acl_protected_path_block(other, mode="write") is None
+        assert ft._acl_protected_path_block(other, mode="read") is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_traversal_into_protected_still_denied(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="")
+    try:
+        sneaky = str(tmp_path / "other" / ".." / "skills" / "x" / "SKILL.md")
+        assert ft._acl_protected_path_block(sneaky, mode="write") is not None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_non_api_server_exempt(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="", platform="cli")
+    try:
+        assert ft._acl_protected_path_block(str(protect / "x" / "SKILL.md"), mode="write") is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_acl_disabled_exempt(identity_resolve, tmp_path):
+    # No monkeypatch => live config disabled => allow.
+    tokens = _scope(role="user", groups="")
+    try:
+        assert ft._acl_protected_path_block(str(tmp_path / "skills" / "x" / "SKILL.md"), mode="write") is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_failclosed_on_error(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+
+    def _raise(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", _raise)
+    tokens = _scope(role="admin", groups="")  # even admin denied when unresolvable
+    try:
+        assert ft._acl_protected_path_block(str(protect / "x" / "SKILL.md"), mode="write") is not None
+    finally:
+        clear_session_vars(tokens)
+
+
+# ── end-to-end wire-in on the actual file tools ──────────────────────────────
+
+def test_write_file_tool_blocks_protected_and_does_not_write(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    protect.mkdir(parents=True)
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    # Bypass the unrelated sensitive-system-path guard (macOS tmp lives under
+    # /private/var); real /home/hermes/skills is not a sensitive system path, so
+    # this isolates the ACL guard as the blocker.
+    monkeypatch.setattr(ft, "_check_sensitive_path", lambda p, task_id="default": None)
+    tokens = _scope(role="user", groups=G_READERS)  # read only, no manage
+    try:
+        target = protect / "evil" / "SKILL.md"
+        assert _denied(ft.write_file_tool(str(target), "pwned", task_id="t"))
+        assert not target.exists()  # the write never happened
+    finally:
+        clear_session_vars(tokens)
+
+
+def _mk_search_result(protect, tmp_path):
+    """A SearchResult with one PROTECTED skill match and one public match —
+    as if search ran from an ancestor root spanning into the protected dir."""
+    prot = str(protect / "secret" / "SKILL.md")
+    pub = str(tmp_path / "docs" / "readme.md")
+    return SearchResult(
+        matches=[
+            SearchMatch(path=prot, line_number=3, content="TOPSECRET-SKILL-BODY"),
+            SearchMatch(path=pub, line_number=1, content="public note"),
+        ],
+        files=[prot, pub],
+        counts={prot: 1, pub: 1},
+        total_count=2,
+    )
+
+
+def test_search_filter_excludes_protected_for_no_read(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="")  # ancestor-root search, NO read perm
+    try:
+        out = ft._acl_filter_search_result(_mk_search_result(protect, tmp_path), "t")
+        blob = json.dumps(out.to_dict())
+        # protected path, content AND snippet all withheld
+        assert "SKILL.md" not in blob
+        assert "TOPSECRET" not in blob
+        assert "secret" not in blob
+        # legitimate non-protected match still returned
+        assert "readme.md" in blob and "public note" in blob
+        # public-only remains: 1 match + 1 file + 1 count (synthetic populates all)
+        assert out.total_count == 3
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_search_filter_keeps_protected_for_reader(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    for role, groups in [("user", G_READERS), ("admin", "")]:
+        tokens = _scope(role=role, groups=groups)
+        try:
+            out = ft._acl_filter_search_result(_mk_search_result(protect, tmp_path), "t")
+            assert any("SKILL.md" in m.path for m in out.matches)  # read perm => kept
+        finally:
+            clear_session_vars(tokens)
+
+
+def test_search_filter_non_api_server_exempt(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="", platform="cli")  # exempt even with ACL on
+    try:
+        out = ft._acl_filter_search_result(_mk_search_result(protect, tmp_path), "t")
+        assert any("SKILL.md" in m.path for m in out.matches)
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_search_filter_disabled_unchanged(identity_resolve, tmp_path):
+    # No monkeypatch => live config disabled => unchanged.
+    protect = tmp_path / "skills"
+    tokens = _scope(role="user", groups="")
+    try:
+        out = ft._acl_filter_search_result(_mk_search_result(protect, tmp_path), "t")
+        assert any("SKILL.md" in m.path for m in out.matches)
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_search_filter_failclosed_on_error(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+
+    def _raise(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", _raise)
+    tokens = _scope(role="admin", groups="")  # enabled-state unknown => drop all
+    try:
+        out = ft._acl_filter_search_result(_mk_search_result(protect, tmp_path), "t")
+        assert out.matches == [] and out.files == [] and out.total_count == 0
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_search_tool_end_to_end_filters_protected(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    res = _mk_search_result(protect, tmp_path)
+
+    class _FakeOps:
+        def search(self, **kw):
+            return res
+
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": _FakeOps())
+    tokens = _scope(role="user", groups="")  # ancestor-root search, no read
+    try:
+        out = ft.search_tool(pattern="x", path=str(tmp_path), task_id="t-e2e")
+        assert "TOPSECRET" not in out and "SKILL.md" not in out  # protected withheld
+        assert "readme.md" in out and "public note" in out       # public retained
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_read_file_tool_blocks_protected_without_leak(monkeypatch, identity_resolve, tmp_path):
+    protect = tmp_path / "skills"
+    (protect / "secret").mkdir(parents=True)
+    secret = protect / "secret" / "SKILL.md"
+    secret.write_text("TOP-SECRET-SKILL-CONTENT")
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
+    tokens = _scope(role="user", groups="")  # no read
+    try:
+        res = ft.read_file_tool(str(secret), task_id="t")
+        assert _denied(res)
+        assert "TOP-SECRET" not in res  # content not leaked
+    finally:
+        clear_session_vars(tokens)

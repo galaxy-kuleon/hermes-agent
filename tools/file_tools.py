@@ -781,10 +781,176 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
+# Hermes skill ACL (#13): prevent file tools from reading/mutating the protected
+# skills directory and thereby bypassing the skill ACL. api_server-scoped;
+# fail-CLOSED when ACL is enabled on api_server.
+_ACL_PROTECTED_READ_DENY = (
+    "Hermes skills ACL: reading under a protected skills path requires skill "
+    "read permission for the current OpenWebUI role/group scope; denied."
+)
+_ACL_PROTECTED_WRITE_DENY = (
+    "Hermes skills ACL: writing under a protected skills path requires skill "
+    "manage permission for the current OpenWebUI role/group scope; denied."
+)
+
+
+def _acl_protected_path_block(path, mode: str = "write", task_id: str = "default"):
+    """Return a non-leaky denial if a file *mode* op on *path* would bypass the
+    skill ACL by touching a protected skills directory, else ``None`` (allow).
+
+    *mode* is ``"read"`` (requires skill read permission) or ``"write"`` (requires
+    skill manage permission). **api_server-platform only** — CLI/cron/chat are the
+    trusted owner / gated elsewhere and exempt. ACL disabled => allow. When ACL is
+    ENABLED on api_server, any resolution error **fails CLOSED**. ``..``/symlink
+    traversal is neutralised via ``Path.resolve()``. The reason reveals no skill
+    names/contents.
+    """
+    if not path:
+        return None
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return None
+    except Exception:
+        return None
+    deny = _ACL_PROTECTED_READ_DENY if mode == "read" else _ACL_PROTECTED_WRITE_DENY
+    try:
+        from tools.skill_acl import load_skill_acl_config, resolve_skill_permissions
+        from gateway.session_context import get_session_env
+
+        cfg = load_skill_acl_config()
+        if not cfg.get("enabled"):
+            return None
+        protect = list(cfg.get("protect_paths") or [])
+        if not protect:
+            from hermes_constants import get_hermes_home
+
+            protect = [str(Path(get_hermes_home()) / "skills")]
+        try:
+            target = Path(_resolve_path_for_task(path, task_id))
+        except Exception:
+            target = Path(os.path.expanduser(str(path)))
+        target = target.resolve()
+        under = False
+        for root in protect:
+            try:
+                root_p = Path(os.path.expanduser(str(root))).resolve()
+            except Exception:
+                continue
+            if target == root_p or root_p in target.parents:
+                under = True
+                break
+        if not under:
+            return None  # not a protected path -> normal file op
+        role = get_session_env("HERMES_SESSION_USER_ROLE", "")
+        groups = get_session_env("HERMES_SESSION_USER_GROUPS", "")
+        perms = resolve_skill_permissions(role, groups, cfg)
+        needed = {"read"} if mode == "read" else {"create", "update", "delete"}
+        if perms & needed:
+            return None  # caller is permitted for this protected-path op
+        return deny
+    except Exception:
+        return deny  # fail closed
+
+
+def _acl_filter_search_result(result, task_id: str = "default"):
+    """Exclude search matches/files/counts under a protected skills path when the
+    api_server caller lacks skill READ permission (#13 search read-bypass closure).
+
+    Per-RESULT filtering (not just the search root) so legitimate non-protected
+    matches still return while protected paths AND their content/snippets are
+    withheld; ``total_count`` is recomputed so hidden matches are not implied.
+    api_server-platform only; ACL disabled => unchanged; **fail-CLOSED** (drop all
+    results) on resolution error when enabled+api_server. Callers WITH read
+    permission are unaffected (they may read protected skills).
+    """
+    if result is None:
+        return result
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return result
+    except Exception:
+        return result
+
+    def _blank(r):
+        try:
+            r.matches = []
+            r.files = []
+            r.counts = {}
+            r.total_count = 0
+            r.truncated = False
+        except Exception:
+            pass
+        return r
+
+    try:
+        from tools.skill_acl import load_skill_acl_config, resolve_skill_permissions
+        from gateway.session_context import get_session_env
+
+        cfg = load_skill_acl_config()
+        if not cfg.get("enabled"):
+            return result
+        role = get_session_env("HERMES_SESSION_USER_ROLE", "")
+        groups = get_session_env("HERMES_SESSION_USER_GROUPS", "")
+        if "read" in resolve_skill_permissions(role, groups, cfg):
+            return result  # caller may read protected skills -> no filtering
+        protect = list(cfg.get("protect_paths") or [])
+        if not protect:
+            from hermes_constants import get_hermes_home
+
+            protect = [str(Path(get_hermes_home()) / "skills")]
+        roots = []
+        for _r in protect:
+            try:
+                roots.append(Path(os.path.expanduser(str(_r))).resolve())
+            except Exception:
+                continue
+    except Exception:
+        return _blank(result)  # enabled+api_server but unresolvable -> fail closed
+
+    def _protected(p) -> bool:
+        try:
+            tp = Path(_resolve_path_for_task(p, task_id)).resolve()
+        except Exception:
+            try:
+                tp = Path(os.path.expanduser(str(p))).resolve()
+            except Exception:
+                return True  # unresolvable -> treat as protected (fail closed)
+        for root in roots:
+            if tp == root or root in tp.parents:
+                return True
+        return False
+
+    try:
+        if getattr(result, "matches", None):
+            result.matches = [m for m in result.matches if not _protected(m.path)]
+        if getattr(result, "files", None):
+            result.files = [f for f in result.files if not _protected(f)]
+        if getattr(result, "counts", None):
+            result.counts = {k: v for k, v in result.counts.items() if not _protected(k)}
+        result.total_count = (
+            len(getattr(result, "matches", []) or [])
+            + len(getattr(result, "files", []) or [])
+            + len(getattr(result, "counts", {}) or {})
+        )
+        result.truncated = False
+    except Exception:
+        return _blank(result)
+    return result
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+
+        # Skill ACL (#13): block reading protected skill files without read perm.
+        acl_err = _acl_protected_path_block(path, mode="read", task_id=task_id)
+        if acl_err:
+            return json.dumps({"error": acl_err, "success": False}, ensure_ascii=False)
 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
@@ -1195,6 +1361,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    # Skill ACL (#13): block writing protected skill files without manage perm.
+    acl_err = _acl_protected_path_block(path, mode="write", task_id=task_id)
+    if acl_err:
+        return tool_error(acl_err)
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
@@ -1297,6 +1467,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    # Skill ACL (#13): block patching protected skill files without manage perm.
+    for _p in _paths_to_check:
+        acl_err = _acl_protected_path_block(_p, mode="write", task_id=task_id)
+        if acl_err:
+            return tool_error(acl_err)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -1478,6 +1653,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, code_file=True)
+        # Skill ACL (#13): drop matches/files/counts under a protected skills path
+        # the caller lacks read permission for — closes the search read-bypass.
+        result = _acl_filter_search_result(result, task_id)
         result_dict = result.to_dict(densify=True)
 
         if count >= 3:

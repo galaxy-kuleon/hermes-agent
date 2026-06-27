@@ -947,18 +947,119 @@ def _sanitize_owui_id(raw: str) -> str:
     return cleaned
 
 
-def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
-    """Extract sanitised user_id / user_name / chat_id from request headers.
+# Role is a short lowercase token (e.g. "admin", "user").  Groups header is a
+# comma-separated list of stable OpenWebUI group IDs; each element is sanitised
+# with the same rules as a user ID and the whole header is length-capped.
+_OWUI_ROLE_RE = re.compile(r"[^a-z0-9_\-]")
+_OWUI_GROUPS_MAX = 2048
+_OWUI_GROUPS_MAX_COUNT = 64
 
-    Always returns a dict with all three keys (empty string if header is
-    missing or fails sanitisation).  Callers decide whether to fail-closed on
-    missing user_id.
+
+def _sanitize_owui_role(raw: str) -> str:
+    """Sanitise the X-OpenWebUI-User-Role header to a lowercase token."""
+    if not raw:
+        return ""
+    return _OWUI_ROLE_RE.sub("", raw.strip().lower())[:_OWUI_ID_MAX]
+
+
+def _sanitize_owui_groups(raw: str) -> str:
+    """Parse X-OpenWebUI-User-Groups into a clean comma-joined string of IDs.
+
+    Splits on commas, sanitises each element as an OpenWebUI ID, drops empties
+    and duplicates (order-preserving), and caps the count.  Returns ``""`` when
+    no valid IDs remain.  Identity is taken from trusted headers only.
+    """
+    if not raw:
+        return ""
+    ids: List[str] = []
+    for part in raw.strip()[:_OWUI_GROUPS_MAX].split(","):
+        gid = _sanitize_owui_id(part)
+        if gid and gid not in ids:
+            ids.append(gid)
+            if len(ids) >= _OWUI_GROUPS_MAX_COUNT:
+                break
+    return ",".join(ids)
+
+
+def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
+    """Extract sanitised user_id / user_name / chat_id / user_role / user_groups.
+
+    Always returns a dict with all keys (empty string if header is missing or
+    fails sanitisation).  Callers decide whether to fail-closed on missing
+    user_id.  ``user_role``/``user_groups`` feed the Hermes skill ACL.
     """
     user_id = _sanitize_owui_id(request.headers.get("X-OpenWebUI-User-Id", ""))
     chat_id = _sanitize_owui_id(request.headers.get("X-OpenWebUI-Chat-Id", ""))
     raw_user_name = request.headers.get("X-OpenWebUI-User-Name", "").strip()
     user_name = raw_user_name[:128] if raw_user_name else ""
-    return {"user_id": user_id, "user_name": user_name, "chat_id": chat_id}
+    user_role = _sanitize_owui_role(request.headers.get("X-OpenWebUI-User-Role", ""))
+    user_groups = _sanitize_owui_groups(
+        request.headers.get("X-OpenWebUI-User-Groups", "")
+    )
+    return {
+        "user_id": user_id,
+        "user_name": user_name,
+        "chat_id": chat_id,
+        "user_role": user_role,
+        "user_groups": user_groups,
+    }
+
+
+_SKILL_TOOLSET_KEYS = {"skills", "skills_read", "skills_manage"}
+_FILE_TOOLSET_KEYS = {"file", "file_read", "file_write"}
+# Toolsets that let a caller read/mutate the protected skills dir OUTSIDE the
+# skill tools (arbitrary shell). Withheld from non-manage api_server users (#13).
+_BYPASS_TOOLSET_KEYS = {"terminal"}
+_ACL_MANAGED_TOOLSET_KEYS = _SKILL_TOOLSET_KEYS | _FILE_TOOLSET_KEYS | _BYPASS_TOOLSET_KEYS
+
+
+def _apply_skill_acl_toolset_minimization(
+    toolsets: List[str], role: str, groups: str
+) -> List[str]:
+    """Schema-level skill ACL minimization for the api_server platform (#12/#13).
+
+    When ``skills_acl`` is enabled, restrict the toolset the model sees so an
+    unprivileged caller cannot read/mutate protected skills:
+      * ``skills`` -> ``skills_read`` (if read) and/or ``skills_manage`` (if manage);
+      * ``file``   -> full ``file`` only for manage callers, else read-only
+        ``file_read`` (no write_file/patch) — closes the file-write bypass (#13);
+      * ``terminal`` -> withheld from non-manage callers (arbitrary-exec bypass, #13).
+
+    Runtime gates (#11 read, #12 manage, #13 protected-path file guard) remain
+    authoritative; this is defense-in-depth + UX. Takes ``role``/``groups`` as
+    explicit args (not session context) because on /v1/runs the agent is created
+    before session vars are bound. ACL disabled => unchanged. Resolution error =>
+    fail safe (drop skill/write/exec toolsets; keep read-only file if a file
+    toolset was present, since read-only file cannot mutate skills).
+    """
+    if not any(t in _ACL_MANAGED_TOOLSET_KEYS for t in toolsets):
+        return toolsets
+    had_file = any(t in _FILE_TOOLSET_KEYS for t in toolsets)
+    had_terminal = "terminal" in toolsets
+    try:
+        from tools.skill_acl import load_skill_acl_config, resolve_skill_permissions
+
+        cfg = load_skill_acl_config()
+        if not cfg.get("enabled"):
+            return toolsets
+        perms = resolve_skill_permissions(role or "", groups or "", cfg)
+    except Exception:
+        kept = [t for t in toolsets if t not in _ACL_MANAGED_TOOLSET_KEYS]
+        if had_file:
+            kept.append("file_read")
+        return kept
+    can_read = "read" in perms
+    can_manage = bool(perms & {"create", "update", "delete"})
+    result = [t for t in toolsets if t not in _ACL_MANAGED_TOOLSET_KEYS]
+    if can_read:
+        result.append("skills_read")
+    if can_manage:
+        result.append("skills_manage")
+    if had_file:
+        result.append("file" if can_manage else "file_read")
+    if had_terminal and can_manage:
+        result.append("terminal")
+    return result
 
 
 def _scope_session_id(base_session_id: str, scope: Dict[str, str]) -> str:
@@ -1625,6 +1726,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         reasoning_callback=None,
         user_id: Optional[str] = None,
+        user_role: Optional[str] = None,
+        user_groups: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1657,6 +1760,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        # Schema-level skill ACL minimization (issue #12): hide skill toolsets the
+        # caller cannot use. Runtime gates remain authoritative.
+        enabled_toolsets = _apply_skill_acl_toolset_minimization(
+            enabled_toolsets, user_role or "", user_groups or ""
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -2632,6 +2740,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 user_id=user_id,
                 chat_id=chat_id,
+                user_name=user_name,
+                user_role=scope.get("user_role", ""),
+                user_groups=scope.get("user_groups", ""),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2653,6 +2764,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 user_id=user_id,
                 chat_id=chat_id,
+                user_name=user_name,
+                user_role=scope.get("user_role", ""),
+                user_groups=scope.get("user_groups", ""),
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3810,6 +3924,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 user_id=user_id,
                 chat_id=chat_id,
+                user_name=user_name,
+                user_role=scope.get("user_role", ""),
+                user_groups=scope.get("user_groups", ""),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3845,6 +3962,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 user_id=user_id,
                 chat_id=chat_id,
+                user_name=user_name,
+                user_role=scope.get("user_role", ""),
+                user_groups=scope.get("user_groups", ""),
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4449,6 +4569,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         user_id: Optional[str] = None,
         chat_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        user_role: Optional[str] = None,
+        user_groups: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4470,11 +4593,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 set_trusted_export_context,
             )
 
+            # Bind OpenWebUI identity (incl. role/groups) into concurrency-safe
+            # session contextvars so skill ACL checks in tool handlers can read
+            # the caller's scope.  Real values are passed (not defaults) so the
+            # chat-completions path no longer falls back to stale os.environ.
+            # set_session_vars is not stack-safe, so upstream's session-id bind
+            # and the kg ACL identity bind are merged into ONE call (a second
+            # call would reset session_id to "" — losing upstream's binding).
             tokens = set_session_vars(
                 platform="api_server",
-                chat_id=session_id or "",
+                chat_id=chat_id or session_id or "",
+                user_id=user_id or "",
+                user_name=user_name or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
+                user_role=user_role or "",
+                user_groups=user_groups or "",
             )
             export_context_token = set_trusted_export_context(
                 {
@@ -4496,6 +4630,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     reasoning_callback=reasoning_callback,
                     user_id=user_id,
+                    user_role=user_role,
+                    user_groups=user_groups,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
@@ -4518,8 +4654,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
-                clear_session_vars(tokens)
-                reset_trusted_export_context(export_context_token)
+                try:
+                    clear_session_vars(tokens)
+                finally:
+                    reset_trusted_export_context(export_context_token)
 
         return await loop.run_in_executor(None, _run)
 
@@ -4744,6 +4882,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
                     user_id=user_id,
+                    user_role=scope.get("user_role", ""),
+                    user_groups=scope.get("user_groups", ""),
                 )
                 self._active_run_agents[run_id] = agent
 
@@ -4798,7 +4938,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                         session_tokens = set_session_vars(
                             platform="api_server",
+                            chat_id=chat_id or "",
+                            user_id=user_id or "",
+                            user_name=scope.get("user_name", ""),
                             session_key=approval_session_key,
+                            user_role=scope.get("user_role", ""),
+                            user_groups=scope.get("user_groups", ""),
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(

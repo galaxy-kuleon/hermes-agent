@@ -999,6 +999,49 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
         _skill_gate_bypass.reset(token)
 
 
+# Non-leaky denial used when the ACL is enabled on api_server but management
+# permission resolution fails unexpectedly — fail CLOSED for write/manage actions.
+_ACL_MANAGE_DENY = (
+    "Hermes skills ACL: management permission could not be verified for the "
+    "current OpenWebUI role/group scope; denied."
+)
+
+
+def _acl_manage_block(action: str) -> Optional[str]:
+    """Return a non-leaky denial message if the current OpenWebUI (api_server)
+    caller lacks permission for skill management *action*, else ``None`` (allow).
+
+    Mirrors the read gate in ``tools/skills_tool.py`` (#11): the skill ACL governs
+    the multi-user **api_server** (OpenWebUI) surface only — CLI/cron/chat-platform
+    callers (trusted owner / gated elsewhere) are never blocked here. Allow is
+    preserved for exactly (a) ACL disabled (the default) and (b) non-api_server
+    platforms. When ACL is ENABLED on api_server, any error during permission
+    resolution **fails CLOSED** (write/manage actions must never silently pass).
+    The action maps to a permission via the #10 resolver
+    (create=create; edit/patch/write_file/remove_file=update; delete=delete), and
+    delete is never implied by update. The reason reveals no skill names/contents.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        return None
+    if platform != "api_server":
+        return None  # (b) ACL governs the api_server surface only
+    try:
+        from tools.skill_acl import load_skill_acl_config, require_skill_permission
+
+        if not load_skill_acl_config().get("enabled"):
+            return None  # (a) legacy: ACL disabled => allow (unchanged)
+        ok, reason = require_skill_permission(action)
+        return None if ok else reason
+    except Exception:
+        # ACL enabled (or indeterminate) on api_server and resolution failed:
+        # fail CLOSED rather than allow a skill mutation.
+        return _ACL_MANAGE_DENY
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1016,6 +1059,13 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    # Action-level ACL (issue #12): map action -> permission and deny BEFORE any
+    # mutation/filesystem write. create/update/delete are independent; delete is
+    # never implied by update.
+    blocked = _acl_manage_block(action)
+    if blocked:
+        return tool_error(blocked, success=False)
+
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is
