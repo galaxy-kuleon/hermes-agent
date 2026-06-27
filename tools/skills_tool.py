@@ -89,6 +89,58 @@ logger = logging.getLogger(__name__)
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 
+
+# Non-leaky denial used when the ACL is enabled on api_server but permission
+# resolution fails unexpectedly — fail CLOSED rather than expose skills.
+_ACL_READ_DENY = (
+    "Hermes skills ACL: read access could not be verified for the current "
+    "OpenWebUI role/group scope; denied."
+)
+
+
+def _acl_read_block(action: str) -> Optional[str]:
+    """Return a non-leaky denial message if the current OpenWebUI (api_server)
+    caller lacks skill READ permission for *action*, else ``None`` (allow).
+
+    The Hermes skill ACL (issue #11) governs the multi-user **api_server**
+    (OpenWebUI) surface only. CLI / cron / chat-platform callers are the trusted
+    owner (or gated elsewhere) and are never blocked here.
+
+    Allow is preserved for exactly two cases:
+      (a) ``skills_acl`` disabled (the default) — behavior unchanged until the
+          policy is enabled; and
+      (b) non-api_server platforms — exempt by design.
+
+    When ACL is ENABLED on api_server, any error during permission resolution
+    **fails CLOSED** (returns a deny reason) — consistent with the fail-safe-deny
+    contract of #10/#13. The returned reason never reveals skill names/contents.
+    """
+    # Platform probe (cheap, reliable). If it cannot be read we are not on a
+    # verified api_server surface, so do not block.
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        return None
+    if platform != "api_server":
+        return None  # (b) ACL governs the api_server surface only
+
+    # On api_server: from here, default to FAIL CLOSED on any error.
+    try:
+        from tools.skill_acl import load_skill_acl_config, require_skill_permission
+
+        # load_skill_acl_config is designed not to raise; use it as the
+        # authoritative enabled-state probe, independent of the decision call.
+        if not load_skill_acl_config().get("enabled"):
+            return None  # (a) legacy: ACL disabled => allow (unchanged)
+        ok, reason = require_skill_permission(action)
+        return None if ok else reason
+    except Exception:
+        # ACL enabled (or indeterminate) on api_server and resolution failed:
+        # fail CLOSED rather than expose skills_list/skill_view.
+        return _ACL_READ_DENY
+
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -686,6 +738,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     Returns:
         JSON string with minimal skill info: name, description, category
     """
+    blocked = _acl_read_block("skills_list")
+    if blocked:
+        return tool_error(blocked, success=False)
     try:
         if not SKILLS_DIR.exists():
             SKILLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -868,6 +923,11 @@ def skill_view(
     Returns:
         JSON string with skill content or error message
     """
+    # Read enforcement (issue #11): gate BEFORE any name resolution so a no-read
+    # caller learns nothing about whether the requested skill exists.
+    blocked = _acl_read_block("skill_view")
+    if blocked:
+        return tool_error(blocked, success=False)
     try:
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────

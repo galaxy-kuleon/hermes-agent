@@ -151,12 +151,29 @@ TOOLSETS = {
         "includes": []
     },
     
-    "skills": {
-        "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
-        "tools": ["skills_list", "skill_view", "skill_manage"],
+    # Read-only skill access (list/view), split out from "skills" so the skill
+    # ACL (issues #11/#12) can expose reading without exposing skill_manage.
+    "skills_read": {
+        "description": "List and view skill documents (read-only)",
+        "tools": ["skills_list", "skill_view"],
         "includes": []
     },
-    
+
+    # Skill mutation (create/edit/delete). Action-level ACL is enforced inside
+    # skill_manage itself (issue #12).
+    "skills_manage": {
+        "description": "Create, edit, and delete skill documents",
+        "tools": ["skill_manage"],
+        "includes": []
+    },
+
+    "skills": {
+        "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
+        # Backward-compatible: resolves to skills_list + skill_view + skill_manage.
+        "tools": [],
+        "includes": ["skills_read", "skills_manage"]
+    },
+
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
         "tools": [
@@ -182,12 +199,31 @@ TOOLSETS = {
     },
 
     
-    "file": {
-        "description": "File manipulation tools: read, write, patch (with fuzzy matching), search, and local document export",
-        "tools": ["read_file", "write_file", "patch", "search_files", "local_document_export"],
+    # Read-only file access (read/search/export), split out from "file" so the
+    # skill ACL (#13) can withhold write-capable file tools from unprivileged
+    # api_server users while preserving read + document export.
+    "file_read": {
+        "description": "Read files, search files, and export documents (read-only; no writes)",
+        "tools": ["read_file", "search_files", "local_document_export"],
         "includes": []
     },
-    
+
+    # Write-capable file tools. Withheld from api_server users lacking skill
+    # manage permission (#13 bypass closure); protected-path writes are also
+    # guarded at execution.
+    "file_write": {
+        "description": "Create and modify files (write, patch with fuzzy matching)",
+        "tools": ["write_file", "patch"],
+        "includes": []
+    },
+
+    "file": {
+        "description": "File manipulation tools: read, write, patch (with fuzzy matching), search, and local document export",
+        # Backward-compatible: resolves to read_file + search_files + local_document_export + write_file + patch.
+        "tools": [],
+        "includes": ["file_read", "file_write"]
+    },
+
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
