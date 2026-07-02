@@ -38,6 +38,8 @@ RUN apt-get update && \
     chromium \
     # Other tools
     ripgrep \
+    tmux \
+    vim \
     ffmpeg \
     openssh-client \
     docker-cli \
