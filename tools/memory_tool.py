@@ -26,6 +26,7 @@ Design:
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -52,9 +53,39 @@ logger = logging.getLogger(__name__)
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
+def _current_user_scope() -> str:
+    """Return a filesystem-safe per-user segment for the bound gateway user.
+
+    On multi-user gateway platforms (e.g. OpenWebUI 8083) the built-in file
+    memory is injected into EVERY user's system prompt, so a single shared
+    ``memories/`` dir leaks one user's notes to all others.  When a gateway
+    user id is bound to the current async task (``HERMES_SESSION_USER_ID``,
+    the same per-request identity that scopes the OpenViking provider), scope
+    the memory dir under it.  Single-tenant contexts (CLI, cron, tests) have
+    no bound user id → returns ``""`` → the flat shared dir is used, so their
+    on-disk layout and behaviour are byte-identical to before.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        uid = get_session_env("HERMES_SESSION_USER_ID", "") or ""
+    except Exception:
+        return ""
+    # Mirror OpenWebUI's own path-segment sanitiser: keep [A-Za-z0-9_.-], cap
+    # length, and never allow traversal (no bare '.'/'..' segment).
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", uid).strip("._-")[:64]
+    if not safe or safe in (".", ".."):
+        return ""
+    return safe
+
+
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the profile-scoped, per-user-scoped memories directory."""
+    base = get_hermes_home() / "memories"
+    scope = _current_user_scope()
+    if scope:
+        return base / "users" / scope
+    return base
 
 ENTRY_DELIMITER = "\n§\n"
 
