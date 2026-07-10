@@ -215,9 +215,10 @@ class _VikingClient:
                  agent: Optional[str] = None):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
-        # Account/user are local/trusted-mode tenant identity. API-key requests
-        # omit these headers by default; trusted-mode retry may send them only
-        # after OpenViking explicitly asks for asserted tenant identity.
+        # Account/user are local/trusted-mode tenant identity. When callers pass
+        # an explicit tenant, send it on the first request so trusted mode does
+        # not emit a noisy 400 before retrying.
+        self._send_tenant_by_default = bool(account or user)
         self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
         self._user = user or os.environ.get("OPENVIKING_USER", "default")
         self._agent = agent if agent is not None else os.environ.get("OPENVIKING_AGENT", _DEFAULT_AGENT)
@@ -227,7 +228,7 @@ class _VikingClient:
 
     def _headers(self, *, include_tenant: bool | None = None) -> dict:
         if include_tenant is None:
-            include_tenant = not bool(self._api_key)
+            include_tenant = self._send_tenant_by_default or not bool(self._api_key)
 
         h = {"Content-Type": "application/json"}
         if self._agent:
@@ -2210,7 +2211,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 queries.append(("viking://resources/", "resources"))
 
                 for target_uri, ctx_type in queries:
-                    payload = {"query": query, "top_k": 5, "target_uri": target_uri}
+                    payload = {"query": query, "limit": 5, "target_uri": target_uri}
                     try:
                         resp = client.post("/api/v1/search/find", payload)
                     except Exception as e:
@@ -3051,8 +3052,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
-        if mode != "auto":
-            payload["mode"] = mode
+        # `mode` is a Hermes-side routing hint. OpenViking v0.4.5 request
+        # models reject unknown body fields, so do not forward it.
         # Multi-tenancy guard: OpenViking's `/api/v1/search/find` does NOT
         # filter results by X-OpenViking-User when called with a ROOT key.
         # Without an explicit target_uri the search returns memories from
@@ -3062,7 +3063,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # `scope` (e.g. "viking://resources/" for shared org documents).
         if args.get("scope"):
             payload["target_uri"] = args["scope"]
-        elif self._user:
+        elif getattr(self, "_user", ""):
             payload["target_uri"] = f"viking://user/{self._user}/"
         if args.get("limit"):
             payload["limit"] = args["limit"]
