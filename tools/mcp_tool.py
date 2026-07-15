@@ -3115,6 +3115,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Skill ACL (#13 code-exec extension): block a locally-launched code-exec
+        # MCP server (e.g. opencode_runner) from operating under a protected
+        # skills path when the api_server caller lacks skill permission. This is
+        # the universal MCP-dispatch choke point (both the concurrent and the
+        # sequential tool paths reach it), so the guard cannot be bypassed via a
+        # code-exec subprocess that the skills-ACL toolset minimization does not
+        # cover. Remote MCP servers (soc_v2) and non-protected working dirs are
+        # unaffected. The guard is api_server-only and fails closed internally.
+        from tools.file_tools import _acl_guard_code_exec_mcp_call
+        _acl_denial = _acl_guard_code_exec_mcp_call(server_name, args)
+        if _acl_denial:
+            return json.dumps({"error": _acl_denial}, ensure_ascii=False)
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).

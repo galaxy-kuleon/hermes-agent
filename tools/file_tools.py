@@ -789,21 +789,32 @@ _ACL_PROTECTED_READ_DENY = (
     "read permission for the current OpenWebUI role/group scope; denied."
 )
 _ACL_PROTECTED_WRITE_DENY = (
-    "Hermes skills ACL: writing under a protected skills path requires skill "
-    "manage permission for the current OpenWebUI role/group scope; denied."
+    "Hermes skills ACL: writing under a protected skills path requires the "
+    "matching skill create/update/delete permission for the current OpenWebUI "
+    "role/group scope; denied."
 )
+_VALID_ACL_FILE_PERMISSIONS = frozenset({"read", "create", "update", "delete"})
 
 
-def _acl_protected_path_block(path, mode: str = "write", task_id: str = "default"):
+def _acl_protected_path_block(
+    path,
+    mode: str = "write",
+    task_id: str = "default",
+    permission: str | None = None,
+):
     """Return a non-leaky denial if a file *mode* op on *path* would bypass the
     skill ACL by touching a protected skills directory, else ``None`` (allow).
 
-    *mode* is ``"read"`` (requires skill read permission) or ``"write"`` (requires
-    skill manage permission). **api_server-platform only** — CLI/cron/chat are the
-    trusted owner / gated elsewhere and exempt. ACL disabled => allow. When ACL is
-    ENABLED on api_server, any resolution error **fails CLOSED**. ``..``/symlink
-    traversal is neutralised via ``Path.resolve()``. The reason reveals no skill
-    names/contents.
+    *mode* is ``"read"`` (requires skill read permission) or ``"write"``. Write
+    callers should pass the concrete ACL *permission* they need (``create``,
+    ``update``, or ``delete``). If omitted, write defaults to ``create`` for a
+    missing target and ``update`` for an existing target. This keeps ``delete``
+    independent from ``update`` instead of treating every write-capable operation
+    as a single broad "manage" bypass. **api_server-platform only** — CLI/cron/chat
+    are the trusted owner / gated elsewhere and exempt. ACL disabled => allow.
+    When ACL is ENABLED on api_server, any resolution error **fails CLOSED**.
+    ``..``/symlink traversal is neutralised via ``Path.resolve()``. The reason
+    reveals no skill names/contents.
     """
     if not path:
         return None
@@ -846,12 +857,61 @@ def _acl_protected_path_block(path, mode: str = "write", task_id: str = "default
         role = get_session_env("HERMES_SESSION_USER_ROLE", "")
         groups = get_session_env("HERMES_SESSION_USER_GROUPS", "")
         perms = resolve_skill_permissions(role, groups, cfg)
-        needed = {"read"} if mode == "read" else {"create", "update", "delete"}
-        if perms & needed:
+        if mode == "read":
+            needed = "read"
+        else:
+            needed = (permission or "").strip().lower()
+            if needed not in _VALID_ACL_FILE_PERMISSIONS or needed == "read":
+                needed = "update" if target.exists() else "create"
+        if needed in perms:
             return None  # caller is permitted for this protected-path op
         return deny
     except Exception:
         return deny  # fail closed
+
+
+# Locally-launched code-exec MCP servers: they run a subprocess with hermes-
+# container filesystem access and a caller-supplied working directory (e.g.
+# ``opencode_runner`` runs ``opencode`` in an arbitrary ``cwd``). They are NOT
+# members of ``_ACL_MANAGED_TOOLSET_KEYS``, so ``_apply_skill_acl_toolset_
+# minimization`` never withholds them — an api_server caller lacking skill perms
+# could otherwise point one at a protected skills path to read/mutate skills,
+# bypassing the skills ACL (#13 code-exec extension). REMOTE MCP servers (e.g.
+# ``soc_v2``) run in their own container and cannot reach a hermes ``protect_path``,
+# so they are intentionally NOT guarded here (keeps SOCv2 working normally).
+_ACL_GUARDED_CODE_EXEC_MCP_SERVERS = frozenset({"opencode_runner"})
+# Argument keys a code-exec MCP tool may use to name a working dir / target path.
+_ACL_MCP_PATH_ARG_KEYS = (
+    "cwd", "path", "directory", "working_dir", "workdir", "dir", "root",
+)
+
+
+def _acl_guard_code_exec_mcp_call(server_name, args, task_id: str = "default"):
+    """Return a non-leaky denial if a code-exec MCP call would operate under a
+    protected skills path without the required skill permission, else ``None``.
+
+    Only servers in :data:`_ACL_GUARDED_CODE_EXEC_MCP_SERVERS` are checked; every
+    path-like argument is tested via :func:`_acl_protected_path_block` (which is
+    api_server-only, ACL-disabled => allow, ``..``/symlink resolved, and
+    fail-closed). Running under a ``protect_path`` requires ``delete`` permission,
+    because arbitrary code can delete/rewrite skills — so only a full skill-admin
+    may operate there, mirroring the ``terminal`` toolset restriction. Legit
+    non-protected working dirs (e.g. ``/tmp``, ``/home/hermes/workspace``) and
+    non-guarded / remote MCP servers are unaffected.
+    """
+    if server_name not in _ACL_GUARDED_CODE_EXEC_MCP_SERVERS:
+        return None
+    if not isinstance(args, dict):
+        return None
+    for key in _ACL_MCP_PATH_ARG_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            denial = _acl_protected_path_block(
+                val, mode="write", task_id=task_id, permission="delete"
+            )
+            if denial:
+                return denial
+    return None
 
 
 def _acl_filter_search_result(result, task_id: str = "default"):
@@ -1437,28 +1497,52 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
+    _acl_path_checks = []  # (path, required skill ACL permission or None for existence-based)
     if path:
         _paths_to_check.append(path)
+        _acl_path_checks.append((path, "update"))
     if mode == "patch" and patch:
-        import re as _re
         from tools.path_security import has_traversal_component
-        for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        from tools.patch_parser import OperationType, parse_v4a_patch
+
+        operations, parse_error = parse_v4a_patch(patch)
+        if parse_error:
+            return tool_error(f"Failed to parse patch: {parse_error}")
+
+        def _add_v4a_path(v4a_path: str, permission: str | None) -> None:
             # V4A path headers come from patch CONTENT, not the explicit
             # ``path=`` arg — so they're more attacker-influenceable (skill
             # content, web extract, prompt injection). Reject ``..`` traversal
             # in V4A headers: a legitimate multi-file patch from a single cwd
             # can always emit absolute paths or paths relative to the agent's
-            # cwd without ``..``. The explicit ``path=`` arg is unchanged
-            # because the agent uses relative ``..`` paths legitimately
-            # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
+            # cwd without ``..``.
             if has_traversal_component(v4a_path):
-                return tool_error(
+                raise ValueError(
                     f"V4A patch header contains '..' traversal: {v4a_path!r}. "
                     "Use the agent's cwd-relative path (no '..') or an absolute "
-                    "path in '*** Update File:' / '*** Add File:' / '*** Delete File:' headers."
+                    "path in '*** Update File:' / '*** Add File:' / '*** Delete File:' / '*** Move File:' headers."
                 )
             _paths_to_check.append(v4a_path)
+            _acl_path_checks.append((v4a_path, permission))
+
+        try:
+            for op in operations:
+                if op.operation == OperationType.UPDATE:
+                    _add_v4a_path(op.file_path, "update")
+                elif op.operation == OperationType.ADD:
+                    # V4A Add is implemented by write_file under the hood. Keep
+                    # create/update independent by deriving required permission
+                    # from target existence in _acl_protected_path_block: new
+                    # protected file => create, existing protected file => update.
+                    _add_v4a_path(op.file_path, None)
+                elif op.operation == OperationType.DELETE:
+                    _add_v4a_path(op.file_path, "delete")
+                elif op.operation == OperationType.MOVE:
+                    _add_v4a_path(op.file_path, "delete")
+                    if op.new_path:
+                        _add_v4a_path(op.new_path, "create")
+        except ValueError as e:
+            return tool_error(str(e))
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
@@ -1467,9 +1551,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
-    # Skill ACL (#13): block patching protected skill files without manage perm.
-    for _p in _paths_to_check:
-        acl_err = _acl_protected_path_block(_p, mode="write", task_id=task_id)
+    # Skill ACL (#13): block patching protected skill files without the concrete
+    # permission for the requested operation. Update/Add/Delete/Move are kept
+    # distinct so update never implies delete and delete never implies update.
+    for _p, _permission in _acl_path_checks:
+        acl_err = _acl_protected_path_block(_p, mode="write", task_id=task_id, permission=_permission)
         if acl_err:
             return tool_error(acl_err)
     try:

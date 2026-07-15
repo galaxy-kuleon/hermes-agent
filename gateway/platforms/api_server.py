@@ -1021,9 +1021,11 @@ def _apply_skill_acl_toolset_minimization(
     When ``skills_acl`` is enabled, restrict the toolset the model sees so an
     unprivileged caller cannot read/mutate protected skills:
       * ``skills`` -> ``skills_read`` (if read) and/or ``skills_manage`` (if manage);
-      * ``file``   -> full ``file`` only for manage callers, else read-only
-        ``file_read`` (no write_file/patch) — closes the file-write bypass (#13);
-      * ``terminal`` -> withheld from non-manage callers (arbitrary-exec bypass, #13).
+      * ``file``   -> full ``file`` only for create/update callers, else read-only
+        ``file_read`` (no write_file/patch) — delete-only does not imply raw file
+        writes; protected-path operations are still permission-checked per action;
+      * ``terminal`` -> withheld unless the caller has the full read/create/update/delete
+        set, because arbitrary shell cannot preserve delete/update independence.
 
     Runtime gates (#11 read, #12 manage, #13 protected-path file guard) remain
     authoritative; this is defense-in-depth + UX. Takes ``role``/``groups`` as
@@ -1049,15 +1051,17 @@ def _apply_skill_acl_toolset_minimization(
             kept.append("file_read")
         return kept
     can_read = "read" in perms
-    can_manage = bool(perms & {"create", "update", "delete"})
+    can_skill_manage = bool(perms & {"create", "update", "delete"})
+    can_file_write = bool(perms & {"create", "update"})
+    can_terminal = {"read", "create", "update", "delete"} <= perms
     result = [t for t in toolsets if t not in _ACL_MANAGED_TOOLSET_KEYS]
     if can_read:
         result.append("skills_read")
-    if can_manage:
+    if can_skill_manage:
         result.append("skills_manage")
     if had_file:
-        result.append("file" if can_manage else "file_read")
-    if had_terminal and can_manage:
+        result.append("file" if can_file_write else "file_read")
+    if had_terminal and can_terminal:
         result.append("terminal")
     return result
 
