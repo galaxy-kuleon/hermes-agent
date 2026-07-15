@@ -84,6 +84,15 @@ if [ "$(id -u)" = "0" ]; then
     chmod 600 "$primary_opencode_cfg" "$subprocess_opencode_cfg" 2>/dev/null || true
     chown -R hermes:hermes "$HERMES_HOME/.config" "$HERMES_HOME/home" 2>/dev/null || true
 
+    # Ensure the per-user skills namespace root (skills ACL Increment 1) is
+    # writable by the hermes runtime user. The gateway (post-gosu, uid 1001)
+    # creates $HERMES_HOME/user-skills/<owui-user-id>/ on the first user-skill
+    # create; if the parent dir was created root-owned (e.g. by any root-context
+    # tool touching the volume), those mkdirs fail with EACCES for every caller.
+    # Create + own it here as root so container recreation stays writable.
+    mkdir -p "$HERMES_HOME/user-skills"
+    chown hermes:hermes "$HERMES_HOME/user-skills" 2>/dev/null || true
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
