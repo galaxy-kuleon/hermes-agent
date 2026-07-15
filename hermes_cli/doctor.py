@@ -2131,7 +2131,9 @@ def run_doctor(args):
         check_warn("Could not check tool availability", f"({e})")
     
     _section("Skills Hub")
-    hub_dir = HERMES_HOME / "skills" / ".hub"
+    from tools.skill_state import platform_hub_dir
+
+    hub_dir = platform_hub_dir(HERMES_HOME)
     if hub_dir.exists():
         check_ok("Skills Hub directory exists")
         lock_file = hub_dir / "lock.json"

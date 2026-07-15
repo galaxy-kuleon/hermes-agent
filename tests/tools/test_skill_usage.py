@@ -10,10 +10,11 @@ import pytest
 
 def _bump_view_many(hermes_home: str, skill_name: str, iterations: int) -> None:
     os.environ["HERMES_HOME"] = hermes_home
-    from tools.skill_usage import bump_view
+    from tools.skill_usage import bump_view, skill_usage_scope
 
-    for _ in range(iterations):
-        bump_view(skill_name)
+    with skill_usage_scope(Path(hermes_home) / "skills", platform=False):
+        for _ in range(iterations):
+            bump_view(skill_name)
 
 
 @pytest.fixture
@@ -35,7 +36,8 @@ def skills_home(tmp_path, monkeypatch):
     import tools.skill_usage as mod
     importlib.reload(mod)
     monkeypatch.setattr(mod, "_prune_builtins_enabled", lambda: False)
-    return home
+    with mod.skill_usage_scope(home / "skills", platform=False):
+        yield home
 
 
 def _write_skill(skills_dir: Path, name: str, category: str = ""):

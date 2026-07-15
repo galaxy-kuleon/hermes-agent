@@ -296,6 +296,7 @@ from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
 from hermes_cli.subcommands.skills import build_skills_parser
+from hermes_cli.subcommands.platform_skills import build_platform_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
@@ -707,7 +708,12 @@ def _termux_bundled_skills_fingerprint() -> str:
 
 
 def _termux_bundled_skills_stamp_path() -> Path:
-    return get_hermes_home() / "skills" / ".termux_bundled_sync_stamp"
+    from tools.skill_state import (
+        PLATFORM_TERMUX_SYNC_STAMP_FILENAME,
+        platform_skill_state_dir,
+    )
+
+    return platform_skill_state_dir() / PLATFORM_TERMUX_SYNC_STAMP_FILENAME
 
 
 def _termux_bundled_skills_sync_needed() -> bool:
@@ -745,7 +751,7 @@ def _sync_bundled_skills_for_startup() -> bool:
 
     from tools.skills_sync import sync_skills
 
-    sync_skills(quiet=True)
+    sync_skills(quiet=True, startup=True)
     _mark_termux_bundled_skills_synced()
     return True
 
@@ -2112,7 +2118,7 @@ def _sync_bundled_skills_quietly() -> None:
     try:
         from tools.skills_sync import sync_skills
 
-        sync_skills(quiet=True)
+        sync_skills(quiet=True, startup=True)
     except Exception:
         pass
 
@@ -11897,6 +11903,10 @@ def main():
     # skills command  (parser built in hermes_cli/subcommands/skills.py)
     # =========================================================================
     build_skills_parser(subparsers, cmd_skills=cmd_skills)
+
+    # Out-of-band transactional writer. Deployment, not chat identity, grants
+    # the read-write platform mount and operator intent marker.
+    build_platform_skills_parser(subparsers)
 
     # =========================================================================
     # bundles command — skill bundles (alias /<name> for multiple skills)

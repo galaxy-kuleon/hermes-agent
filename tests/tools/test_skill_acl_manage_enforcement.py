@@ -1,9 +1,8 @@
-"""Tests for issue #12 — gate skill_manage with INDEPENDENT create/update/delete.
+"""Runtime platform immutability and ACL schema minimization tests.
 
-Covers the action-level runtime gate on ``skill_manage`` (create/update/delete
-matrix, delete-independence, denied mutations never touch the filesystem, admin
-all-access, ACL-disabled legacy, fail-closed) and the schema-level toolset
-minimization in ``_apply_skill_acl_toolset_minimization``.
+Covers Increment 2's action-level platform gate (all api_server roles denied;
+denied mutations never touch the filesystem) and the existing schema-level
+toolset minimization in ``_apply_skill_acl_toolset_minimization``.
 """
 
 import json
@@ -80,6 +79,11 @@ def _denied(result: str) -> bool:
     return obj.get("success") is False and "skills acl" in obj.get("error", "").lower()
 
 
+def _immutable(result: str) -> bool:
+    obj = json.loads(result)
+    return obj.get("success") is False and obj.get("error_code") == "immutable_platform"
+
+
 def _do(action):
     """Call skill_manage with the minimal required args for *action*."""
     kw = {
@@ -95,48 +99,41 @@ def _do(action):
 
 # ── Runtime gate matrix ──────────────────────────────────────────────────────
 
-def test_no_perm_user_denied_all_and_no_mutation(acl_enabled, recorder):
+def test_no_perm_user_gets_immutable_platform_and_no_mutation(acl_enabled, recorder):
     tokens = _scope(role="user", groups="")  # missing group header => no perms
     try:
         for action in ["create", "edit", "patch", "delete", "write_file", "remove_file"]:
-            assert _denied(_do(action)), action
+            assert _immutable(_do(action)), action
         assert recorder == []  # nothing dispatched => no filesystem mutation
     finally:
         clear_session_vars(tokens)
 
 
-def test_editor_can_create_update_but_not_delete(acl_enabled, recorder):
-    # delete-independence: editor has read/create/update but NOT delete.
+def test_editor_cannot_mutate_platform(acl_enabled, recorder):
     tokens = _scope(role="user", groups=G_EDITORS)
     try:
-        assert not _denied(_do("create"))
-        assert not _denied(_do("edit"))
-        assert not _denied(_do("patch"))
-        assert not _denied(_do("write_file"))
-        assert not _denied(_do("remove_file"))
-        # delete must be DENIED and never dispatched
-        assert _denied(_do("delete"))
-        assert "delete" not in recorder
-        assert {"create", "edit", "patch", "write_file", "remove_file"} <= set(recorder)
+        for action in ["create", "edit", "patch", "delete", "write_file", "remove_file"]:
+            assert _immutable(_do(action)), action
+        assert recorder == []
     finally:
         clear_session_vars(tokens)
 
 
-def test_delete_granted_group_can_delete(acl_enabled, recorder):
+def test_delete_granted_group_cannot_delete_platform(acl_enabled, recorder):
     tokens = _scope(role="user", groups=G_DELETERS)
     try:
-        assert not _denied(_do("delete"))
-        assert "delete" in recorder
+        assert _immutable(_do("delete"))
+        assert recorder == []
     finally:
         clear_session_vars(tokens)
 
 
-def test_admin_can_do_all(acl_enabled, recorder):
+def test_admin_cannot_mutate_platform(acl_enabled, recorder):
     tokens = _scope(role="admin", groups="")
     try:
         for action in ["create", "edit", "patch", "delete", "write_file", "remove_file"]:
-            assert not _denied(_do(action)), action
-        assert "delete" in recorder and "create" in recorder
+            assert _immutable(_do(action)), action
+        assert recorder == []
     finally:
         clear_session_vars(tokens)
 
@@ -145,9 +142,9 @@ def test_denied_delete_leaves_dispatch_untouched(acl_enabled, recorder):
     # Explicit: a reader (read only) denied delete/edit/patch never mutates.
     tokens = _scope(role="user", groups=G_READERS)
     try:
-        assert _denied(_do("delete"))
-        assert _denied(_do("edit"))
-        assert _denied(_do("patch"))
+        assert _immutable(_do("delete"))
+        assert _immutable(_do("edit"))
+        assert _immutable(_do("patch"))
         assert recorder == []
     finally:
         clear_session_vars(tokens)
@@ -162,19 +159,17 @@ def test_non_api_server_platform_exempt(acl_enabled, recorder):
         clear_session_vars(tokens)
 
 
-def test_acl_disabled_allows_all(recorder):
-    # No acl_enabled fixture => live config has no skills_acl => disabled => allow.
+def test_acl_disabled_does_not_disable_platform_immutability(recorder):
     tokens = _scope(role="user", groups="")
     try:
-        assert not _denied(_do("delete"))
-        assert not _denied(_do("create"))
-        assert {"delete", "create"} <= set(recorder)
+        assert _immutable(_do("delete"))
+        assert _immutable(_do("create"))
+        assert recorder == []
     finally:
         clear_session_vars(tokens)
 
 
-def test_failclosed_on_resolution_error(monkeypatch, recorder):
-    # ACL enabled on api_server, resolution raises => DENY, no mutation.
+def test_platform_immutability_precedes_acl_resolution(monkeypatch, recorder):
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: ENABLED_ACL)
 
     def _raise(*a, **k):
@@ -183,7 +178,7 @@ def test_failclosed_on_resolution_error(monkeypatch, recorder):
     monkeypatch.setattr(skill_acl, "require_skill_permission", _raise)
     tokens = _scope(role="user", groups=G_DELETERS)
     try:
-        assert _denied(_do("delete"))
+        assert _immutable(_do("delete"))
         assert recorder == []
     finally:
         clear_session_vars(tokens)

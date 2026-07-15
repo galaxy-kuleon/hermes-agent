@@ -1211,6 +1211,10 @@ _ACL_MANAGE_DENY = (
     "Hermes skills ACL: management permission could not be verified for the "
     "current OpenWebUI role/group scope; denied."
 )
+_IMMUTABLE_PLATFORM_DENY = (
+    "Platform skills are read-only in chat/agent contexts; use the "
+    "out-of-band platform-skills operator workflow."
+)
 
 
 def _acl_manage_block(action: str, target_namespace: Optional[str] = None) -> Optional[str]:
@@ -1247,6 +1251,8 @@ def _acl_manage_block(action: str, target_namespace: Optional[str] = None) -> Op
         return None
     if platform != "api_server":
         return None  # (b) ACL governs the api_server surface only
+    if target_namespace == "platform":
+        return _IMMUTABLE_PLATFORM_DENY
     try:
         from tools.skill_acl import load_skill_acl_config, require_skill_permission
 
@@ -1295,7 +1301,12 @@ def skill_manage(
     # never implied by update.
     blocked = _acl_manage_block(action, target_namespace)
     if blocked:
-        return tool_error(blocked, success=False)
+        extra = (
+            {"error_code": "immutable_platform"}
+            if blocked == _IMMUTABLE_PLATFORM_DENY
+            else {}
+        )
+        return tool_error(blocked, success=False, **extra)
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off

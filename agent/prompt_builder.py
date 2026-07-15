@@ -1086,7 +1086,18 @@ _SKILLS_SNAPSHOT_VERSION = 1
 
 
 def _skills_prompt_snapshot_path() -> Path:
-    return get_hermes_home() / ".skills_prompt_snapshot.json"
+    from tools.skill_state import (
+        PLATFORM_PROMPT_SNAPSHOT_FILENAME,
+        platform_skill_state_dir,
+    )
+
+    return platform_skill_state_dir() / PLATFORM_PROMPT_SNAPSHOT_FILENAME
+
+
+def _platform_skills_generation() -> int:
+    from tools.platform_skill_store import read_generation
+
+    return read_generation()
 
 
 def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
@@ -1126,6 +1137,8 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
+    if snapshot.get("platform_generation", 0) != _platform_skills_generation():
+        return None
     if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
         return None
     return snapshot
@@ -1140,6 +1153,7 @@ def _write_skills_snapshot(
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
+        "platform_generation": _platform_skills_generation(),
         "manifest": manifest,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
@@ -1282,8 +1296,10 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names(_platform_hint or None)
+    platform_generation = _platform_skills_generation()
     cache_key = (
         str(skills_dir.resolve()),
+        platform_generation,
         tuple(str(d) for d in additional_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),

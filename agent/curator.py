@@ -65,10 +65,14 @@ DEFAULT_CONSOLIDATE = False
 
 
 # ---------------------------------------------------------------------------
-# .curator_state — persistent scheduler + status
+# Persistent scheduler + status (external state for platform content)
 # ---------------------------------------------------------------------------
 
 def _state_file() -> Path:
+    if skill_usage.is_platform_skills_context():
+        from tools.skill_state import PLATFORM_CURATOR_STATE_FILENAME
+
+        return skill_usage.current_skill_state_dir() / PLATFORM_CURATOR_STATE_FILENAME
     return skill_usage.current_skills_dir() / ".curator_state"
 
 
@@ -1459,6 +1463,11 @@ def run_curator_review(
     *consolidate*: when consolidation is off, the preview only reports the
     deterministic prune candidates.
     """
+    if skill_usage.is_platform_skills_context() and not dry_run:
+        logger.info(
+            "curator platform pass forced to dry-run; content is operator-managed"
+        )
+        dry_run = True
     if consolidate is None:
         consolidate = get_consolidate()
     start = datetime.now(timezone.utc)

@@ -27,7 +27,10 @@ def backup_env(monkeypatch, tmp_path):
     importlib.reload(hermes_constants)
     from agent import curator_backup
     importlib.reload(curator_backup)
-    return {"home": home, "skills": home / "skills", "cb": curator_backup}
+    from tools import skill_usage
+
+    with skill_usage.skill_usage_scope(home / "skills", platform=False):
+        yield {"home": home, "skills": home / "skills", "cb": curator_backup}
 
 
 def _write_skill(skills_dir: Path, name: str, body: str = "body") -> Path:

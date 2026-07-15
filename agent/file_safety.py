@@ -150,7 +150,7 @@ def get_read_block_error(path: str) -> Optional[str]:
 
     Three categories are blocked:
 
-      * Internal Hermes cache files under ``HERMES_HOME/skills/.hub`` —
+      * Internal Hermes cache files under ``HERMES_HOME/skill-state/platform/hub`` —
         readable metadata that an attacker could use as a prompt-injection
         carrier.
       * Credential / secret stores under HERMES_HOME and the global Hermes
@@ -206,11 +206,14 @@ def get_read_block_error(path: str) -> Optional[str]:
         except Exception:
             continue
 
-    # Skills .hub: prompt-injection carriers.
+    # Skills Hub metadata: prompt-injection carriers. Keep the legacy path
+    # protected during migration as well as the Increment 2 state path.
     for hd in hermes_dirs:
         blocked_dirs = [
             hd / "skills" / ".hub" / "index-cache",
             hd / "skills" / ".hub",
+            hd / "skill-state" / "platform" / "hub" / "index-cache",
+            hd / "skill-state" / "platform" / "hub",
         ]
         for blocked in blocked_dirs:
             try:

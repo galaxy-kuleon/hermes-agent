@@ -758,13 +758,12 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     try:
         from agent.skill_utils import get_skill_roots
         if not any(root.path.exists() for root in get_skill_roots(platform_dir=SKILLS_DIR)):
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
+                    "message": f"No skills found under {display_hermes_home()}/skills/.",
                 },
                 ensure_ascii=False,
             )

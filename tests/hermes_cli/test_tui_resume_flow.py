@@ -464,7 +464,9 @@ def test_termux_skips_bundled_skill_sync_when_stamp_fresh(monkeypatch, tmp_path,
     monkeypatch.setitem(
         sys.modules,
         "tools.skills_sync",
-        types.SimpleNamespace(sync_skills=lambda quiet: calls.append(quiet)),
+        types.SimpleNamespace(
+            sync_skills=lambda quiet, startup=False: calls.append((quiet, startup))
+        ),
     )
 
     assert main_mod._sync_bundled_skills_for_startup() is False
@@ -481,11 +483,13 @@ def test_termux_forced_bundled_skill_sync_runs(monkeypatch, tmp_path, main_mod):
     monkeypatch.setitem(
         sys.modules,
         "tools.skills_sync",
-        types.SimpleNamespace(sync_skills=lambda quiet: calls.append(quiet)),
+        types.SimpleNamespace(
+            sync_skills=lambda quiet, startup=False: calls.append((quiet, startup))
+        ),
     )
 
     assert main_mod._sync_bundled_skills_for_startup() is True
-    assert calls == [True]
+    assert calls == [(True, True)]
 
 
 def test_read_git_revision_fingerprint_resolves_packed_refs(tmp_path, main_mod):

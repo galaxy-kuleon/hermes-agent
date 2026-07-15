@@ -314,14 +314,14 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
-    def test_empty_creates_directory(self, tmp_path):
+    def test_empty_does_not_create_read_only_platform_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
             raw = skills_list()
         result = json.loads(raw)
         assert result["success"] is True
         assert result["skills"] == []
-        assert skills_dir.exists()
+        assert not skills_dir.exists()
 
     def test_lists_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

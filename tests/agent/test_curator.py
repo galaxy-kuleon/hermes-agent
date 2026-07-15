@@ -37,7 +37,8 @@ def curator_env(tmp_path, monkeypatch):
     # directly). Tests opt in with _enable_prune_builtins(...).
     monkeypatch.setattr(usage, "_prune_builtins_enabled", lambda: False)
 
-    return {"home": home, "curator": curator, "usage": usage}
+    with usage.skill_usage_scope(home / "skills", platform=False):
+        yield {"home": home, "curator": curator, "usage": usage}
 
 
 def _write_skill(skills_dir: Path, name: str):

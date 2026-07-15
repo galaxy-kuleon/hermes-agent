@@ -37,8 +37,15 @@ if [ "$(id -u)" = "0" ]; then
         # In rootless Podman the container's "root" is mapped to an unprivileged
         # host UID — chown will fail.  That's fine: the volume is already owned
         # by the mapped user on the host side.
-        chown -R hermes:hermes "$HERMES_HOME" 2>/dev/null || \
+        chown hermes:hermes "$HERMES_HOME" 2>/dev/null || \
             echo "Warning: chown failed (rootless container?) — continuing anyway"
+        # Never traverse the platform content mount: Increment 2 mounts it
+        # read-only. Runtime-owned mutable roots are handled explicitly.
+        for sub in cron sessions logs hooks memories skins plans workspace home user-skills skill-state; do
+            if [ -e "$HERMES_HOME/$sub" ]; then
+                chown -R hermes:hermes "$HERMES_HOME/$sub" 2>/dev/null || true
+            fi
+        done
         # The venv must also be re-chowned when UID is remapped, otherwise
         # lazy_deps.py cannot install platform packages (discord.py, etc.).
         chown -R hermes:hermes "$INSTALL_DIR/venv" 2>/dev/null || true
@@ -90,8 +97,12 @@ if [ "$(id -u)" = "0" ]; then
     # create; if the parent dir was created root-owned (e.g. by any root-context
     # tool touching the volume), those mkdirs fail with EACCES for every caller.
     # Create + own it here as root so container recreation stays writable.
-    mkdir -p "$HERMES_HOME/user-skills"
-    chown hermes:hermes "$HERMES_HOME/user-skills" 2>/dev/null || true
+    mkdir -p \
+        "$HERMES_HOME/user-skills" \
+        "$HERMES_HOME/skill-state/platform"
+    chown -R hermes:hermes \
+        "$HERMES_HOME/user-skills" \
+        "$HERMES_HOME/skill-state" 2>/dev/null || true
 
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
@@ -114,7 +125,7 @@ fi
 # The "home/" subdirectory is a per-profile HOME for subprocesses (git,
 # ssh, gh, npm …).  Without it those tools write to /root which is
 # ephemeral and shared across profiles.  See issue #4426.
-mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
+mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skins,plans,workspace,home,user-skills,skill-state/platform}
 
 # .env
 if [ ! -f "$HERMES_HOME/.env" ]; then
@@ -147,7 +158,7 @@ fi
 
 # Sync bundled skills (manifest-based so user edits are preserved)
 if [ -d "$INSTALL_DIR/skills" ]; then
-    python3 "$INSTALL_DIR/tools/skills_sync.py"
+    python3 "$INSTALL_DIR/tools/skills_sync.py" --startup
 fi
 
 # Optionally start `hermes dashboard` as a side-process.

@@ -9187,7 +9187,7 @@ def _installed_hub_identifiers(profile: Optional[str] = None) -> dict:
     """Map identifier -> installed lock entry for hub-installed skills.
 
     Lets the UI mark search results that are already installed.  Scoped to
-    ``profile``'s skills/.hub/lock.json when provided (HubLockFile takes an
+    ``profile``'s skill-state/platform/hub/lock.json when provided (HubLockFile takes an
     explicit path, sidestepping the import-time LOCK_FILE binding).
     Best-effort: returns an empty dict if the lock file can't be read.
     """
@@ -9197,7 +9197,15 @@ def _installed_hub_identifiers(profile: Optional[str] = None) -> dict:
         requested = (profile or "").strip()
         if requested and requested.lower() != "current":
             profile_dir = _resolve_profile_dir(requested)
-            lock = HubLockFile(profile_dir / "skills" / ".hub" / "lock.json")
+            from tools.skill_state import PLATFORM_HUB_DIRNAME, PLATFORM_STATE_NAMESPACE, SKILL_STATE_DIRNAME
+
+            lock = HubLockFile(
+                profile_dir
+                / SKILL_STATE_DIRNAME
+                / PLATFORM_STATE_NAMESPACE
+                / PLATFORM_HUB_DIRNAME
+                / "lock.json"
+            )
         else:
             lock = HubLockFile()
         out = {}
@@ -10252,16 +10260,19 @@ class SkillContentUpdate(BaseModel):
 
 
 def _clear_skills_prompt_cache() -> None:
-    """Best-effort: invalidate the skills system-prompt snapshot after a write.
+    """Best-effort invalidation for mutable named-profile skill writes."""
 
-    Mirrors what ``skill_manage`` does so a dashboard-authored skill is picked
-    up by the next session without a manual cache reset.
-    """
     try:
         from agent.prompt_builder import clear_skills_system_prompt_cache
+
         clear_skills_system_prompt_cache(clear_snapshot=True)
     except Exception:
         pass
+
+
+def _dashboard_named_profile(profile: Optional[str]) -> bool:
+    requested = (profile or "").strip().lower()
+    return bool(requested and requested not in {"current", "default"})
 
 
 @app.get("/api/skills/content")
@@ -10285,36 +10296,49 @@ async def get_skill_content(name: str, profile: Optional[str] = None):
 
 @app.post("/api/skills")
 async def create_skill(body: SkillCreate):
-    """Create a new custom skill (SKILL.md) from the dashboard editor.
+    """Keep named profiles mutable; shared platform content is operator-only."""
+    if _dashboard_named_profile(body.profile):
+        from tools.skill_manager_tool import _create_skill
 
-    Calls the same validated write path as the agent's ``skill_manage``
-    tool (frontmatter validation, name/category validation, size limit,
-    optional security scan) — but bypasses the agent write-approval gate:
-    a write from the authenticated dashboard IS the user acting directly.
-    """
-    from tools.skill_manager_tool import _create_skill
-
-    with _profile_scope(body.profile):
-        result = _create_skill(body.name, body.content, body.category or None)
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Failed to create skill."))
-    _clear_skills_prompt_cache()
-    return result
+        with _profile_scope(body.profile):
+            result = _create_skill(body.name, body.content, body.category or None)
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error", "Failed to create skill."),
+            )
+        _clear_skills_prompt_cache()
+        return result
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Platform skills are read-only in the dashboard; use the isolated "
+            "out-of-band `hermes platform-skills put` workflow."
+        ),
+    )
 
 
 @app.put("/api/skills/content")
 async def update_skill_content(body: SkillContentUpdate):
-    """Replace the SKILL.md of an existing skill (full rewrite) from the editor."""
-    from tools.skill_manager_tool import _edit_skill
+    """Keep named profiles mutable; shared platform content is operator-only."""
+    if _dashboard_named_profile(body.profile):
+        from tools.skill_manager_tool import _edit_skill
 
-    with _profile_scope(body.profile):
-        result = _edit_skill(body.name, body.content)
-    if not result.get("success"):
-        err = result.get("error", "Failed to update skill.")
-        status = 404 if "not found" in str(err).lower() else 400
-        raise HTTPException(status_code=status, detail=err)
-    _clear_skills_prompt_cache()
-    return result
+        with _profile_scope(body.profile):
+            result = _edit_skill(body.name, body.content)
+        if not result.get("success"):
+            error = result.get("error", "Failed to update skill.")
+            status = 404 if "not found" in str(error).lower() else 400
+            raise HTTPException(status_code=status, detail=error)
+        _clear_skills_prompt_cache()
+        return result
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Platform skills are read-only in the dashboard; use the isolated "
+            "out-of-band `hermes platform-skills put` workflow."
+        ),
+    )
 
 
 @app.get("/api/tools/toolsets")

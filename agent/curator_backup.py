@@ -1,21 +1,19 @@
 """Curator snapshot + rollback.
 
-A pre-run snapshot of ``~/.hermes/skills/`` (excluding ``.curator_backups/``
-itself) is taken before any mutating curator pass. Snapshots are tar.gz
-files under ``~/.hermes/skills/.curator_backups/<utc-iso>/`` with a
-companion ``manifest.json`` describing the snapshot (reason, time, size,
-counted skill files). Rollback picks a snapshot, moves the current
-``skills/`` tree aside into another snapshot so even the rollback itself
-is undoable, then extracts the chosen snapshot into place.
+A pre-run snapshot of the active skill content root is taken before any
+mutating user-skill curator pass. User-root backups remain under that root.
+Platform snapshots are written under ``skill-state/platform/curator-backups``;
+platform rollback and pruning are refused here because content is managed by
+the transactional out-of-band writer.
 
 The snapshot does NOT include:
   - ``.curator_backups/`` (would recurse)
   - ``.hub/`` (hub-installed skills — managed by the hub, not us)
 
-It DOES include:
+For mutable user roots it DOES include:
   - all SKILL.md files + their directories (``scripts/``, ``references/``,
     ``templates/``, ``assets/``)
-  - ``.usage.json`` (usage telemetry — needed to rehydrate state cleanly)
+  - ``.usage.json`` (user-skill usage telemetry)
   - ``.archive/`` (so rollback restores previously-archived skills too)
   - ``.curator_state`` (so rolling back also restores the last-run-at
     pointer — otherwise the curator would immediately re-fire on the next
@@ -68,6 +66,11 @@ _ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(-\d{2})?$")
 
 
 def _backups_dir() -> Path:
+    from tools import skill_usage
+    from tools.skill_state import PLATFORM_CURATOR_BACKUPS_DIRNAME
+
+    if skill_usage.is_platform_skills_context():
+        return skill_usage.current_skill_state_dir() / PLATFORM_CURATOR_BACKUPS_DIRNAME
     return _skills_dir() / ".curator_backups"
 
 
@@ -554,6 +557,15 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
 
     Returns ``(ok, message, snapshot_path)``.
     """
+    from tools import skill_usage
+
+    if skill_usage.is_platform_skills_context():
+        return (
+            False,
+            "platform content rollback requires the out-of-band operator workflow",
+            None,
+        )
+
     target = _resolve_backup(backup_id)
     if target is None:
         return (

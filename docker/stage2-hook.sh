@@ -199,7 +199,7 @@ if [ "$needs_chown" = true ]; then
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skills skins plans workspace home profiles pairing platforms/pairing; do
+    for sub in cron sessions logs hooks memories skins plans workspace home profiles pairing platforms/pairing user-skills skill-state; do
         if [ -e "$HERMES_HOME/$sub" ]; then
             chown -R hermes:hermes "$HERMES_HOME/$sub" 2>/dev/null || \
                 echo "[stage2] Warning: chown $HERMES_HOME/$sub failed (rootless container?) — continuing"
@@ -283,13 +283,14 @@ as_hermes mkdir -p \
     "$HERMES_HOME/logs/gateways" \
     "$HERMES_HOME/hooks" \
     "$HERMES_HOME/memories" \
-    "$HERMES_HOME/skills" \
     "$HERMES_HOME/skins" \
     "$HERMES_HOME/plans" \
     "$HERMES_HOME/workspace" \
     "$HERMES_HOME/home" \
     "$HERMES_HOME/pairing" \
-    "$HERMES_HOME/platforms/pairing"
+    "$HERMES_HOME/platforms/pairing" \
+    "$HERMES_HOME/user-skills" \
+    "$HERMES_HOME/skill-state/platform"
 
 # --- Install-method stamp ---
 # The 'docker' stamp is baked into the immutable install tree at
@@ -390,8 +391,17 @@ fi
 # the python binary's own bin-stub already sets up (sys.path is rooted
 # at the venv's site-packages by virtue of running .venv/bin/python).
 if [ -d "$INSTALL_DIR/skills" ]; then
-    as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" \
-        || echo "[stage2] Warning: skills_sync.py failed; continuing"
+    if ! as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" --startup; then
+        case "${HERMES_SKILLS_SYNC_ON_START:-auto}" in
+            1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+                echo "[stage2] ERROR: explicit startup skill sync failed" >&2
+                exit 1
+                ;;
+            *)
+                echo "[stage2] Warning: startup skills sync failed; continuing"
+                ;;
+        esac
+    fi
 fi
 
 # --- Discover agent-browser's Chromium binary ---

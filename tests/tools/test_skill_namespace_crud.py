@@ -115,7 +115,7 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
         clear_session_vars(tokens)
 
 
-def test_platform_acl_is_preserved_for_existing_platform_crud(namespace_home):
+def test_platform_is_immutable_for_reader_and_editor(namespace_home):
     _home, platform = namespace_home
     _write_skill(platform, "platform-skill", "old")
 
@@ -129,7 +129,7 @@ def test_platform_acl_is_preserved_for_existing_platform_crud(namespace_home):
             )
         )
         assert denied["success"] is False
-        assert "skills acl" in denied["error"].lower()
+        assert denied["error_code"] == "immutable_platform"
     finally:
         clear_session_vars(reader)
 
@@ -142,9 +142,9 @@ def test_platform_acl_is_preserved_for_existing_platform_crud(namespace_home):
                 content=VALID.format(name="platform-skill", body="editor edit"),
             )
         )
-        assert updated["success"] is True
-        assert updated["namespace"] == "platform"
-        assert "editor edit" in (platform / "platform-skill" / "SKILL.md").read_text()
+        assert updated["success"] is False
+        assert updated["error_code"] == "immutable_platform"
+        assert "old" in (platform / "platform-skill" / "SKILL.md").read_text()
     finally:
         clear_session_vars(editor)
 
@@ -207,7 +207,7 @@ def test_user_create_cannot_shadow_platform_or_external(namespace_home, tmp_path
         clear_session_vars(tokens)
 
 
-def test_explicit_platform_create_remains_available_to_editor(namespace_home):
+def test_explicit_platform_create_is_immutable_for_editor(namespace_home):
     _home, platform = namespace_home
     tokens = _scope("alice", "editors")
     try:
@@ -219,9 +219,9 @@ def test_explicit_platform_create_remains_available_to_editor(namespace_home):
                 content=VALID.format(name="platform-new", body="platform"),
             )
         )
-        assert result["success"] is True
-        assert result["namespace"] == "platform"
-        assert (platform / "platform-new" / "SKILL.md").exists()
+        assert result["success"] is False
+        assert result["error_code"] == "immutable_platform"
+        assert not (platform / "platform-new").exists()
     finally:
         clear_session_vars(tokens)
 

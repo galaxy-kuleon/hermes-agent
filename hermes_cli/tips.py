@@ -296,7 +296,7 @@ TIPS = [
     "agent.api_max_retries (default 3) controls how many times the agent retries a failed API call before surfacing the error — lower it for fast fallback.",
     "The gateway caches AIAgent instances per session — destroying this cache breaks Anthropic prompt caching.",
     "Any website can expose skills via /.well-known/skills/index.json — the skills hub discovers them automatically.",
-    "The skills audit log at ~/.hermes/skills/.hub/audit.log tracks every install and removal operation.",
+    "The platform skills audit log at ~/.hermes/skill-state/platform/hub/audit.log tracks every install and removal operation.",
     "Stale git worktrees are auto-cleaned: 24-72h old with no unpushed commits get pruned on startup.",
     "Profiles scope Hermes state via HERMES_HOME; host tool subprocesses keep your real HOME unless terminal.home_mode is profile.",
     "HERMES_HOME_MODE env var (octal, e.g. 0701) sets custom directory permissions for web server traversal.",
@@ -336,7 +336,7 @@ TIPS = [
     "Each MCP server gets its own toolset (mcp-servername) that can be toggled independently via hermes tools.",
     "MCP ${ENV_VAR} placeholders in config are resolved at server spawn — including vars from ~/.hermes/.env.",
     "Skills from trusted repos (NousResearch) get a 'trusted' security level; community skills get extra scanning.",
-    "The skills quarantine at ~/.hermes/skills/.hub/quarantine/ holds skills pending security review.",
+    "The platform skills quarantine at ~/.hermes/skill-state/platform/hub/quarantine/ holds skills pending security review.",
 
     # --- Advanced Slash Commands ---
     '/steer <prompt> injects a note after the next tool call — nudge direction mid-task without interrupting.',
@@ -366,7 +366,7 @@ TIPS = [
     # --- Curator ---
     'hermes curator run --dry-run previews what the curator would archive or consolidate without mutating anything.',
     "hermes curator pin <skill> hard-fences a skill against both auto-archival and the agent's skill_manage tool.",
-    'hermes curator rollback restores skills from a pre-run snapshot — backups live under skills/.curator_backups/.',
+    'hermes curator rollback restores mutable profile skills from a pre-run snapshot; platform snapshots live under skill-state/platform/curator-backups and require the operator workflow.',
 
     # --- Credential Pools & Routing ---
     'hermes auth reset <provider> clears all cooldowns and exhaustion flags on a credential pool.',

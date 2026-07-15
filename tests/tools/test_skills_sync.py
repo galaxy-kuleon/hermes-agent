@@ -708,11 +708,15 @@ class TestSyncSkills:
 
     def test_nonexistent_bundled_dir(self, tmp_path):
         with patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "nope"):
-            result = sync_skills(quiet=True)
+            result = sync_skills(
+                quiet=True,
+                target_root=tmp_path / "local-profile-skills",
+                state_dir=tmp_path / "local-profile-state",
+            )
         assert result == {
             "copied": [], "updated": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "suppressed": [], "total_bundled": 0,
-            "optional_provenance_backfilled": [],
+            "optional_provenance_backfilled": [], "failed": [],
         }
 
     def test_failed_copy_does_not_poison_manifest(self, tmp_path):

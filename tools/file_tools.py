@@ -793,6 +793,10 @@ _ACL_PROTECTED_WRITE_DENY = (
     "matching skill create/update/delete permission for the current OpenWebUI "
     "role/group scope; denied."
 )
+_PLATFORM_IMMUTABLE_WRITE_DENY = (
+    "Platform skills are read-only in chat/agent contexts; use the "
+    "out-of-band platform-skills operator workflow."
+)
 _VALID_ACL_FILE_PERMISSIONS = frozenset({"read", "create", "update", "delete"})
 
 
@@ -829,6 +833,18 @@ def _acl_protected_path_block(
     try:
         from tools.skill_acl import load_skill_acl_config, resolve_skill_permissions
         from gateway.session_context import get_session_env
+        from tools.skill_state import platform_skills_dir
+
+        try:
+            target = Path(_resolve_path_for_task(path, task_id))
+        except Exception:
+            target = Path(os.path.expanduser(str(path)))
+        target = target.resolve()
+        platform_root = platform_skills_dir().resolve()
+        if mode != "read" and (
+            target == platform_root or platform_root in target.parents
+        ):
+            return _PLATFORM_IMMUTABLE_WRITE_DENY
 
         cfg = load_skill_acl_config()
         if not cfg.get("enabled"):
@@ -838,11 +854,6 @@ def _acl_protected_path_block(
             from hermes_constants import get_hermes_home
 
             protect = [str(Path(get_hermes_home()) / "skills")]
-        try:
-            target = Path(_resolve_path_for_task(path, task_id))
-        except Exception:
-            target = Path(os.path.expanduser(str(path)))
-        target = target.resolve()
         under = False
         for root in protect:
             try:

@@ -1,13 +1,14 @@
 """Skill usage telemetry + provenance tracking for the Curator feature.
 
-Tracks per-skill usage metadata in a sidecar JSON file inside the skill root
-whose skill is being operated on. Counters are bumped by the existing skill
-tools (skill_view, skill_manage); the curator orchestrator reads the derived
-activity timestamp to decide lifecycle transitions.
+Tracks per-skill usage metadata in mutable state associated with the resolved
+skill root. User-skill telemetry remains in that user's writable root; platform
+telemetry lives under ``skill-state/platform`` so platform content can be
+mounted read-only. Counters are bumped by the existing skill tools
+(skill_view, skill_manage); the curator orchestrator reads the derived activity
+timestamp to decide lifecycle transitions.
 
 Design notes:
-  - Sidecar, not frontmatter. Keeps operational telemetry out of user-authored
-    SKILL.md content and avoids conflict pressure for bundled/hub skills.
+  - Sidecar, not frontmatter. Platform state is physically outside content.
   - Atomic writes via tempfile + os.replace (same pattern as .bundled_manifest).
   - All counter bumps are best-effort: failures log at DEBUG and return silently.
     A broken sidecar never breaks the underlying tool call.
@@ -36,6 +37,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path
+from tools.skill_state import (
+    PLATFORM_CURATOR_ARCHIVE_PLAN_FILENAME,
+    PLATFORM_CURATOR_SUPPRESSION_FILENAME,
+    PLATFORM_HUB_DIRNAME,
+    PLATFORM_MANIFEST_FILENAME,
+    PLATFORM_USAGE_FILENAME,
+    is_platform_skills_root,
+    platform_skill_state_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +80,9 @@ PROTECTED_BUILTIN_SKILLS: Set[str] = {
 
 _USAGE_SKILLS_ROOT: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
     "HERMES_SKILL_USAGE_ROOT", default=None
+)
+_USAGE_PLATFORM_CONTEXT: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("HERMES_SKILL_USAGE_IS_PLATFORM", default=None)
 )
 
 
@@ -106,16 +119,18 @@ def current_skills_dir() -> Path:
 
 
 @contextmanager
-def skill_usage_scope(skills_root: Optional[Path]):
+def skill_usage_scope(skills_root: Optional[Path], *, platform: Optional[bool] = None):
     """Temporarily bind usage and curator state to one resolved skill root."""
 
     if skills_root is None:
         yield
         return
     token = _USAGE_SKILLS_ROOT.set(Path(skills_root))
+    platform_token = _USAGE_PLATFORM_CONTEXT.set(platform)
     try:
         yield
     finally:
+        _USAGE_PLATFORM_CONTEXT.reset(platform_token)
         _USAGE_SKILLS_ROOT.reset(token)
 
 
@@ -123,7 +138,22 @@ def _skills_dir() -> Path:
     return current_skills_dir()
 
 
+def is_platform_skills_context() -> bool:
+    declared = _USAGE_PLATFORM_CONTEXT.get()
+    if declared is not None:
+        return declared
+    return is_platform_skills_root(_skills_dir())
+
+
+def current_skill_state_dir() -> Path:
+    if is_platform_skills_context():
+        return platform_skill_state_dir()
+    return _skills_dir()
+
+
 def _usage_file() -> Path:
+    if is_platform_skills_context():
+        return current_skill_state_dir() / PLATFORM_USAGE_FILENAME
     return _skills_dir() / ".usage.json"
 
 
@@ -222,10 +252,14 @@ def activity_count(record: Dict[str, Any]) -> int:
 def _read_bundled_manifest_names() -> Set[str]:
     """Return the set of skill names that were seeded from the bundled repo.
 
-    Reads ~/.hermes/skills/.bundled_manifest (format: "name:hash" per line).
+    Reads the root-associated bundled manifest (format: "name:hash" per line).
     Returns empty set if the file is missing or unreadable.
     """
-    manifest = _skills_dir() / ".bundled_manifest"
+    manifest = (
+        current_skill_state_dir() / PLATFORM_MANIFEST_FILENAME
+        if is_platform_skills_context()
+        else _skills_dir() / ".bundled_manifest"
+    )
     if not manifest.exists():
         return set()
     names: Set[str] = set()
@@ -245,9 +279,13 @@ def _read_bundled_manifest_names() -> Set[str]:
 def _read_hub_installed_names() -> Set[str]:
     """Return the set of skill names installed via the Skills Hub.
 
-    Reads ~/.hermes/skills/.hub/lock.json (see tools/skills_hub.py :: HubLockFile).
+    Reads the root-associated Hub lock (see tools/skills_hub.py :: HubLockFile).
     """
-    lock_path = _skills_dir() / ".hub" / "lock.json"
+    lock_path = (
+        current_skill_state_dir() / PLATFORM_HUB_DIRNAME / "lock.json"
+        if is_platform_skills_context()
+        else _skills_dir() / ".hub" / "lock.json"
+    )
     if not lock_path.exists():
         return set()
     try:
@@ -302,13 +340,15 @@ def _prune_builtins_enabled() -> bool:
 
 
 def _suppressed_file() -> Path:
+    if is_platform_skills_context():
+        return current_skill_state_dir() / PLATFORM_CURATOR_SUPPRESSION_FILENAME
     return _skills_dir() / ".curator_suppressed"
 
 
 def read_suppressed_names() -> Set[str]:
     """Built-in skills the curator pruned — the re-seeder must leave archived.
 
-    One skill name per line in ``~/.hermes/skills/.curator_suppressed``. This is
+    One skill name per line in the root-associated curator state. This is
     what makes pruning a built-in durable: without it, ``hermes update`` would
     re-copy the bundled skill on the next sync.
     """
@@ -710,6 +750,25 @@ def forget(skill_name: str) -> None:
 # Archive / restore
 # ---------------------------------------------------------------------------
 
+
+def _record_platform_curator_plan(action: str, skill_name: str) -> None:
+    """Record operator work without mutating read-only platform content."""
+
+    path = current_skill_state_dir() / PLATFORM_CURATOR_ARCHIVE_PLAN_FILENAME
+    payload = {
+        "action": action,
+        "skill": skill_name,
+        "requested_at": _now_iso(),
+        "status": "operator_required",
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError as exc:
+        logger.debug("Failed to record platform curator plan: %s", exc)
+
+
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill directory to ~/.hermes/skills/.archive/.
 
@@ -718,6 +777,13 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     when one is archived, its name is added to the suppression list so the
     update-time re-seeder leaves it archived instead of restoring it.
     """
+    if is_platform_skills_context():
+        _record_platform_curator_plan("archive", skill_name)
+        return False, (
+            "platform skills are read-only in chat/agent contexts; "
+            "an out-of-band operator transaction is required"
+        )
+
     if not is_curation_eligible(skill_name):
         if is_protected_builtin(skill_name):
             return False, (
@@ -776,6 +842,13 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     way to lift a prune). Restoring clears any suppression entry so future
     updates may re-seed the built-in again.
     """
+    if is_platform_skills_context():
+        _record_platform_curator_plan("restore", skill_name)
+        return False, (
+            "platform skills are read-only in chat/agent contexts; "
+            "an out-of-band operator transaction is required"
+        )
+
     # Hub skills always have an external upstream owner — never shadow them.
     if is_hub_installed(skill_name):
         return False, (
