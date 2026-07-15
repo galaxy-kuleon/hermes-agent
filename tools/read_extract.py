@@ -1,8 +1,11 @@
-"""Stdlib document-to-text extraction for ``read_file``.
+"""Document-to-text extraction for ``read_file``.
 
-Supports Jupyter notebooks, DOCX, and XLSX without adding hard dependencies.
-Malformed documents raise :class:`ExtractionError`; callers can then fall back to
-normal text/binary handling.
+Jupyter notebooks, DOCX, and XLSX are rendered with pure stdlib (no hard
+dependencies). PDF is extracted out-of-process via the docling service (see
+:mod:`tools.pdf_extract`) because hermes ships no in-process PDF library — this
+lets an agent actually read an uploaded PDF's text (Path-B). Malformed or
+unextractable documents raise :class:`ExtractionError`; callers can then fall
+back to normal text/binary handling.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from xml.etree import ElementTree as ET
 
 __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
 
-EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
+EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".pdf"})
 MAX_XLSX_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
@@ -47,6 +50,11 @@ def extract_document_text(path: str) -> str:
         return _extract_docx(path)
     if ext == ".xlsx":
         return _extract_xlsx(path)
+    if ext == ".pdf":
+        # Out-of-process via docling (lazy import avoids an import cycle).
+        from tools.pdf_extract import extract_pdf_text
+
+        return extract_pdf_text(path)
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 

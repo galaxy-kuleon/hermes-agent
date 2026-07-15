@@ -356,7 +356,14 @@ def _build_handoff_context(entries: List[Dict[str, str]], scope: Dict[str, str])
 
     sections: List[str] = [
         '<attached_files source="openwebui-skip-rag-handoff">',
-        "The user attached files. These are signed /handoff paths only; file contents were not pre-read or converted. Use tools to inspect files when needed.",
+        # Path-B guidance (2026-07-15): the agent must read the delivered file's
+        # TEXT via read_file (which now extracts PDF/DOCX/XLSX/notebook text) to
+        # answer questions, and must NOT convert unless the user explicitly asks.
+        "The user attached files (signed /handoff paths; contents were NOT pre-read). "
+        "To read a file's TEXT and answer the user's question, call read_file(path) — "
+        "it extracts text from PDF, DOCX, XLSX, and notebooks. Do NOT convert a file "
+        "with the soc_v2 / DOCX-conversion tools unless the user EXPLICITLY asks to "
+        "convert or export it; reading a file to answer a question is not a conversion request.",
     ]
     accepted = 0
 
@@ -1033,6 +1040,18 @@ def _apply_skill_acl_toolset_minimization(
     before session vars are bound. ACL disabled => unchanged. Resolution error =>
     fail safe (drop skill/write/exec toolsets; keep read-only file if a file
     toolset was present, since read-only file cannot mutate skills).
+
+    HONEST SCOPE (not a complete security boundary — see the 2026-07-15 design
+    verdict, reports/handoffs/hermes-skill-crud-acl/partner72-acl-design-verdict-*):
+    this is *attack-surface reduction*, NOT the skills reference monitor. It
+    minimizes only the ``skills``/``file``/``terminal`` toolset families, and only
+    for ``platform == "api_server"``. It does NOT gate arbitrary-code / MCP tools
+    (opencode_runner has a cwd-guard but a HIGH prompt-driven absolute-path
+    residual remains; code_execution/delegation/cronjob are un-gated where
+    enabled), the ``vision`` read path, or execution spawned under another platform
+    label (subagent/cron). The real boundary for ``/home/hermes/skills`` must live
+    at the resource (read-only mount + exec namespace), with this ACL as policy on
+    top — do not treat this minimization as the security boundary.
     """
     if not any(t in _ACL_MANAGED_TOOLSET_KEYS for t in toolsets):
         return toolsets
