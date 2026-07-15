@@ -319,3 +319,31 @@ def test_rejected_api_writer_does_not_create_missing_platform_root(
     assert not platform.exists()
     assert not state.exists()
     assert not transactions.exists()
+
+
+def test_state_update_failure_rolls_back_content_and_operator_state(
+    store_paths, tmp_path
+):
+    platform, state, transactions = store_paths
+    source = _write_skill(tmp_path / "incoming", "canary")
+    hub = state / "hub"
+    hub.mkdir(parents=True)
+    lock = hub / "lock.json"
+    lock.write_text('{"installed":{}}')
+
+    def _failing_state_update(_installed_path: Path):
+        lock.write_text('{"installed":{"canary":{}}}')
+        raise OSError("injected lock write failure")
+
+    with pytest.raises(store.PlatformSkillStoreError, match="lock write failure"):
+        store.put_skill(
+            source,
+            state_update=_failing_state_update,
+            target_root=platform,
+            state_dir=state,
+            transactions_dir=transactions,
+        )
+
+    assert not (platform / "canary").exists()
+    assert json.loads(lock.read_text()) == {"installed": {}}
+    assert store.read_generation(state) == 0

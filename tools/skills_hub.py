@@ -3379,17 +3379,33 @@ def install_from_quarantine(
             f"Installed skill contains symlinks, which is not allowed: {rel}"
         )
 
-    platform_transaction = None
+    lock = HubLockFile()
     if SKILLS_DIR.resolve() == (HERMES_HOME / "skills").resolve():
         from tools.platform_skill_store import put_skill
 
+        def _record_platform_install(installed_path: Path) -> dict:
+            lock.record_install(
+                name=safe_skill_name,
+                source=bundle.source,
+                identifier=bundle.identifier,
+                trust_level=bundle.trust_level,
+                scan_verdict=scan_result.verdict,
+                skill_hash=content_hash(installed_path),
+                install_path=str(installed_path.relative_to(SKILLS_DIR)),
+                files=list(bundle.files.keys()),
+                metadata=bundle.metadata,
+            )
+            return {"hub_lock": "recorded"}
+
         # The store requires the isolated operator context and performs
-        # snapshot, atomic replacement, validation, generation bump and receipt.
-        platform_transaction = put_skill(
+        # content + lock-state snapshot, validation, generation bump and receipt.
+        put_skill(
             quarantine_path,
             destination=install_rel_path,
+            state_update=_record_platform_install,
             target_root=SKILLS_DIR,
         )
+        shutil.rmtree(quarantine_path, ignore_errors=True)
     else:
         # Named/local profiles remain mutable profile roots; they are not the
         # shared platform content plane protected by Increment 2.
@@ -3397,10 +3413,6 @@ def install_from_quarantine(
             shutil.rmtree(install_dir)
         install_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(quarantine_path), str(install_dir))
-
-    # Record in lock file
-    lock = HubLockFile()
-    try:
         lock.record_install(
             name=safe_skill_name,
             source=bundle.source,
@@ -3412,14 +3424,6 @@ def install_from_quarantine(
             files=list(bundle.files.keys()),
             metadata=bundle.metadata,
         )
-    except BaseException:
-        if platform_transaction is not None:
-            from tools.platform_skill_store import rollback_transaction
-
-            rollback_transaction(platform_transaction["transaction_id"])
-        raise
-    if platform_transaction is not None:
-        shutil.rmtree(quarantine_path, ignore_errors=True)
 
     append_audit_log(
         "INSTALL", safe_skill_name, bundle.source,
@@ -3451,26 +3455,24 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     except ValueError as exc:
         return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
-    platform_transaction = None
     if install_path.exists():
         if SKILLS_DIR.resolve() == (HERMES_HOME / "skills").resolve():
             from tools.platform_skill_store import delete_skill
 
-            platform_transaction = delete_skill(
+            def _record_platform_uninstall(_deleted_path: Path) -> dict:
+                lock.record_uninstall(skill_name)
+                return {"hub_lock": "removed"}
+
+            delete_skill(
                 skill_name,
+                state_update=_record_platform_uninstall,
                 target_root=SKILLS_DIR,
             )
         else:
             shutil.rmtree(install_path)
-
-    try:
+            lock.record_uninstall(skill_name)
+    else:
         lock.record_uninstall(skill_name)
-    except BaseException:
-        if platform_transaction is not None:
-            from tools.platform_skill_store import rollback_transaction
-
-            rollback_transaction(platform_transaction["transaction_id"])
-        raise
     append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
 
     return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"

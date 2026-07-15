@@ -611,6 +611,7 @@ def put_skill(
     source: Path,
     *,
     destination: Optional[str] = None,
+    state_update: Optional[Callable[[Path], Optional[Dict[str, Any]]]] = None,
     target_root: Optional[Path] = None,
     state_dir: Optional[Path] = None,
     transactions_dir: Optional[Path] = None,
@@ -644,7 +645,13 @@ def put_skill(
             shutil.rmtree(stage, ignore_errors=True)
             if backup.exists() and not dest.exists():
                 os.replace(backup, dest)
-        return {"destination": relative.as_posix(), "source": str(source)}
+        result: Dict[str, Any] = {
+            "destination": relative.as_posix(),
+            "source": str(source),
+        }
+        if state_update is not None:
+            result["state_update"] = state_update(dest) or {}
+        return result
 
     return apply_transaction(
         "put",
@@ -659,6 +666,7 @@ def put_skill(
 def delete_skill(
     name: str,
     *,
+    state_update: Optional[Callable[[Path], Optional[Dict[str, Any]]]] = None,
     target_root: Optional[Path] = None,
     state_dir: Optional[Path] = None,
     transactions_dir: Optional[Path] = None,
@@ -682,7 +690,13 @@ def delete_skill(
         quarantine = target.parent / f".platform-delete-{transaction_id}-{target.name}"
         os.replace(target, quarantine)
         shutil.rmtree(quarantine)
-        return {"deleted": target.relative_to(root).as_posix(), "name": name}
+        result: Dict[str, Any] = {
+            "deleted": target.relative_to(root).as_posix(),
+            "name": name,
+        }
+        if state_update is not None:
+            result["state_update"] = state_update(target) or {}
+        return result
 
     return apply_transaction(
         "delete",
