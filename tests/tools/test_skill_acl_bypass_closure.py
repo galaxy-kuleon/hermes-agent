@@ -97,7 +97,9 @@ def test_coupling_reader_loses_terminal_and_write_file(acl_enabled):
     assert "terminal" not in out
     assert "file" not in out and "file_write" not in out
     assert "file_read" in out                 # read-only file kept
-    assert "skills_read" in out and "skills_manage" not in out
+    # Reader still loses arbitrary filesystem/terminal writes, but Increment 1
+    # exposes the native manager for full CRUD on only the caller-owned root.
+    assert "skills_read" in out and "skills_manage" in out
     assert "web" in out and "todo" in out
 
 

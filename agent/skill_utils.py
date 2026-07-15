@@ -496,15 +496,53 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
-def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
+def get_skill_roots(*, platform_dir: Optional[Path] = None):
+    """Return caller-visible skill roots with stable functional metadata.
 
-    The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    Ordering is intentionally platform, configured external roots, then the
+    current OpenWebUI caller's own user root.  Increment 1 is functional
+    namespacing only: these paths are not a kernel isolation boundary.
+
+    ``platform_dir`` exists for profile/dashboard compatibility where legacy
+    callers temporarily override their module-level ``SKILLS_DIR``.
     """
-    dirs = [get_skills_dir()]
-    dirs.extend(get_external_skills_dirs())
-    return dirs
+    from agent.skill_namespaces import (
+        EXTERNAL_NAMESPACE_PREFIX,
+        PLATFORM_NAMESPACE,
+        USER_NAMESPACE,
+        SkillRoot,
+        current_skill_namespace_user_id,
+        get_current_user_skills_dir,
+    )
+
+    platform = Path(platform_dir) if platform_dir is not None else get_skills_dir()
+    roots = [SkillRoot(PLATFORM_NAMESPACE, platform)]
+    seen = {platform.resolve() if platform.exists() else platform.absolute()}
+
+    for idx, external in enumerate(get_external_skills_dirs()):
+        candidate = external.resolve() if external.exists() else external.absolute()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        roots.append(SkillRoot(f"{EXTERNAL_NAMESPACE_PREFIX}-{idx}", external))
+
+    user_dir = get_current_user_skills_dir()
+    user_id = current_skill_namespace_user_id()
+    if user_dir is not None and user_id is not None:
+        candidate = user_dir.resolve() if user_dir.exists() else user_dir.absolute()
+        if candidate not in seen:
+            roots.append(SkillRoot(USER_NAMESPACE, user_dir, owner_user_id=user_id))
+    return roots
+
+
+def get_all_skills_dirs() -> List[Path]:
+    """Return platform + external + caller-owned user skill directories.
+
+    The platform directory remains first for backward-compatible precedence.
+    The user root is included only for a validated ``api_server`` subject (or
+    a trusted approval replay binding), and it is never created by discovery.
+    """
+    return [root.path for root in get_skill_roots()]
 
 
 # ── Condition extraction ──────────────────────────────────────────────────

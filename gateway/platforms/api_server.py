@@ -936,20 +936,23 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
 # underscore, hyphen, dot.  Dots are allowed for email-style IDs but the
 # helper below rejects any value that contains `..` to block path-traversal
 # style misuse if the value is ever appended to a filesystem path or URL.
-_OWUI_ID_RE = re.compile(r"[^a-zA-Z0-9_\-\.]")
+_OWUI_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,63}$")
 _OWUI_ID_MAX = 64
 
 
 def _sanitize_owui_id(raw: str) -> str:
     """Sanitise an OpenWebUI-supplied ID.  Returns ``""`` on suspicious input.
 
-    Strips control chars and anything outside ``[A-Za-z0-9_.-]``, caps at 64
-    chars, and rejects values that contain ``..`` (potential path traversal).
+    Validation is lossless: malformed or overlong values are rejected instead
+    of being rewritten onto another user's filesystem namespace. Values that
+    contain ``..`` are also rejected as potential path traversal.
     """
     if not raw:
         return ""
-    cleaned = _OWUI_ID_RE.sub("", raw.strip())[:_OWUI_ID_MAX]
-    if not cleaned or ".." in cleaned:
+    cleaned = raw.strip()
+    if len(cleaned) > _OWUI_ID_MAX or not _OWUI_ID_RE.fullmatch(cleaned):
+        return ""
+    if ".." in cleaned:
         return ""
     return cleaned
 
@@ -1027,7 +1030,11 @@ def _apply_skill_acl_toolset_minimization(
 
     When ``skills_acl`` is enabled, restrict the toolset the model sees so an
     unprivileged caller cannot read/mutate protected skills:
-      * ``skills`` -> ``skills_read`` (if read) and/or ``skills_manage`` (if manage);
+      * ``skills`` -> ``skills_read`` (if read) and ``skills_manage`` for every
+        authenticated/read-authorized Origin Agent caller, because Increment 1
+        gives each caller full native CRUD on only their own user namespace.
+        Runtime target resolution still applies the existing ACL to platform
+        and external skills;
       * ``file``   -> full ``file`` only for create/update callers, else read-only
         ``file_read`` (no write_file/patch) — delete-only does not imply raw file
         writes; protected-path operations are still permission-checked per action;
@@ -1070,7 +1077,11 @@ def _apply_skill_acl_toolset_minimization(
             kept.append("file_read")
         return kept
     can_read = "read" in perms
-    can_skill_manage = bool(perms & {"create", "update", "delete"})
+    # Reader-group callers need the native manager for full CRUD on their own
+    # functional user namespace. This does not broaden platform permissions:
+    # skill_manage resolves the target namespace before applying the existing
+    # create/update/delete ACL to platform/external skills.
+    can_skill_manage = can_read or bool(perms & {"create", "update", "delete"})
     can_file_write = bool(perms & {"create", "update"})
     can_terminal = {"read", "create", "update", "delete"} <= perms
     result = [t for t in toolsets if t not in _ACL_MANAGED_TOOLSET_KEYS]

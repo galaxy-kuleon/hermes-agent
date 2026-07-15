@@ -116,6 +116,32 @@ def test_matched_but_not_disabled_returns_none(
         assert gateway_run._check_unavailable_skill("ascii-art") is None
 
 
+def test_current_user_root_is_in_unavailable_hint_but_sibling_is_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".hermes"
+    (home / "skills").mkdir(parents=True)
+    alice_root = home / "user-skills" / "alice"
+    bob_root = home / "user-skills" / "bob"
+    _write_skill(alice_root, "alice-private", "alice-private")
+    _write_skill(bob_root, "bob-private", "bob-private")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from gateway import run as gateway_run
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(platform="api_server", user_id="alice")
+    try:
+        with patch(
+            "tools.skills_tool._get_disabled_skill_names",
+            return_value={"alice-private", "bob-private"},
+        ):
+            assert gateway_run._check_unavailable_skill("alice-private") is not None
+            assert gateway_run._check_unavailable_skill("bob-private") is None
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_slug_normalization_strips_non_alnum(
     tmp_skills: Path,
 ) -> None:

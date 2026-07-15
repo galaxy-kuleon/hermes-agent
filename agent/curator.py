@@ -69,7 +69,7 @@ DEFAULT_CONSOLIDATE = False
 # ---------------------------------------------------------------------------
 
 def _state_file() -> Path:
-    return get_hermes_home() / "skills" / ".curator_state"
+    return skill_usage.current_skills_dir() / ".curator_state"
 
 
 def _default_state() -> Dict[str, Any]:

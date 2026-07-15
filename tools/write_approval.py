@@ -35,9 +35,9 @@ channel — review happens via ``/memory pending``). Foreground CLI memory
 writes prompt inline via the dangerous-command approval callback; skill
 writes always stage (too big to eyeball mid-loop).
 
-Pending records live under ``<HERMES_HOME>/pending/{memory,skills}/<id>.json``
-so they survive process restarts and can be reviewed from CLI, gateway, or the
-web dashboard.
+Pending records survive process restarts under ``<HERMES_HOME>/pending``.
+api_server user-skill records are partitioned by the validated original
+OpenWebUI subject; trusted CLI/platform records keep the legacy shared path.
 """
 
 from __future__ import annotations
@@ -107,8 +107,22 @@ def _normalize_enabled(value: Any) -> bool:
 # Pending store (file-backed)
 # ---------------------------------------------------------------------------
 
-def _pending_dir(subsystem: str) -> Path:
-    return get_hermes_home() / "pending" / subsystem
+def _pending_dir(subsystem: str, subject_user_id: Optional[str] = None) -> Path:
+    base = get_hermes_home() / "pending" / subsystem
+    if subsystem != SKILLS:
+        return base
+    try:
+        from agent.skill_namespaces import (
+            current_skill_namespace_user_id,
+            validate_owui_user_id,
+        )
+
+        raw_subject = subject_user_id or current_skill_namespace_user_id()
+        if raw_subject:
+            return base / "users" / validate_owui_user_id(raw_subject)
+    except (ImportError, ValueError):
+        pass
+    return base
 
 
 def stage_write(subsystem: str, payload: Dict[str, Any],
@@ -451,22 +465,34 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
     current = ""
     target_label = "SKILL.md"
     if _find_skill is not None:
-        found = _find_skill(name)
-        if found:
-            base = found["path"]
-            if action == "edit":
-                p = base / "SKILL.md"
-            elif action in {"patch", "write_file"}:
-                rel = payload.get("file_path") or "SKILL.md"
-                p = base / rel
-                target_label = rel
-            else:
-                p = base / "SKILL.md"
-            try:
-                if p.exists():
-                    current = p.read_text(encoding="utf-8")
-            except Exception:
-                current = ""
+        from contextlib import nullcontext
+
+        namespace = payload.get("namespace")
+        replay_scope = nullcontext()
+        if namespace == "user" and payload.get("subject_user_id"):
+            from agent.skill_namespaces import bind_skill_namespace_user
+
+            replay_scope = bind_skill_namespace_user(payload["subject_user_id"])
+        try:
+            with replay_scope:
+                found = _find_skill(name, namespace=namespace)
+                if found:
+                    base = found["path"]
+                    if action == "edit":
+                        p = base / "SKILL.md"
+                    elif action in {"patch", "write_file"}:
+                        rel = payload.get("file_path") or "SKILL.md"
+                        p = base / rel
+                        target_label = rel
+                    else:
+                        p = base / "SKILL.md"
+                    try:
+                        if p.exists():
+                            current = p.read_text(encoding="utf-8")
+                    except Exception:
+                        current = ""
+        except ValueError:
+            current = ""
 
     if action == "edit":
         new = payload.get("content") or ""

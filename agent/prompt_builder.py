@@ -19,7 +19,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
-    get_all_skills_dirs,
+    get_skill_roots,
     get_disabled_skill_names,
     iter_skill_index_files,
     parse_frontmatter,
@@ -1255,10 +1255,9 @@ def build_skills_system_prompt(
 
     Falls back to a full filesystem scan when both layers miss.
 
-    External skill directories (``skills.external_dirs`` in config.yaml) are
-    scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
-    are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
+    Configured external roots and the current api_server caller's user root are
+    scanned alongside the platform root. The user root is functional routing,
+    not an operating-system security boundary.
 
     ``compact_categories`` (e.g. from the coding posture — see
     agent/coding_context.py) demotes whole categories to a names-only line in
@@ -1267,9 +1266,10 @@ def build_skills_system_prompt(
     descriptions are dropped, and a footer note explains the demotion.
     """
     skills_dir = get_skills_dir()
-    external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    skill_roots = get_skill_roots(platform_dir=skills_dir)
+    additional_dirs = [root.path for root in skill_roots if root.path != skills_dir]
 
-    if not skills_dir.exists() and not external_dirs:
+    if not skills_dir.exists() and not additional_dirs:
         return ""
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
@@ -1284,7 +1284,7 @@ def build_skills_system_prompt(
     disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir.resolve()),
-        tuple(str(d) for d in external_dirs),
+        tuple(str(d) for d in additional_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1372,16 +1372,15 @@ def build_skills_system_prompt(
             category_descriptions,
         )
 
-    # ── External skill directories ─────────────────────────────────────
-    # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
-    # precedence: we track seen names and skip duplicates from external dirs.
+    # ── Additional skill directories ───────────────────────────────────
+    # Scan external and caller-user roots directly (no platform snapshot).
+    # Platform skills already in skills_by_category keep first precedence.
     seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
         for name, _desc in cat_skills:
             seen_skill_names.add(name)
 
-    for ext_dir in external_dirs:
+    for ext_dir in additional_dirs:
         if not ext_dir.exists():
             continue
         for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):

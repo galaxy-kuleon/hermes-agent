@@ -1,9 +1,9 @@
 """Skill usage telemetry + provenance tracking for the Curator feature.
 
-Tracks per-skill usage metadata in a sidecar JSON file (~/.hermes/skills/.usage.json)
-keyed by skill name. Counters are bumped by the existing skill tools (skill_view,
-skill_manage); the curator orchestrator reads the derived activity timestamp to
-decide lifecycle transitions.
+Tracks per-skill usage metadata in a sidecar JSON file inside the skill root
+whose skill is being operated on. Counters are bumped by the existing skill
+tools (skill_view, skill_manage); the curator orchestrator reads the derived
+activity timestamp to decide lifecycle transitions.
 
 Design notes:
   - Sidecar, not frontmatter. Keeps operational telemetry out of user-authored
@@ -24,6 +24,7 @@ Lifecycle states:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -67,6 +68,10 @@ PROTECTED_BUILTIN_SKILLS: Set[str] = {
     "plan",
 }
 
+_USAGE_SKILLS_ROOT: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
+    "HERMES_SKILL_USAGE_ROOT", default=None
+)
+
 
 def is_protected_builtin(skill_name: str) -> bool:
     """Whether *skill_name* is a load-bearing built-in the curator never touches.
@@ -78,8 +83,44 @@ def is_protected_builtin(skill_name: str) -> bool:
     return skill_name in PROTECTED_BUILTIN_SKILLS
 
 
-def _skills_dir() -> Path:
+def current_skills_dir() -> Path:
+    """Return the usage/curator root for the current skill operation.
+
+    Tool handlers bind the concrete root that resolved the skill.  Direct
+    api_server curator calls default to the caller-owned user root.  Trusted
+    CLI/background callers retain the historical platform root.
+    """
+
+    override = _USAGE_SKILLS_ROOT.get()
+    if override is not None:
+        return override
+    try:
+        from agent.skill_namespaces import get_current_user_skills_dir
+
+        user_root = get_current_user_skills_dir()
+        if user_root is not None:
+            return user_root
+    except Exception:
+        pass
     return get_hermes_home() / "skills"
+
+
+@contextmanager
+def skill_usage_scope(skills_root: Optional[Path]):
+    """Temporarily bind usage and curator state to one resolved skill root."""
+
+    if skills_root is None:
+        yield
+        return
+    token = _USAGE_SKILLS_ROOT.set(Path(skills_root))
+    try:
+        yield
+    finally:
+        _USAGE_SKILLS_ROOT.reset(token)
+
+
+def _skills_dir() -> Path:
+    return current_skills_dir()
 
 
 def _usage_file() -> Path:

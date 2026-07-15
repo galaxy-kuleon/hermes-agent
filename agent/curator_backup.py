@@ -68,11 +68,13 @@ _ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(-\d{2})?$")
 
 
 def _backups_dir() -> Path:
-    return get_hermes_home() / "skills" / ".curator_backups"
+    return _skills_dir() / ".curator_backups"
 
 
 def _skills_dir() -> Path:
-    return get_hermes_home() / "skills"
+    from tools.skill_usage import current_skills_dir
+
+    return current_skills_dir()
 
 
 def _cron_jobs_file() -> Path:

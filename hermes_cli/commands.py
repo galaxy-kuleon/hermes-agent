@@ -732,19 +732,19 @@ def _collect_gateway_skill_entries(
     try:
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import SKILLS_DIR
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_skill_roots
         _skills_dir = str(SKILLS_DIR.resolve())
         _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
-        # Build set of allowed directory prefixes: local skills dir + any
-        # user-configured ``skills.external_dirs``. Ensure each prefix ends
+        # Build caller-visible prefixes: platform + external + own user root.
+        # Ensure each prefix ends
         # with ``/`` so ``/my-skills`` does not also match ``/my-skills-extra``.
         # Without this widening, external skills are visible in
         # ``hermes skills list`` and the agent's ``/skill-name`` dispatch but
         # silently excluded from gateway slash menus (#8110).
-        _allowed_prefixes = [_skills_dir.rstrip("/") + "/"]
-        _allowed_prefixes.extend(
-            str(d).rstrip("/") + "/" for d in get_external_skills_dirs()
-        )
+        _allowed_prefixes = [
+            str(root.path.resolve()).rstrip("/") + "/"
+            for root in get_skill_roots(platform_dir=SKILLS_DIR)
+        ]
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
@@ -911,7 +911,7 @@ def discord_skill_commands_by_category(
 
     try:
         from agent.skill_commands import get_skill_commands
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_skill_roots
         from tools.skills_tool import SKILLS_DIR
 
         _skills_dir = SKILLS_DIR.resolve()
@@ -919,11 +919,11 @@ def discord_skill_commands_by_category(
         # Build list of (resolved_root, is_local) tuples. Each external dir
         # becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
-        _scan_roots: list[_P] = [_skills_dir]
+        _scan_roots: list[_P] = []
         try:
-            for ext in get_external_skills_dirs():
+            for root in get_skill_roots(platform_dir=SKILLS_DIR):
                 try:
-                    _scan_roots.append(_P(ext).resolve())
+                    _scan_roots.append(_P(root.path).resolve())
                 except Exception:
                     continue
         except Exception:

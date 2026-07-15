@@ -8,6 +8,7 @@ taken from trusted request headers only.
 from gateway.platforms.api_server import (
     _extract_owui_scope,
     _sanitize_owui_groups,
+    _sanitize_owui_id,
     _sanitize_owui_role,
 )
 
@@ -23,6 +24,14 @@ def test_sanitize_role_lowercases_and_strips():
     # internal spaces / punctuation / control chars stripped
     assert _sanitize_owui_role("ad min!@#") == "admin"
     assert _sanitize_owui_role("") == ""
+
+
+def test_user_id_validation_is_lossless_for_namespace_identity():
+    assert _sanitize_owui_id("  u-123  ") == "u-123"
+    assert _sanitize_owui_id("alice/bob") == ""
+    assert _sanitize_owui_id("alice bob") == ""
+    assert _sanitize_owui_id("a" * 65) == ""
+    assert _sanitize_owui_id("../alice") == ""
 
 
 def test_sanitize_groups_parses_dedupes_and_trims():

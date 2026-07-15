@@ -25,10 +25,14 @@ from tools.skill_manager_tool import (
 
 @contextmanager
 def _skill_dir(tmp_path):
-    """Patch both SKILLS_DIR and get_all_skills_dirs so _find_skill searches
-    only the temp directory — not the real ~/.hermes/skills/."""
+    """Patch the typed platform root to the isolated temp directory."""
+    from agent.skill_namespaces import SkillRoot
+
     with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
-         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+         patch(
+             "agent.skill_utils.get_skill_roots",
+             return_value=[SkillRoot("platform", tmp_path)],
+         ):
         yield
 
 
@@ -572,8 +576,9 @@ class TestSkillManageDispatcher:
                 raw = skill_manage(
                     action="create", name="review-sediment", content=VALID_SKILL_CONTENT
                 )
-                from tools.skill_usage import load_usage
-                usage = load_usage()
+                from tools.skill_usage import load_usage, skill_usage_scope
+                with skill_usage_scope(tmp_path):
+                    usage = load_usage()
         finally:
             from tools.skill_provenance import reset_current_write_origin
             reset_current_write_origin(token)
@@ -710,11 +715,17 @@ class TestSecurityScanGate:
 
 @contextmanager
 def _two_roots(local_dir: Path, external_dir: Path):
-    """Patch the skill manager so local SKILLS_DIR = local_dir and
-    get_all_skills_dirs() returns [local_dir, external_dir] in order."""
+    """Patch typed platform + external roots for mutation tests."""
+    from agent.skill_namespaces import SkillRoot
+
     with patch("tools.skill_manager_tool.SKILLS_DIR", local_dir), \
-         patch("agent.skill_utils.get_all_skills_dirs",
-               return_value=[local_dir, external_dir]):
+         patch(
+             "agent.skill_utils.get_skill_roots",
+             return_value=[
+                 SkillRoot("platform", local_dir),
+                 SkillRoot("external-0", external_dir),
+             ],
+         ):
         yield
 
 
@@ -989,8 +1000,10 @@ class TestDeleteSkillRmtreeGuard:
         evil = skills / "evil-skill"
         evil.symlink_to(victim, target_is_directory=True)
         try:
+            from agent.skill_namespaces import SkillRoot
             with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
-                 patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
+                 patch("agent.skill_utils.get_skill_roots",
+                       return_value=[SkillRoot("platform", skills)]), \
                  patch("tools.skill_manager_tool._find_skill",
                        return_value={"path": evil}):
                 result = _delete_skill("evil-skill", absorbed_into="")
@@ -1004,8 +1017,10 @@ class TestDeleteSkillRmtreeGuard:
     def test_skills_root_itself_refused(self, tmp_path):
         """If discovery ever hands back the skills root, refuse — rmtree would
         wipe every installed skill."""
+        from agent.skill_namespaces import SkillRoot
         with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
-             patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]), \
+             patch("agent.skill_utils.get_skill_roots",
+                   return_value=[SkillRoot("platform", tmp_path)]), \
              patch("tools.skill_manager_tool._find_skill",
                    return_value={"path": tmp_path}):
             result = _delete_skill("root-attack", absorbed_into="")
@@ -1020,8 +1035,10 @@ class TestDeleteSkillRmtreeGuard:
         outside = tmp_path / "outside_skill"
         outside.mkdir()
         (outside / "SKILL.md").write_text("x")
+        from agent.skill_namespaces import SkillRoot
         with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
-             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
+             patch("agent.skill_utils.get_skill_roots",
+                   return_value=[SkillRoot("platform", skills)]), \
              patch("tools.skill_manager_tool._find_skill",
                    return_value={"path": outside}):
             result = _delete_skill("outside", absorbed_into="")

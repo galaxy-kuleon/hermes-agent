@@ -191,13 +191,13 @@ def test_failclosed_on_resolution_error(monkeypatch, recorder):
 
 # ── Schema-level minimization ────────────────────────────────────────────────
 
-def test_schema_min_reader_gets_read_only(acl_enabled):
-    # NOTE: as of #13, a non-manage reader also loses `terminal` and write-capable
-    # `file`; this asserts the skills portion + that a genuinely unrelated toolset
-    # is preserved. (#13 terminal/file coverage lives in the #13 test file.)
+def test_schema_min_reader_gets_own_namespace_manager(acl_enabled):
+    # Increment 1 gives every read-authorized api_server caller native CRUD on
+    # their own functional user namespace. Runtime target resolution still
+    # applies the platform ACL to platform/external skill mutations.
     out = _apply_skill_acl_toolset_minimization(["web", "skills"], "user", G_READERS)
     assert "skills_read" in out
-    assert "skills" not in out and "skills_manage" not in out
+    assert "skills" not in out and "skills_manage" in out
     assert "web" in out  # unrelated toolset preserved
 
 
