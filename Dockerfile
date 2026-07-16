@@ -34,8 +34,6 @@ RUN apt-get update && \
     fonts-noto-cjk \
     fonts-noto-cjk-extra \
     fontconfig \
-    # Browser
-    chromium \
     # Other tools
     ripgrep \
     tmux \
@@ -61,6 +59,24 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# ── Install a real, image-baked Chromium ─────────────────────────────────────
+# Ubuntu 26.04's `chromium` package is only a Snap launcher stub. Containers do
+# not run snapd, so the stub exists and passes executable-presence checks but
+# fails every launch. Use Playwright's pinned headless shell instead and expose
+# it through one stable path for both Hermes setup and agent-browser runtime.
+ARG PLAYWRIGHT_VERSION=1.61.1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN set -eux; \
+    npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium --only-shell; \
+    chromium_path="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -name headless_shell -print -quit)"; \
+    test -n "${chromium_path}"; \
+    ln -s "${chromium_path}" /usr/local/bin/playwright-chromium; \
+    /usr/local/bin/playwright-chromium --version; \
+    rm -rf /root/.npm /var/lib/apt/lists/*
+
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
+
 # ── Install OpenCode CLI system-wide ─────────────────────────────────────────
 # Use /usr/local as HOME so the official installer does not write under
 # /home/hermes, which is volume-mounted and would be hidden at runtime.
@@ -80,7 +96,6 @@ RUN chown -R hermes:hermes /opt/hermes
 USER hermes
 ENV HOME=/home/hermes
 ENV DOCKER_BUILD=true
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 # Tell uv to use system python, not download its own
 ENV UV_PYTHON_PREFERENCE=only-system
 RUN bash /opt/hermes/setup-hermes.sh
