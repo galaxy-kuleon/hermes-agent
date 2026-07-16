@@ -6,6 +6,8 @@ malformed-config fail-safe, ACL-disabled legacy behavior, the action->permission
 mapping, and session-driven ``require_skill_permission``.
 """
 
+from pathlib import Path
+
 import pytest
 
 from gateway.session_context import clear_session_vars, set_session_vars
@@ -30,6 +32,7 @@ def _cfg(**skills_acl):
 def _enabled_cfg():
     return _cfg(
         enabled=True,
+        authority_mode="role_or_group",
         roles={"admin": ["read", "create", "update", "delete"], "user": []},
         groups={
             G_READERS: ["read"],
@@ -70,6 +73,42 @@ def test_protect_paths_normalized_to_list():
     assert cfg["protect_paths"] == ["/home/hermes/skills"]
 
 
+def test_readonly_writer_falls_back_to_direct_config_read(tmp_path, monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "skills_acl:\n"
+        "  enabled: true\n"
+        "  authority_mode: groups_only\n"
+        "  groups:\n"
+        f"    {G_READERS}: [read]\n"
+    )
+    monkeypatch.setattr(
+        hermes_config, "load_config", lambda: (_ for _ in ()).throw(OSError("read-only home"))
+    )
+    monkeypatch.setattr(hermes_config, "get_config_path", lambda: path)
+    cfg = load_skill_acl_config()
+    assert cfg["enabled"] is True
+    assert cfg["authority_mode"] == "groups_only"
+    assert cfg["groups"][G_READERS] == {"read"}
+    assert cfg["error"] is None
+
+
+def test_unreadable_live_config_fails_closed(monkeypatch):
+    import hermes_cli.config as hermes_config
+
+    missing = Path("/definitely/missing/hermes-config.yaml")
+    monkeypatch.setattr(
+        hermes_config, "load_config", lambda: (_ for _ in ()).throw(OSError("boom"))
+    )
+    monkeypatch.setattr(hermes_config, "get_config_path", lambda: missing)
+    cfg = load_skill_acl_config()
+    assert cfg["enabled"] is True
+    assert cfg["error"] == "skills_acl config could not be loaded"
+    assert resolve_skill_permissions("admin", G_ADMINS, cfg) == set()
+
+
 # ---------------------------------------------------------------------------
 # resolve_skill_permissions
 # ---------------------------------------------------------------------------
@@ -80,8 +119,51 @@ def test_admin_role_gets_all_permissions():
     assert resolve_skill_permissions("Admin", "", cfg) == set(ALL_PERMISSIONS)  # case-insensitive
 
 
+def test_groups_only_ignores_admin_and_all_role_grants():
+    cfg = load_skill_acl_config(
+        _cfg(
+            enabled=True,
+            authority_mode="groups_only",
+            roles={"admin": ["read", "create", "update", "delete"]},
+            groups={G_ADMINS: ["read", "create", "update", "delete"]},
+        )
+    )
+    assert resolve_skill_permissions("admin", "", cfg) == set()
+    assert resolve_skill_permissions("admin", G_ADMINS, cfg) == set(ALL_PERMISSIONS)
+
+
+def test_unknown_authority_mode_fails_safe():
+    cfg = load_skill_acl_config(
+        _cfg(enabled=True, authority_mode="magic", groups={G_ADMINS: ["read"]})
+    )
+    assert cfg["enabled"] is True
+    assert cfg["error"]
+    assert resolve_skill_permissions("user", G_ADMINS, cfg) == set()
+    assert resolve_skill_permissions("admin", G_ADMINS, cfg) == set()
+    assert resolve_skill_permissions("admin", "", cfg) == set()
+
+
+def test_omitted_authority_mode_defaults_to_groups_only():
+    cfg = load_skill_acl_config(
+        _cfg(
+            enabled=True,
+            roles={"admin": ["read", "create", "update", "delete"]},
+            groups={G_ADMINS: ["read", "create", "update", "delete"]},
+        )
+    )
+    assert cfg["authority_mode"] == "groups_only"
+    assert resolve_skill_permissions("admin", "", cfg) == set()
+    assert resolve_skill_permissions("admin", G_ADMINS, cfg) == set(ALL_PERMISSIONS)
+
+
 def test_role_grant():
-    cfg = load_skill_acl_config(_cfg(enabled=True, roles={"editor": ["read", "create"]}))
+    cfg = load_skill_acl_config(
+        _cfg(
+            enabled=True,
+            authority_mode="role_or_group",
+            roles={"editor": ["read", "create"]},
+        )
+    )
     assert resolve_skill_permissions("editor", "", cfg) == {"read", "create"}
 
 
@@ -93,7 +175,12 @@ def test_group_grant_string_and_list():
 
 def test_union_of_role_and_group_grants():
     cfg = load_skill_acl_config(
-        _cfg(enabled=True, roles={"user": ["read"]}, groups={G_EDITORS: ["create", "update"]})
+        _cfg(
+            enabled=True,
+            authority_mode="role_or_group",
+            roles={"user": ["read"]},
+            groups={G_EDITORS: ["create", "update"]},
+        )
     )
     assert resolve_skill_permissions("user", G_EDITORS, cfg) == {"read", "create", "update"}
 
@@ -123,8 +210,8 @@ def test_malformed_config_failsafe_enable_and_deny():
     assert cfg["enabled"] is True
     assert cfg["error"]
     assert resolve_skill_permissions("user", G_EDITORS, cfg) == set()
-    # admin still works under fail-safe
-    assert resolve_skill_permissions("admin", "", cfg) == set(ALL_PERMISSIONS)
+    # No role shortcut survives malformed policy.
+    assert resolve_skill_permissions("admin", "", cfg) == set()
 
 
 def test_malformed_top_level_section():
@@ -143,8 +230,8 @@ def test_malformed_roles_with_valid_group_still_denies_nonadmin():
     assert cfg["error"]  # structural error recorded
     # non-admin fully denied despite the valid group grant
     assert resolve_skill_permissions("user", G_EDITORS, cfg) == set()
-    # admin still allowed under malformed config
-    assert resolve_skill_permissions("admin", "", cfg) == set(ALL_PERMISSIONS)
+    # admin is also denied under malformed config
+    assert resolve_skill_permissions("admin", "", cfg) == set()
     # require_skill_permission denies the non-admin with a config-error reason
     tokens = set_session_vars(user_role="user", user_groups=G_EDITORS)
     try:
@@ -171,11 +258,13 @@ def test_require_allows_everything_when_disabled():
         ("skills_list", "read"),
         ("skill_view", "read"),
         ("create", "create"),
+        ("publish", "create"),
         ("edit", "update"),
         ("patch", "update"),
         ("write_file", "update"),
         ("remove_file", "update"),
         ("delete", "delete"),
+        ("rollback", "delete"),
     ],
 )
 def test_require_action_mapping_against_editor_group(action, perm):

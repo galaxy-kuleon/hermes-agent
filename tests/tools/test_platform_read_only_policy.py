@@ -3,7 +3,13 @@ from pathlib import Path
 
 from agent import curator, curator_backup
 from gateway.session_context import clear_session_vars, set_session_vars
-from tools import file_tools, skill_acl, skill_manager_tool as manager, skill_usage
+from tools import (
+    file_tools,
+    shared_skill_writer,
+    skill_acl,
+    skill_manager_tool as manager,
+    skill_usage,
+)
 
 
 SKILL = """---
@@ -24,7 +30,7 @@ def _write_skill(root: Path, name: str, body: str = "body") -> Path:
     return skill
 
 
-def test_api_server_platform_native_writes_are_immutable_even_for_admin(
+def test_api_server_platform_native_writes_route_to_writer_for_group_admin(
     tmp_path, monkeypatch
 ):
     platform = tmp_path / "skills"
@@ -32,9 +38,35 @@ def test_api_server_platform_native_writes_are_immutable_even_for_admin(
     _write_skill(platform, "company-skill", "original")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(manager, "SKILLS_DIR", platform)
-    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: {"enabled": False})
+    monkeypatch.setattr(
+        skill_acl,
+        "load_skill_acl_config",
+        lambda config=None: {
+            "enabled": True,
+            "authority_mode": "groups_only",
+            "roles": {},
+            "groups": {"skill-admins": {"read", "create", "update", "delete"}},
+            "protect_paths": [str(platform)],
+            "error": None,
+        },
+    )
+    writer_calls = []
+
+    def _writer(action, name, *, arguments=None):
+        writer_calls.append((action, name))
+        args = arguments or {}
+        if action == "edit":
+            return manager._edit_skill(name, args.get("content"), "platform")
+        if action == "create":
+            return manager._create_skill(
+                name, args.get("content"), args.get("category"), "platform"
+            )
+        raise AssertionError(action)
+
+    monkeypatch.setattr(shared_skill_writer, "request_shared_skill_mutation", _writer)
     tokens = set_session_vars(
-        platform="api_server", user_id="admin-user", user_role="admin"
+        platform="api_server", user_id="admin-user", user_role="user",
+        user_groups="skill-admins",
     )
     try:
         edited = json.loads(
@@ -61,16 +93,16 @@ def test_api_server_platform_native_writes_are_immutable_even_for_admin(
     finally:
         clear_session_vars(tokens)
 
-    assert edited["success"] is False
-    assert edited["error_code"] == "immutable_platform"
-    assert created["error_code"] == "immutable_platform"
-    assert "original" in (platform / "company-skill" / "SKILL.md").read_text()
-    assert not (platform / "new-platform").exists()
+    assert edited["success"] is True
+    assert created["success"] is True
+    assert writer_calls == [("edit", "company-skill"), ("create", "new-platform")]
+    assert "changed" in (platform / "company-skill" / "SKILL.md").read_text()
+    assert (platform / "new-platform" / "SKILL.md").exists()
     assert own["success"] is True
     assert (tmp_path / "user-skills" / "admin-user" / "own-skill").exists()
 
 
-def test_file_tool_platform_write_is_immutable_independent_of_acl_flag(
+def test_file_tool_platform_write_requires_native_skill_manage_independent_of_acl_flag(
     tmp_path, monkeypatch
 ):
     platform = tmp_path / "skills"
@@ -89,7 +121,7 @@ def test_file_tool_platform_write_is_immutable_independent_of_acl_flag(
     finally:
         clear_session_vars(tokens)
 
-    assert "read-only" in denied
+    assert "skill_manage" in denied
     assert readable is None
 
 
@@ -135,4 +167,3 @@ def test_user_usage_and_curator_state_stay_in_own_user_root(tmp_path, monkeypatc
 
     assert (user_root / ".usage.json").is_file()
     assert (user_root / ".curator_state").is_file()
-

@@ -113,6 +113,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_BROWSER_NAVIGATION_SCHEMES = frozenset({"http", "https"})
+
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
 # Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
 # npx, node, and Android's glibc runner (grun).
@@ -2338,6 +2340,21 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "error": "Blocked: URL contains what appears to be an API key or token. "
                      "Secrets must not be sent in URLs.",
         })
+    try:
+        navigation_scheme = urllib.parse.urlsplit(url).scheme.lower()
+    except ValueError:
+        navigation_scheme = ""
+    if navigation_scheme not in ALLOWED_BROWSER_NAVIGATION_SCHEMES:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Blocked: browser navigation requires an explicit http:// or "
+                    "https:// URL. Local files and executable URL schemes are unavailable."
+                ),
+                "error_code": "unsupported_url_scheme",
+            }
+        )
 
     # SSRF protection — block private/internal addresses before navigating.
     # Skipped for local backends (Camofox, headless Chromium without a cloud

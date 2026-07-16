@@ -176,6 +176,34 @@ def test_rollback_requires_exact_current_generation_and_is_one_shot(
         )
 
 
+@pytest.mark.parametrize(
+    "transaction_id",
+    [
+        "../crafted",
+        "../../skills/crafted",
+        "/tmp/crafted",
+        "20260716T120000Z-deadbeefcafe/../crafted",
+        "not-a-platform-transaction",
+    ],
+)
+def test_rollback_rejects_noncanonical_transaction_ids_before_path_access(
+    store_paths, transaction_id
+):
+    platform, state, transactions = store_paths
+    _write_skill(platform, "must-survive", "original")
+
+    with pytest.raises(store.PlatformSkillStoreError, match="invalid transaction id"):
+        store.rollback_transaction(
+            transaction_id,
+            target_root=platform,
+            state_dir=state,
+            transactions_dir=transactions,
+        )
+
+    assert "original" in (platform / "must-survive" / "SKILL.md").read_text()
+    assert not transactions.exists()
+
+
 def test_api_server_context_cannot_activate_operator_writer(store_paths, tmp_path):
     platform, state, transactions = store_paths
     source = _write_skill(tmp_path / "incoming", "blocked")
@@ -210,6 +238,12 @@ def test_next_writer_recovers_interrupted_transaction_without_losing_usage(
     receipt["status"] = "applying"
     receipt_path.write_text(json.dumps(receipt))
     (state / "usage.json").write_text('{"live":{"view_count":3}}')
+    publish_stage = platform / ".shared-publish-interrupted"
+    publish_backup = platform / ".shared-publish-backup-interrupted"
+    publish_stage.mkdir()
+    publish_backup.mkdir()
+    (publish_stage / "partial").write_text("partial")
+    (publish_backup / "old").write_text("old")
 
     recovered = store.recover_incomplete_transactions(
         target_root=platform,
@@ -219,6 +253,8 @@ def test_next_writer_recovers_interrupted_transaction_without_losing_usage(
 
     assert recovered["recovered"] == [committed["transaction_id"]]
     assert not (platform / "interrupted").exists()
+    assert not publish_stage.exists()
+    assert not publish_backup.exists()
     assert json.loads((state / "usage.json").read_text())["live"]["view_count"] == 3
     assert store.read_generation(state) == 2
 

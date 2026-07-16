@@ -75,3 +75,28 @@ def test_extract_scope_malformed_groups_sanitised():
     req = _FakeRequest({"X-OpenWebUI-User-Groups": "ok-1, ../etc, , ok-2"})
     scope = _extract_owui_scope(req)
     assert scope["user_groups"] == "ok-1,ok-2"
+
+
+def test_extract_scope_logs_missing_group_context_for_authenticated_user(caplog):
+    scope = _extract_owui_scope(
+        _FakeRequest({"X-OpenWebUI-User-Id": "u-123"})
+    )
+
+    assert scope["user_groups"] == ""
+    assert "owui_acl_group_context_missing user_id=u-123" in caplog.text
+
+
+def test_extract_scope_logs_fully_rejected_group_context_without_raw_value(caplog):
+    raw_group_value = "../private-group"
+    scope = _extract_owui_scope(
+        _FakeRequest(
+            {
+                "X-OpenWebUI-User-Id": "u-123",
+                "X-OpenWebUI-User-Groups": raw_group_value,
+            }
+        )
+    )
+
+    assert scope["user_groups"] == ""
+    assert "owui_acl_group_context_invalid user_id=u-123" in caplog.text
+    assert raw_group_value not in caplog.text

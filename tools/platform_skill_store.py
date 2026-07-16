@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tarfile
@@ -46,6 +47,7 @@ TRANSACTION_RECEIPT_FILENAME = "receipt.json"
 PLATFORM_SNAPSHOT_FILENAME = "platform-before.tar.gz"
 STATE_SNAPSHOT_FILENAME = "state-before.tar.gz"
 TRANSACTION_LOCK_FILENAME = ".writer.lock"
+TRANSACTION_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 _OPERATOR_STATE_NAMES = frozenset(
     {
         PLATFORM_GENERATION_FILENAME,
@@ -91,6 +93,20 @@ def _dir_digest(path: Path) -> str:
         digest.update(rel.encode("utf-8"))
         digest.update(_sha256(item).encode("ascii"))
     return digest.hexdigest()
+
+
+def skill_tree_hash(path: Path) -> Optional[str]:
+    """Return a stable SHA-256 for one skill tree, or ``None`` if absent.
+
+    The digest covers relative file names and file content, never absolute paths.
+    Symlinks are ignored here because :func:`verify_store` rejects them before a
+    transaction can commit.
+    """
+
+    path = Path(path)
+    if not path.exists() or not path.is_dir():
+        return None
+    return _dir_digest(path)
 
 
 def store_manifest(root: Path) -> Dict[str, Dict[str, Any]]:
@@ -494,6 +510,15 @@ def _new_transaction_id() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:12]}"
 
 
+def _validate_transaction_id(transaction_id: str) -> str:
+    """Validate the opaque transaction directory name before path joining."""
+
+    normalized = str(transaction_id or "").strip()
+    if not TRANSACTION_ID_PATTERN.fullmatch(normalized):
+        raise PlatformSkillStoreError("invalid transaction id")
+    return normalized
+
+
 def apply_transaction(
     operation: str,
     mutation: Callable[[str], Dict[str, Any]],
@@ -502,6 +527,7 @@ def apply_transaction(
     state_dir: Optional[Path] = None,
     transactions_dir: Optional[Path] = None,
     expected_generation: Optional[int] = None,
+    receipt_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply one operator mutation with snapshots, validation, receipt and rollback."""
 
@@ -541,6 +567,11 @@ def apply_transaction(
             "platform_snapshot": platform_snapshot.name,
             "state_snapshot": state_snapshot.name,
         }
+        if receipt_metadata:
+            # Metadata is nested so callers cannot overwrite transaction state.
+            # Round-trip through JSON now, before the first receipt write, to
+            # reject opaque objects and keep the journal independently readable.
+            receipt["request"] = json.loads(json.dumps(receipt_metadata))
         receipt_path = transaction_dir / TRANSACTION_RECEIPT_FILENAME
         atomic_json_write(receipt_path, receipt, indent=2, sort_keys=True)
         try:
@@ -745,7 +776,10 @@ def rollback_transaction(
     target_root: Optional[Path] = None,
     state_dir: Optional[Path] = None,
     transactions_dir: Optional[Path] = None,
+    rollback_metadata: Optional[Dict[str, Any]] = None,
+    expected_request_target: Optional[str] = None,
 ) -> Dict[str, Any]:
+    transaction_id = _validate_transaction_id(transaction_id)
     root = Path(target_root or platform_skills_dir())
     state = Path(state_dir or platform_skill_state_dir())
     transactions = Path(transactions_dir or default_transactions_dir())
@@ -762,6 +796,25 @@ def rollback_transaction(
         raise PlatformSkillStoreError(
             f"transaction {transaction_id} is not rollback-eligible: {receipt.get('status')}"
         )
+    if (
+        receipt.get("transaction_id") != transaction_id
+        or receipt.get("platform_snapshot") != PLATFORM_SNAPSHOT_FILENAME
+        or receipt.get("state_snapshot") != STATE_SNAPSHOT_FILENAME
+    ):
+        raise PlatformSkillStoreError(
+            f"transaction {transaction_id} receipt integrity check failed"
+        )
+    if expected_request_target is not None:
+        request_metadata = receipt.get("request")
+        receipt_target = (
+            str(request_metadata.get("target") or "")
+            if isinstance(request_metadata, dict)
+            else ""
+        )
+        if receipt_target != expected_request_target:
+            raise PlatformSkillStoreError(
+                f"transaction {transaction_id} target does not match rollback request"
+            )
 
     with _writer_lock(transactions):
         current = read_generation(state)
@@ -771,8 +824,8 @@ def rollback_transaction(
                 f"rollback base generation mismatch: transaction ended at "
                 f"{committed_generation}, current is {current}"
             )
-        platform_snapshot = transaction_dir / str(receipt["platform_snapshot"])
-        state_snapshot = transaction_dir / str(receipt["state_snapshot"])
+        platform_snapshot = transaction_dir / PLATFORM_SNAPSHOT_FILENAME
+        state_snapshot = transaction_dir / STATE_SNAPSHOT_FILENAME
         _restore_tree(root, platform_snapshot)
         _restore_operator_state(state, state_snapshot)
         migrate_legacy_generated_state(root, state, preserve_existing=True)
@@ -790,6 +843,8 @@ def rollback_transaction(
                 "rollback_generation": rollback_generation,
             }
         )
+        if rollback_metadata:
+            receipt["rollback_request"] = json.loads(json.dumps(rollback_metadata))
         atomic_json_write(receipt_path, receipt, indent=2, sort_keys=True)
     return {
         "ok": True,

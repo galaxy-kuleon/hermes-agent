@@ -1,11 +1,12 @@
 """Tests for issue #13 — prevent file/terminal BYPASS of /home/hermes/skills.
 
-Covers (1) toolset coupling: non-manage api_server users lose `terminal` and
-write-capable `file` (keep read-only `file_read`); manage users keep both;
+Covers (1) toolset coupling: api_server skill ACL grants never grant `terminal`
+or raw file-write tools;
 (2) the `file` toolset split (backward compatible); and (3) the protected-path
-guard at the file-tool execution layer — WRITE bypass (needs manage), READ
-bypass (needs read), manage allowed, non-protected allowed, traversal
-normalized, non-api_server/disabled exempt, and fail-CLOSED on error.
+guard at the file-tool execution layer — raw WRITE bypass is always denied,
+READ bypass needs read for shared/protected roots, sibling user roots stay hidden,
+all raw api_server writes fail closed when ACL is enabled, traversal is
+normalized, and local/ACL-disabled compatibility remains intact.
 """
 
 import json
@@ -112,13 +113,13 @@ def test_coupling_no_perm_keeps_only_read_file(acl_enabled):
     assert "web" in out
 
 
-def test_coupling_update_manage_keeps_file_but_loses_terminal(acl_enabled):
-    # Update/create can use skill_manage and file writes, but terminal is an
-    # arbitrary shell bypass that could delete protected skills. It is reserved
-    # for full skill admins (all four permissions), so update never implies delete.
+def test_coupling_update_manage_keeps_only_file_read_and_loses_terminal(acl_enabled):
+    # Update/create can use native skill_manage, but skill ACL grants never imply
+    # raw filesystem or shell authority.
     out_editor = minim(["web", "terminal", "file", "skills"], "user", G_EDITORS)
     assert "terminal" not in out_editor
-    assert "file" in out_editor
+    assert "file_read" in out_editor
+    assert "file" not in out_editor and "file_write" not in out_editor
     assert "skills_read" in out_editor and "skills_manage" in out_editor
 
 
@@ -133,9 +134,20 @@ def test_coupling_delete_only_loses_file_write_and_terminal(acl_enabled):
     assert "terminal" not in out
 
 
-def test_coupling_full_admin_keeps_terminal_and_file(acl_enabled):
+def test_coupling_full_admin_keeps_only_file_read_and_not_terminal(acl_enabled):
     out_admin = minim(["web", "terminal", "file", "skills"], "admin", "")
-    assert "terminal" in out_admin and "file" in out_admin
+    assert "terminal" not in out_admin
+    assert "file_read" in out_admin
+    assert "file" not in out_admin and "file_write" not in out_admin
+
+
+@pytest.mark.parametrize("requested_file_toolset", ["file", "file_write", "file_read"])
+def test_coupling_every_file_toolset_projects_to_read_only(
+    acl_enabled, requested_file_toolset
+):
+    out = minim([requested_file_toolset], "user", G_EDITORS)
+    assert out.count("file_read") == 1
+    assert "file" not in out and "file_write" not in out
 
 
 def test_coupling_disabled_unchanged():
@@ -182,7 +194,9 @@ def test_protected_read_denied_for_no_read(monkeypatch, identity_resolve, tmp_pa
         clear_session_vars(tokens)
 
 
-def test_protected_write_allowed_for_update_or_create(monkeypatch, identity_resolve, tmp_path):
+def test_protected_raw_write_denied_even_with_create_or_update(
+    monkeypatch, identity_resolve, tmp_path
+):
     protect = tmp_path / "skills"
     protect.mkdir(parents=True)
     existing = protect / "x" / "SKILL.md"
@@ -197,7 +211,11 @@ def test_protected_write_allowed_for_update_or_create(monkeypatch, identity_reso
     for role, groups, target, permission in cases:
         tokens = _scope(role=role, groups=groups)
         try:
-            assert ft._acl_protected_path_block(str(target), mode="write", task_id="t", permission=permission) is None
+            denial = ft._acl_protected_path_block(
+                str(target), mode="write", task_id="t", permission=permission
+            )
+            assert denial is not None
+            assert "skill_manage" in denial
         finally:
             clear_session_vars(tokens)
 
@@ -215,6 +233,113 @@ def test_protected_write_denied_for_delete_only(monkeypatch, identity_resolve, t
         clear_session_vars(tokens)
 
 
+def test_user_skills_raw_paths_are_ownership_aware(monkeypatch, identity_resolve, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    platform = tmp_path / "skills"
+    alice_skill = tmp_path / "user-skills" / "alice" / "private" / "SKILL.md"
+    bob_skill = tmp_path / "user-skills" / "bob" / "private" / "SKILL.md"
+    alice_skill.parent.mkdir(parents=True)
+    bob_skill.parent.mkdir(parents=True)
+    alice_skill.write_text("alice")
+    bob_skill.write_text("bob")
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(platform))
+
+    tokens = set_session_vars(
+        platform="api_server", user_id="alice", user_role="user", user_groups=G_EDITORS
+    )
+    try:
+        # Own personal drafts can be read, but raw writes still cannot bypass the
+        # native skill API. Sibling user roots are hidden regardless of read/update
+        # grants.
+        assert ft._acl_protected_path_block(str(alice_skill), mode="read") is None
+        assert ft._acl_protected_path_block(str(alice_skill), mode="write") is not None
+        assert ft._acl_protected_path_block(str(bob_skill), mode="read") is not None
+        assert ft._acl_protected_path_block(str(bob_skill), mode="write") is not None
+        assert ft._acl_protected_path_block(
+            str(tmp_path / "user-skills"), mode="read"
+        ) is not None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_vision_local_file_ingress_uses_same_ownership_guard(
+    monkeypatch, identity_resolve, tmp_path
+):
+    from tools.vision_tools import _acl_local_vision_path_block
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    platform = tmp_path / "skills"
+    alice_image = tmp_path / "user-skills" / "alice" / "draft" / "assets" / "own.png"
+    bob_image = tmp_path / "user-skills" / "bob" / "draft" / "assets" / "private.png"
+    alice_image.parent.mkdir(parents=True)
+    bob_image.parent.mkdir(parents=True)
+    alice_image.write_bytes(b"own")
+    bob_image.write_bytes(b"private")
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(platform))
+
+    tokens = set_session_vars(
+        platform="api_server", user_id="alice", user_role="user", user_groups=G_EDITORS
+    )
+    try:
+        assert _acl_local_vision_path_block(str(alice_image)) is None
+        assert _acl_local_vision_path_block(f"file://{bob_image}") is not None
+        assert _acl_local_vision_path_block("https://example.test/image.png") is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_video_local_file_ingress_uses_same_ownership_guard(
+    monkeypatch, identity_resolve, tmp_path
+):
+    import asyncio
+    import json
+
+    from tools.vision_tools import video_analyze_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    platform = tmp_path / "skills"
+    bob_video = tmp_path / "user-skills" / "bob" / "draft" / "assets" / "private.mp4"
+    bob_video.parent.mkdir(parents=True)
+    bob_video.write_bytes(b"private")
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(platform))
+
+    tokens = set_session_vars(
+        platform="api_server", user_id="alice", user_role="user", user_groups=G_EDITORS
+    )
+    try:
+        result = json.loads(
+            asyncio.run(video_analyze_tool(f"file://{bob_video}", "inspect"))
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["success"] is False
+    assert "ACL" in result["error"]
+
+
+def test_writer_socket_and_auth_material_are_hidden_even_from_skill_admin(
+    monkeypatch, identity_resolve, tmp_path
+):
+    platform = tmp_path / "skills"
+    socket_path = tmp_path / "writer-control" / "writer.sock"
+    secret_path = tmp_path / "secrets" / "writer.key"
+    socket_path.parent.mkdir(parents=True)
+    secret_path.parent.mkdir(parents=True)
+    secret_path.write_text("not-a-real-secret")
+    monkeypatch.setenv("HERMES_SKILL_WRITER_SOCKET", str(socket_path))
+    monkeypatch.setenv("HERMES_SKILL_WRITER_SECRET_FILE", str(secret_path))
+    monkeypatch.setattr(
+        skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(platform)
+    )
+    tokens = _scope(role="admin", groups="")
+    try:
+        for path in (socket_path, socket_path.parent, secret_path):
+            assert ft._acl_protected_path_block(str(path), mode="read") is not None
+            assert ft._acl_protected_path_block(str(path), mode="write") is not None
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_non_protected_path_allowed(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
@@ -223,6 +348,81 @@ def test_non_protected_path_allowed(monkeypatch, identity_resolve, tmp_path):
         other = str(tmp_path / "other" / "doc.txt")
         assert ft._acl_protected_path_block(other, mode="write") is None
         assert ft._acl_protected_path_block(other, mode="read") is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_raw_write_runtime_gate_denies_same_uid_code_persistence(
+    monkeypatch, identity_resolve, tmp_path
+):
+    """Direct dispatch cannot plant executable/plugin code outside skill roots."""
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(
+        skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect)
+    )
+    monkeypatch.setattr(ft, "_check_sensitive_path", lambda p, task_id="default": None)
+
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    executable_target = Path("/opt/hermes/.kg-acl-raw-write-regression")
+    plugin_target = hermes_home / "plugins" / "persistence.py"
+    plugin_target.parent.mkdir(parents=True)
+    plugin_target.write_text("SAFE = True\n")
+    tokens = _scope(role="user", groups=G_EDITORS)
+    try:
+        assert not executable_target.exists()
+        assert _denied(
+            ft.write_file_tool(
+                str(executable_target), "raise SystemExit('pwned')\n", task_id="t"
+            )
+        )
+        assert not executable_target.exists()
+        assert _denied(
+            ft.patch_tool(
+                mode="replace",
+                path=str(plugin_target),
+                old_string="SAFE = True",
+                new_string="PWNED = True",
+                task_id="t",
+            )
+        )
+        assert plugin_target.read_text() == "SAFE = True\n"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_raw_write_runtime_gate_preserves_local_and_acl_disabled_behavior(
+    monkeypatch, identity_resolve, tmp_path
+):
+    protect = tmp_path / "skills"
+    monkeypatch.setattr(
+        skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect)
+    )
+    tokens = _scope(role="admin", groups="", platform="cli")
+    try:
+        assert ft._acl_raw_file_write_block() is None
+    finally:
+        clear_session_vars(tokens)
+
+    disabled = dict(_acl_cfg(protect), enabled=False)
+    monkeypatch.setattr(
+        skill_acl, "load_skill_acl_config", lambda config=None: disabled
+    )
+    tokens = _scope(role="admin", groups="")
+    try:
+        assert ft._acl_raw_file_write_block() is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_raw_write_runtime_gate_fails_closed_on_acl_config_error(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", _raise)
+    tokens = _scope(role="admin", groups="")
+    try:
+        assert ft._acl_raw_file_write_block() is not None
     finally:
         clear_session_vars(tokens)
 
@@ -334,7 +534,7 @@ def test_write_file_tool_blocks_update_only_from_creating_new_skill_file(monkeyp
         clear_session_vars(tokens)
 
 
-def test_write_file_tool_allows_creator_for_new_skill_file(monkeypatch, identity_resolve, tmp_path):
+def test_write_file_tool_denies_creator_for_new_protected_skill_file(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     protect.mkdir(parents=True)
     target = protect / "new" / "SKILL.md"
@@ -342,9 +542,8 @@ def test_write_file_tool_allows_creator_for_new_skill_file(monkeypatch, identity
     monkeypatch.setattr(ft, "_check_sensitive_path", lambda p, task_id="default": None)
     tokens = _scope(role="user", groups=G_CREATORS)  # create, NOT update/delete
     try:
-        res = json.loads(ft.write_file_tool(str(target), "created", task_id="t"))
-        assert not res.get("error")
-        assert target.read_text() == "created"
+        assert _denied(ft.write_file_tool(str(target), "created", task_id="t"))
+        assert not target.exists()
     finally:
         clear_session_vars(tokens)
 
@@ -408,7 +607,7 @@ def test_v4a_add_existing_protected_requires_update_not_create(monkeypatch, iden
         clear_session_vars(tokens)
 
 
-def test_v4a_add_new_protected_allows_create(monkeypatch, identity_resolve, tmp_path):
+def test_v4a_add_new_protected_denies_raw_create(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     protect.mkdir(parents=True)
     target = protect / "new" / "SKILL.md"
@@ -421,14 +620,13 @@ def test_v4a_add_new_protected_allows_create(monkeypatch, identity_resolve, tmp_
 """
     tokens = _scope(role="user", groups=G_CREATORS)  # create, NOT update/delete
     try:
-        res = json.loads(ft.patch_tool(mode="patch", patch=patch, task_id="t"))
-        assert not res.get("error")
-        assert target.read_text() == "created"
+        assert _denied(ft.patch_tool(mode="patch", patch=patch, task_id="t"))
+        assert not target.exists()
     finally:
         clear_session_vars(tokens)
 
 
-def test_v4a_add_existing_protected_allows_update(monkeypatch, identity_resolve, tmp_path):
+def test_v4a_add_existing_protected_denies_raw_update(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     target = protect / "victim" / "SKILL.md"
     target.parent.mkdir(parents=True)
@@ -442,9 +640,8 @@ def test_v4a_add_existing_protected_allows_update(monkeypatch, identity_resolve,
 """
     tokens = _scope(role="user", groups=G_UPDATERS)  # update, NOT create/delete
     try:
-        res = json.loads(ft.patch_tool(mode="patch", patch=patch, task_id="t"))
-        assert not res.get("error")
-        assert target.read_text() == "updated"
+        assert _denied(ft.patch_tool(mode="patch", patch=patch, task_id="t"))
+        assert target.read_text() == "safe"
     finally:
         clear_session_vars(tokens)
 
@@ -484,6 +681,22 @@ def _mk_search_result(protect, tmp_path):
     )
 
 
+def _mk_user_search_result(home, tmp_path):
+    alice = str(home / "user-skills" / "alice" / "private" / "SKILL.md")
+    bob = str(home / "user-skills" / "bob" / "private" / "SKILL.md")
+    pub = str(tmp_path / "docs" / "readme.md")
+    return SearchResult(
+        matches=[
+            SearchMatch(path=alice, line_number=1, content="ALICE-SECRET"),
+            SearchMatch(path=bob, line_number=1, content="BOB-SECRET"),
+            SearchMatch(path=pub, line_number=1, content="public note"),
+        ],
+        files=[alice, bob, pub],
+        counts={alice: 1, bob: 1, pub: 1},
+        total_count=3,
+    )
+
+
 def test_search_filter_excludes_protected_for_no_read(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
@@ -499,6 +712,27 @@ def test_search_filter_excludes_protected_for_no_read(monkeypatch, identity_reso
         assert "readme.md" in blob and "public note" in blob
         # public-only remains: 1 match + 1 file + 1 count (synthetic populates all)
         assert out.total_count == 3
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_search_filter_hides_sibling_user_skills_even_for_reader(
+    monkeypatch, identity_resolve, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    platform = tmp_path / "skills"
+    monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(platform))
+    tokens = set_session_vars(
+        platform="api_server", user_id="alice", user_role="user", user_groups=G_READERS
+    )
+    try:
+        out = ft._acl_filter_search_result(_mk_user_search_result(tmp_path, tmp_path), "t")
+        assert out is not None
+        blob = json.dumps(out.to_dict())
+        assert "ALICE-SECRET" in blob
+        assert "BOB-SECRET" not in blob
+        assert "public note" in blob
+        assert out.total_count == 6  # alice + public, each represented 3 ways
     finally:
         clear_session_vars(tokens)
 
@@ -589,10 +823,10 @@ def test_read_file_tool_blocks_protected_without_leak(monkeypatch, identity_reso
 # ── code-exec MCP bypass closure (opencode_runner protected-path guard) ───────
 # opencode_runner runs `opencode` as a subprocess with hermes-container FS access
 # and a caller-supplied cwd; it is NOT in the ACL-managed toolset, so without a
-# guard an unprivileged api_server caller could point it at /home/hermes/skills
-# to read/mutate skills. The guard reuses _acl_protected_path_block (delete perm
-# required — arbitrary code can delete/rewrite), so only a full skill-admin may
-# operate there. Remote MCP (soc_v2) and non-protected cwds stay unaffected.
+# guard an api_server caller could point it at /home/hermes/skills to read/mutate
+# skills. Raw code execution is never a trusted native skill transaction, so the
+# protected cwd is denied even for a shared-skill Admin. Remote MCP (soc_v2) and
+# non-protected cwds stay unaffected.
 
 def test_opencode_runner_protected_cwd_denied_for_ungrouped(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
@@ -620,19 +854,24 @@ def test_opencode_runner_protected_cwd_denied_for_editor_without_delete(monkeypa
         clear_session_vars(tokens)
 
 
-def test_opencode_runner_protected_cwd_allowed_for_admin_role(monkeypatch, identity_resolve, tmp_path):
+def test_opencode_runner_protected_cwd_denied_for_admin_role(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     protect.mkdir(parents=True)
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
     tokens = _scope(role="admin", groups="")  # full perms
     try:
-        assert ft._acl_guard_code_exec_mcp_call(
-            "opencode_runner", {"cwd": str(protect)}, task_id="t") is None
+        denial = ft._acl_guard_code_exec_mcp_call(
+            "opencode_runner", {"cwd": str(protect)}, task_id="t"
+        )
+        assert denial is not None
+        assert "arbitrary-code" in denial
     finally:
         clear_session_vars(tokens)
 
 
-def test_opencode_runner_nonprotected_cwd_allowed_for_ungrouped(monkeypatch, identity_resolve, tmp_path):
+def test_opencode_runner_nonprotected_cwd_still_denied_on_api_server(
+    monkeypatch, identity_resolve, tmp_path
+):
     protect = tmp_path / "skills"
     protect.mkdir(parents=True)
     work = tmp_path / "work"  # legit cwd (e.g. /tmp, /home/hermes/workspace)
@@ -640,8 +879,11 @@ def test_opencode_runner_nonprotected_cwd_allowed_for_ungrouped(monkeypatch, ide
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
     tokens = _scope(role="user", groups="")
     try:
-        assert ft._acl_guard_code_exec_mcp_call(
-            "opencode_runner", {"cwd": str(work)}, task_id="t") is None
+        denial = ft._acl_guard_code_exec_mcp_call(
+            "opencode_runner", {"cwd": str(work)}, task_id="t"
+        )
+        assert denial is not None
+        assert "arbitrary-code" in denial
     finally:
         clear_session_vars(tokens)
 
@@ -674,14 +916,35 @@ def test_opencode_runner_non_api_server_platform_exempt(monkeypatch, identity_re
         clear_session_vars(tokens)
 
 
-def test_opencode_runner_missing_and_nondict_args_safe(monkeypatch, identity_resolve, tmp_path):
+def test_opencode_runner_missing_and_nondict_args_fail_closed(monkeypatch, identity_resolve, tmp_path):
     protect = tmp_path / "skills"
     protect.mkdir(parents=True)
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(protect))
     tokens = _scope(role="user", groups="")
     try:
-        assert ft._acl_guard_code_exec_mcp_call("opencode_runner", {}, task_id="t") is None
-        assert ft._acl_guard_code_exec_mcp_call("opencode_runner", None, task_id="t") is None
-        assert ft._acl_guard_code_exec_mcp_call("opencode_runner", {"run_id": "abc"}, task_id="t") is None
+        assert ft._acl_guard_code_exec_mcp_call("opencode_runner", {}, task_id="t") is not None
+        assert ft._acl_guard_code_exec_mcp_call("opencode_runner", None, task_id="t") is not None
+        assert ft._acl_guard_code_exec_mcp_call(
+            "opencode_runner", {"run_id": "abc"}, task_id="t"
+        ) is not None
     finally:
         clear_session_vars(tokens)
+
+
+def test_universal_mcp_dispatch_short_circuits_opencode_before_subprocess(
+    monkeypatch, identity_resolve, tmp_path
+):
+    from tools.mcp_tool import _make_tool_handler
+
+    platform = tmp_path / "skills"
+    platform.mkdir()
+    monkeypatch.setattr(
+        skill_acl, "load_skill_acl_config", lambda config=None: _acl_cfg(platform)
+    )
+    tokens = _scope(role="admin", groups="")
+    try:
+        handler = _make_tool_handler("opencode_runner", "opencode_run_start", 30.0)
+        result = json.loads(handler({"cwd": str(tmp_path / "workspace")}))
+    finally:
+        clear_session_vars(tokens)
+    assert "arbitrary-code" in result["error"]

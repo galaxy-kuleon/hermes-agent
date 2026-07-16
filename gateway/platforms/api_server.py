@@ -1003,9 +1003,14 @@ def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
     raw_user_name = request.headers.get("X-OpenWebUI-User-Name", "").strip()
     user_name = raw_user_name[:128] if raw_user_name else ""
     user_role = _sanitize_owui_role(request.headers.get("X-OpenWebUI-User-Role", ""))
-    user_groups = _sanitize_owui_groups(
-        request.headers.get("X-OpenWebUI-User-Groups", "")
-    )
+    raw_user_groups = request.headers.get("X-OpenWebUI-User-Groups")
+    user_groups = _sanitize_owui_groups(raw_user_groups or "")
+    if user_id and raw_user_groups is None:
+        logger.warning("owui_acl_group_context_missing user_id=%s", user_id)
+    elif user_id and raw_user_groups and not user_groups:
+        # Never log the untrusted raw header: stable group identifiers are
+        # authorization context and unnecessary for diagnosing sanitization.
+        logger.warning("owui_acl_group_context_invalid user_id=%s", user_id)
     return {
         "user_id": user_id,
         "user_name": user_name,
@@ -1018,7 +1023,8 @@ def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
 _SKILL_TOOLSET_KEYS = {"skills", "skills_read", "skills_manage"}
 _FILE_TOOLSET_KEYS = {"file", "file_read", "file_write"}
 # Toolsets that let a caller read/mutate the protected skills dir OUTSIDE the
-# skill tools (arbitrary shell). Withheld from non-manage api_server users (#13).
+# skill tools (arbitrary shell). Shared-skill ACL grants never expose these on
+# api_server; operator shell access is a separate out-of-band concern (#13).
 _BYPASS_TOOLSET_KEYS = {"terminal"}
 _ACL_MANAGED_TOOLSET_KEYS = _SKILL_TOOLSET_KEYS | _FILE_TOOLSET_KEYS | _BYPASS_TOOLSET_KEYS
 
@@ -1035,11 +1041,10 @@ def _apply_skill_acl_toolset_minimization(
         gives each caller full native CRUD on only their own user namespace.
         Runtime target resolution still applies the existing ACL to platform
         and external skills;
-      * ``file``   -> full ``file`` only for create/update callers, else read-only
-        ``file_read`` (no write_file/patch) — delete-only does not imply raw file
-        writes; protected-path operations are still permission-checked per action;
-      * ``terminal`` -> withheld unless the caller has the full read/create/update/delete
-        set, because arbitrary shell cannot preserve delete/update independence.
+      * every ``file``/``file_write`` request -> read-only ``file_read``. Raw
+        filesystem writes are never implied by shared-skill Reader/Editor/Admin
+        authority; the trusted native manager is the only skill mutation route;
+      * ``terminal`` -> always withheld: shared-skill Admin is not shell authority.
 
     Runtime gates (#11 read, #12 manage, #13 protected-path file guard) remain
     authoritative; this is defense-in-depth + UX. Takes ``role``/``groups`` as
@@ -1048,22 +1053,21 @@ def _apply_skill_acl_toolset_minimization(
     fail safe (drop skill/write/exec toolsets; keep read-only file if a file
     toolset was present, since read-only file cannot mutate skills).
 
-    HONEST SCOPE (not a complete security boundary — see the 2026-07-15 design
-    verdict, reports/handoffs/hermes-skill-crud-acl/partner72-acl-design-verdict-*):
-    this is *attack-surface reduction*, NOT the skills reference monitor. It
-    minimizes only the ``skills``/``file``/``terminal`` toolset families, and only
-    for ``platform == "api_server"``. It does NOT gate arbitrary-code / MCP tools
-    (opencode_runner has a cwd-guard but a HIGH prompt-driven absolute-path
-    residual remains; code_execution/delegation/cronjob are un-gated where
-    enabled), the ``vision`` read path, or execution spawned under another platform
-    label (subagent/cron). The real boundary for ``/home/hermes/skills`` must live
-    at the resource (read-only mount + exec namespace), with this ACL as policy on
-    top — do not treat this minimization as the security boundary.
+    HONEST SCOPE: this function is schema-level attack-surface reduction, not
+    the skills reference monitor. The resource boundary is the gateway's
+    kernel-read-only shared-skills mount plus the authenticated isolated writer.
+    The live api_server config does not spawn or advertise ``opencode_runner``;
+    universal MCP dispatch also denies that local code-exec server as defense in
+    depth. Browser navigation accepts only HTTP(S), and image/video local-file
+    ingress reuses the ownership-aware file guard. Any future local arbitrary-code,
+    delegation, cron, or auxiliary tool added to api_server still requires an
+    explicit same-UID bypass review; remote ``soc_v2`` remains isolated in its own
+    container without skill mounts. Do not treat toolset minimization alone as the
+    security boundary.
     """
     if not any(t in _ACL_MANAGED_TOOLSET_KEYS for t in toolsets):
         return toolsets
     had_file = any(t in _FILE_TOOLSET_KEYS for t in toolsets)
-    had_terminal = "terminal" in toolsets
     try:
         from tools.skill_acl import load_skill_acl_config, resolve_skill_permissions
 
@@ -1082,17 +1086,13 @@ def _apply_skill_acl_toolset_minimization(
     # skill_manage resolves the target namespace before applying the existing
     # create/update/delete ACL to platform/external skills.
     can_skill_manage = can_read or bool(perms & {"create", "update", "delete"})
-    can_file_write = bool(perms & {"create", "update"})
-    can_terminal = {"read", "create", "update", "delete"} <= perms
     result = [t for t in toolsets if t not in _ACL_MANAGED_TOOLSET_KEYS]
     if can_read:
         result.append("skills_read")
     if can_skill_manage:
         result.append("skills_manage")
     if had_file:
-        result.append("file" if can_file_write else "file_read")
-    if had_terminal and can_terminal:
-        result.append("terminal")
+        result.append("file_read")
     return result
 
 

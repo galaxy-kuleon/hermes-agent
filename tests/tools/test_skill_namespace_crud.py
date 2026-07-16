@@ -7,6 +7,7 @@ import pytest
 from gateway.session_context import clear_session_vars, set_session_vars
 from tools import skill_acl
 from tools import skill_manager_tool as manager
+from tools import shared_skill_writer
 from tools import skills_tool
 
 
@@ -22,6 +23,7 @@ description: Namespace test.
 
 ACL = {
     "enabled": True,
+    "authority_mode": "groups_only",
     "roles": {"admin": {"read", "create", "update", "delete"}, "user": set()},
     "groups": {
         "readers": {"read"},
@@ -40,6 +42,30 @@ def namespace_home(tmp_path, monkeypatch):
     monkeypatch.setattr(manager, "SKILLS_DIR", platform)
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", platform)
     monkeypatch.setattr(skill_acl, "load_skill_acl_config", lambda config=None: ACL)
+
+    def _writer(action, name, *, arguments=None):
+        args = arguments or {}
+        from gateway.session_context import get_session_env
+
+        required = "create" if action == "create" else "update"
+        permissions = skill_acl.resolve_skill_permissions(
+            get_session_env("HERMES_SESSION_USER_ROLE", ""),
+            get_session_env("HERMES_SESSION_USER_GROUPS", ""),
+            ACL,
+        )
+        if required not in permissions:
+            return {
+                "success": False,
+                "error": "Hermes shared skills ACL denied this native mutation.",
+                "error_code": "acl_denied",
+            }
+        if action == "create":
+            return manager._create_skill(name, args.get("content"), args.get("category"), "platform")
+        if action == "edit":
+            return manager._edit_skill(name, args.get("content"), "platform")
+        raise AssertionError(f"unexpected writer action in namespace test: {action}")
+
+    monkeypatch.setattr(shared_skill_writer, "request_shared_skill_mutation", _writer)
     return tmp_path, platform
 
 
@@ -115,7 +141,7 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
         clear_session_vars(tokens)
 
 
-def test_platform_is_immutable_for_reader_and_editor(namespace_home):
+def test_platform_shared_acl_denies_reader_and_allows_editor(namespace_home):
     _home, platform = namespace_home
     _write_skill(platform, "platform-skill", "old")
 
@@ -129,7 +155,7 @@ def test_platform_is_immutable_for_reader_and_editor(namespace_home):
             )
         )
         assert denied["success"] is False
-        assert denied["error_code"] == "immutable_platform"
+        assert "skills acl" in denied["error"].lower()
     finally:
         clear_session_vars(reader)
 
@@ -142,9 +168,8 @@ def test_platform_is_immutable_for_reader_and_editor(namespace_home):
                 content=VALID.format(name="platform-skill", body="editor edit"),
             )
         )
-        assert updated["success"] is False
-        assert updated["error_code"] == "immutable_platform"
-        assert "old" in (platform / "platform-skill" / "SKILL.md").read_text()
+        assert updated["success"] is True
+        assert "editor edit" in (platform / "platform-skill" / "SKILL.md").read_text()
     finally:
         clear_session_vars(editor)
 
@@ -207,7 +232,7 @@ def test_user_create_cannot_shadow_platform_or_external(namespace_home, tmp_path
         clear_session_vars(tokens)
 
 
-def test_explicit_platform_create_is_immutable_for_editor(namespace_home):
+def test_explicit_platform_create_is_allowed_for_editor(namespace_home):
     _home, platform = namespace_home
     tokens = _scope("alice", "editors")
     try:
@@ -219,9 +244,9 @@ def test_explicit_platform_create_is_immutable_for_editor(namespace_home):
                 content=VALID.format(name="platform-new", body="platform"),
             )
         )
-        assert result["success"] is False
-        assert result["error_code"] == "immutable_platform"
-        assert not (platform / "platform-new").exists()
+        assert result["success"] is True
+        assert result["namespace"] == "platform"
+        assert (platform / "platform-new" / "SKILL.md").exists()
     finally:
         clear_session_vars(tokens)
 

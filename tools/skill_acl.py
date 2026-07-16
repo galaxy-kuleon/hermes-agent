@@ -14,8 +14,9 @@ Config schema — ``skills_acl`` section of ``config/hermes/config.yaml``::
 
     skills_acl:
       enabled: true
+      authority_mode: groups_only                  # recommended for shared libraries
       roles:
-        admin: [read, create, update, delete]   # admin is implicitly full; listing is optional
+        admin: [read, create, update, delete]   # ignored in groups_only mode
         user: []
       groups:                                    # keys are STABLE OpenWebUI group IDs, not names
         <group-id-readers>: [read]
@@ -26,7 +27,10 @@ Config schema — ``skills_acl`` section of ``config/hermes/config.yaml``::
 
 Semantics:
   * ACL section absent or ``enabled: false`` => legacy behavior (full access, no gating).
-  * ``admin`` role => all permissions by default.
+  * ``authority_mode: groups_only`` ignores role grants, including the
+    OpenWebUI ``admin`` role. Shared-library authority then comes only from
+    stable group IDs. Enabled ACLs default to this fail-closed mode;
+    ``role_or_group`` remains available only as an explicit legacy opt-in.
   * Otherwise permissions are the UNION of the role grant and every matching
     group grant (any role OR group grant grants a permission).
   * Fail-safe DENY: when ACL is enabled and the caller is non-admin with no
@@ -45,6 +49,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import yaml
+
 # The four skill permissions.
 READ = "read"
 CREATE = "create"
@@ -60,6 +66,7 @@ ACTION_TO_PERMISSION: Dict[str, str] = {
     "read": READ,
     # create
     "create": CREATE,
+    "publish": CREATE,
     # update
     "edit": UPDATE,
     "patch": UPDATE,
@@ -68,9 +75,14 @@ ACTION_TO_PERMISSION: Dict[str, str] = {
     "update": UPDATE,
     # delete
     "delete": DELETE,
+    "rollback": DELETE,
 }
 
 ADMIN_ROLE = "admin"
+AUTHORITY_ROLE_OR_GROUP = "role_or_group"
+AUTHORITY_GROUPS_ONLY = "groups_only"
+VALID_AUTHORITY_MODES = {AUTHORITY_ROLE_OR_GROUP, AUTHORITY_GROUPS_ONLY}
+_CONFIG_LOAD_ERROR = object()
 
 
 def _normalize_grant_map(raw: Any) -> Tuple[Dict[str, Set[str]], Optional[str]]:
@@ -101,13 +113,20 @@ def _raw_skills_acl(config: Optional[Dict[str, Any]]) -> Any:
     cfg = config
     if cfg is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import get_config_path, load_config
 
             cfg = load_config()
         except Exception:
-            return None
+            # The isolated writer intentionally has a read-only, minimal
+            # HERMES_HOME. Upstream load_config() calls ensure_hermes_home() and
+            # may fail while trying to create unrelated cron/session dirs. Fall
+            # back to a side-effect-free direct read of the same canonical file.
+            try:
+                cfg = yaml.safe_load(get_config_path().read_text(encoding="utf-8"))
+            except Exception:
+                return _CONFIG_LOAD_ERROR
     if not isinstance(cfg, dict):
-        return None
+        return _CONFIG_LOAD_ERROR
     return cfg.get("skills_acl")
 
 
@@ -122,9 +141,22 @@ def load_skill_acl_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, 
     fails safe to enabled+deny with ``error`` populated.
     """
     raw = _raw_skills_acl(config)
+    if raw is _CONFIG_LOAD_ERROR:
+        return {
+            "enabled": True,
+            # With no readable policy, no role (including admin) may become
+            # authority. This differs from a structurally malformed legacy
+            # policy, where backward compatibility still treats admin as full.
+            "authority_mode": AUTHORITY_GROUPS_ONLY,
+            "roles": {},
+            "groups": {},
+            "protect_paths": [],
+            "error": "skills_acl config could not be loaded",
+        }
     if raw is None:
         return {
             "enabled": False,
+            "authority_mode": AUTHORITY_ROLE_OR_GROUP,
             "roles": {},
             "groups": {},
             "protect_paths": [],
@@ -133,6 +165,7 @@ def load_skill_acl_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, 
     if not isinstance(raw, dict):
         return {
             "enabled": True,  # present but unusable => fail safe to deny
+            "authority_mode": AUTHORITY_ROLE_OR_GROUP,
             "roles": {},
             "groups": {},
             "protect_paths": [],
@@ -145,12 +178,23 @@ def load_skill_acl_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, 
         protect = [protect]
     elif not isinstance(protect, list):
         protect = []
-    error = role_err or group_err
+    authority_mode = str(
+        raw.get("authority_mode", AUTHORITY_GROUPS_ONLY)
+    ).strip().lower()
+    authority_error = None
+    if authority_mode not in VALID_AUTHORITY_MODES:
+        authority_error = (
+            "authority_mode must be one of: "
+            + ", ".join(sorted(VALID_AUTHORITY_MODES))
+        )
+        authority_mode = AUTHORITY_GROUPS_ONLY
+    error = role_err or group_err or authority_error
     enabled = bool(raw.get("enabled", False))
     if error:
         enabled = True  # structurally malformed present config => fail safe enable+deny
     return {
         "enabled": enabled,
+        "authority_mode": authority_mode,
         "roles": roles,
         "groups": groups,
         "protect_paths": [str(p) for p in protect],
@@ -184,17 +228,19 @@ def resolve_skill_permissions(
         cfg = load_skill_acl_config()
     if not cfg.get("enabled"):
         return set(ALL_PERMISSIONS)  # ACL disabled => legacy full access
-    role_norm = (role or "").strip().lower()
-    if role_norm == ADMIN_ROLE:
-        return set(ALL_PERMISSIONS)  # admin manages by default
     if cfg.get("error"):
-        # Structurally malformed config: do NOT honor any partial role/group
-        # grants — fail safe to deny all non-admin callers.
+        # Structurally malformed config never honors partial grants or implicit
+        # admin authority. Error handling must precede every allow shortcut.
         return set()
+    role_norm = (role or "").strip().lower()
+    authority_mode = cfg.get("authority_mode", AUTHORITY_ROLE_OR_GROUP)
+    if authority_mode != AUTHORITY_GROUPS_ONLY and role_norm == ADMIN_ROLE:
+        return set(ALL_PERMISSIONS)  # backward-compatible admin behavior
     perms: Set[str] = set()
-    roles_map = cfg.get("roles") or {}
-    if role_norm and role_norm in roles_map:
-        perms |= set(roles_map[role_norm])
+    if authority_mode != AUTHORITY_GROUPS_ONLY:
+        roles_map = cfg.get("roles") or {}
+        if role_norm and role_norm in roles_map:
+            perms |= set(roles_map[role_norm])
     groups_map = cfg.get("groups") or {}
     for gid in _as_group_list(groups):
         if gid in groups_map:

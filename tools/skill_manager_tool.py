@@ -5,8 +5,9 @@ Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 Allows the agent to create, update, and delete skills, turning successful
 approaches into reusable procedural knowledge. In an OpenWebUI api_server
 session, new skills default to the validated caller's functional user root;
-trusted CLI/non-API callers retain the platform-root default. Existing skills
-continue to use the current platform/external ACL during Increment 1.
+trusted CLI/non-API callers retain the platform-root default. Explicit shared
+mutations cross the authenticated isolated writer and are governed by stable
+OpenWebUI group IDs while the gateway platform mount remains read-only.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -1127,7 +1128,10 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
     """
-    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {
+        "create", "edit", "patch", "delete", "write_file", "remove_file",
+        "publish", "rollback",
+    }:
         return None
     if _skill_gate_bypass.get():
         return None
@@ -1146,7 +1150,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
     payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
-    if payload.get("namespace") == "user":
+    if payload.get("namespace") == "user" or action == "publish":
         try:
             from agent.skill_namespaces import current_skill_namespace_user_id
 
@@ -1180,7 +1184,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
     """
     namespace = str(payload.get("namespace") or "") or None
     subject_user_id = str(payload.get("subject_user_id") or "")
-    if namespace == "user" and not subject_user_id:
+    if (namespace == "user" or payload.get("action") == "publish") and not subject_user_id:
         return tool_error(
             "Approved user-skill write is missing its original subject; denied.",
             success=False,
@@ -1191,7 +1195,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
 
     subject_scope = (
         bind_skill_namespace_user(subject_user_id)
-        if namespace == "user"
+        if namespace == "user" or payload.get("action") == "publish"
         else nullcontext()
     )
     token = _skill_gate_bypass.set(True)
@@ -1209,6 +1213,9 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
                 new_string=payload.get("new_string"),
                 replace_all=payload.get("replace_all", False),
                 absorbed_into=payload.get("absorbed_into"),
+                target_name=payload.get("target_name"),
+                target_category=payload.get("target_category"),
+                transaction_id=payload.get("transaction_id"),
             )
     except ValueError:
         return tool_error("Approved user-skill write has an invalid original subject; denied.", success=False)
@@ -1222,10 +1229,6 @@ _ACL_MANAGE_DENY = (
     "Hermes skills ACL: management permission could not be verified for the "
     "current OpenWebUI role/group scope; denied."
 )
-_IMMUTABLE_PLATFORM_DENY = (
-    "Platform skills are read-only in chat/agent contexts; use the "
-    "out-of-band platform-skills operator workflow."
-)
 
 
 def _acl_manage_block(action: str, target_namespace: Optional[str] = None) -> Optional[str]:
@@ -1234,17 +1237,20 @@ def _acl_manage_block(action: str, target_namespace: Optional[str] = None) -> Op
 
     Mirrors the read gate in ``tools/skills_tool.py`` (#11): the skill ACL governs
     the multi-user **api_server** (OpenWebUI) surface only — CLI/cron/chat-platform
-    callers (trusted owner / gated elsewhere) are never blocked here. Allow is
-    preserved for exactly (a) ACL disabled (the default) and (b) non-api_server
-    platforms. When ACL is ENABLED on api_server, any error during permission
-    resolution **fails CLOSED** (write/manage actions must never silently pass).
-    The action maps to a permission via the #10 resolver
+    callers (trusted owner / gated elsewhere) are never blocked here. For the
+    shared/platform namespace, ACL-enabled requests cross the authenticated
+    writer boundary; after authenticating the gateway claim, that writer
+    independently re-evaluates group-to-permission policy from the signed stable
+    group IDs, audits both denial and success, and is authoritative. ACL-disabled keeps
+    platform writes closed. Non-platform namespaces preserve the legacy ACL
+    disabled allow path. When ACL is ENABLED on api_server, any local resolution
+    error **fails CLOSED**. The action maps to a permission via the #10 resolver
     (create=create; edit/patch/write_file/remove_file=update; delete=delete), and
     delete is never implied by update. The reason reveals no skill names/contents.
     """
     # Every authenticated OpenWebUI caller owns full native CRUD on exactly the
-    # user root derived from their trusted session identity. Platform/external
-    # mutations retain the existing role/group ACL in Increment 1.
+    # user root derived from their trusted session identity. The shared/platform
+    # library is governed by the action ACL below.
     if target_namespace == "user":
         try:
             from agent.skill_namespaces import current_skill_namespace_user_id
@@ -1262,13 +1268,18 @@ def _acl_manage_block(action: str, target_namespace: Optional[str] = None) -> Op
         return None
     if platform != "api_server":
         return None  # (b) ACL governs the api_server surface only
-    if target_namespace == "platform":
-        return _IMMUTABLE_PLATFORM_DENY
     try:
         from tools.skill_acl import load_skill_acl_config, require_skill_permission
 
-        if not load_skill_acl_config().get("enabled"):
-            return None  # (a) legacy: ACL disabled => allow (unchanged)
+        cfg = load_skill_acl_config()
+        if not cfg.get("enabled"):
+            if target_namespace == "platform":
+                return _ACL_MANAGE_DENY
+            return None  # legacy for non-shared namespaces
+        if target_namespace == "platform":
+            # Complete mediation lives in the isolated writer. Do not reject
+            # here: the writer must record denied attempts in its audit index.
+            return None
         ok, reason = require_skill_permission(action)
         return None if ok else reason
     except Exception:
@@ -1289,9 +1300,12 @@ def skill_manage(
     new_string: str = None,
     replace_all: bool = False,
     absorbed_into: str = None,
+    target_name: str = None,
+    target_category: str = None,
+    transaction_id: str = None,
 ) -> str:
     """
-    Manage user-created skills. Dispatches to the appropriate action handler.
+    Manage personal drafts or ACL-governed shared skills.
 
     Returns JSON string with results.
     """
@@ -1300,40 +1314,107 @@ def skill_manage(
     )
     if namespace_error:
         return tool_error(namespace_error, success=False)
-    target = None if action == "create" else _find_skill(bare_name, resolved_namespace)
-    target_namespace = (
-        resolved_namespace
-        or (target.get("namespace") if target else None)
-        or _default_create_namespace()
-    )
+    publish_source = None
+    broker_name = bare_name
+    if action == "publish":
+        if resolved_namespace not in {None, "user"}:
+            return tool_error(
+                "publish source must be in the caller's personal user namespace.",
+                success=False,
+            )
+        publish_source = _find_skill(bare_name, "user")
+        if not publish_source:
+            return tool_error(_skill_not_found_error(bare_name), success=False)
+        broker_name = str(target_name or "").strip()
+        if not broker_name:
+            return tool_error(
+                "target_name is required for 'publish' so shared publication is explicit.",
+                success=False,
+            )
+        target_namespace = "platform"
+        target = _find_skill(broker_name, "platform")
+    elif action == "rollback":
+        target_namespace = "platform"
+        target = None
+        broker_name = bare_name
+        if not str(transaction_id or "").strip():
+            return tool_error("transaction_id is required for 'rollback'.", success=False)
+    else:
+        target = None if action == "create" else _find_skill(bare_name, resolved_namespace)
+        target_namespace = (
+            resolved_namespace
+            or (target.get("namespace") if target else None)
+            or _default_create_namespace()
+        )
 
     # Action-level ACL (issue #12): map action -> permission and deny BEFORE any
     # mutation/filesystem write. create/update/delete are independent; delete is
     # never implied by update.
     blocked = _acl_manage_block(action, target_namespace)
     if blocked:
-        extra = (
-            {"error_code": "immutable_platform"}
-            if blocked == _IMMUTABLE_PLATFORM_DENY
-            else {}
-        )
-        return tool_error(blocked, success=False, **extra)
+        return tool_error(blocked, success=False)
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
     # (default) passes straight through. The gate is bypassed when this call is
     # itself replaying an already-approved staged write (_skill_apply_pending).
     gate_result = _apply_skill_write_gate(
-        action, bare_name, namespace=target_namespace,
+        action, bare_name,
+        namespace="user" if action == "publish" else target_namespace,
         content=content, category=category,
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
+        target_name=target_name, target_category=target_category,
+        transaction_id=transaction_id,
     )
     if gate_result is not None:
         return gate_result
 
-    if action == "create":
+    try:
+        from gateway.session_context import get_session_env
+
+        api_server_session = get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+    except Exception:
+        api_server_session = False
+
+    if target_namespace == "platform" and api_server_session:
+        arguments = {
+            "content": content,
+            "category": category,
+            "file_path": file_path,
+            "file_content": file_content,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all,
+            "absorbed_into": absorbed_into,
+            "transaction_id": transaction_id or broker_name,
+        }
+        if action == "publish":
+            from tools.shared_skill_writer import serialize_skill_tree
+
+            try:
+                arguments = {
+                    "category": target_category,
+                    "files": serialize_skill_tree(publish_source["path"]),
+                    "source_qualified_name": publish_source["qualified_name"],
+                }
+            except Exception as exc:
+                code = getattr(exc, "code", "invalid_publish_source")
+                return tool_error(str(exc), success=False, error_code=code)
+        try:
+            from tools.shared_skill_writer import (
+                SharedSkillWriterError,
+                request_shared_skill_mutation,
+            )
+
+            result = request_shared_skill_mutation(
+                action, broker_name, arguments=arguments
+            )
+        except SharedSkillWriterError as exc:
+            result = {"success": False, "error": str(exc), "error_code": exc.code}
+
+    elif action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(bare_name, content, category, target_namespace)
@@ -1370,7 +1451,13 @@ def skill_manage(
         result = _remove_file(bare_name, file_path, target_namespace)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {
+            "success": False,
+            "error": (
+                f"Unknown action '{action}'. Use: create, edit, patch, delete, "
+                "write_file, remove_file, publish, rollback"
+            ),
+        }
 
     if result.get("success"):
         try:
@@ -1385,20 +1472,21 @@ def skill_manage(
         # user-directed, and those skills belong to the user (the curator must
         # not touch them). Best-effort; telemetry failures never break the tool.
         usage_root = result.pop("_skills_root", None)
-        try:
-            from tools.skill_usage import bump_patch, forget, mark_agent_created
-            from tools.skill_usage import skill_usage_scope
-            from tools.skill_provenance import is_background_review
-            with skill_usage_scope(Path(usage_root) if usage_root else None):
-                if action == "create":
-                    if is_background_review():
-                        mark_agent_created(bare_name)
-                elif action in {"patch", "edit", "write_file", "remove_file"}:
-                    bump_patch(bare_name)
-                elif action == "delete":
-                    forget(bare_name)
-        except Exception:
-            pass
+        if target_namespace != "platform":
+            try:
+                from tools.skill_usage import bump_patch, forget, mark_agent_created
+                from tools.skill_usage import skill_usage_scope
+                from tools.skill_provenance import is_background_review
+                with skill_usage_scope(Path(usage_root) if usage_root else None):
+                    if action == "create":
+                        if is_background_review():
+                            mark_agent_created(bare_name)
+                    elif action in {"patch", "edit", "write_file", "remove_file"}:
+                        bump_patch(bare_name)
+                    elif action == "delete":
+                        forget(bare_name)
+            except Exception:
+                pass
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1410,16 +1498,17 @@ def skill_manage(
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
     "description": (
-        "Manage skills (create, update, delete). Skills are your procedural "
+        "Manage personal drafts and ACL-governed shared skills. Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
         "On OpenWebUI, new skills default to the caller's own functional "
         f"namespace under {display_hermes_home()}/user-skills/<user-id>/. "
-        f"CLI/non-API callers keep {display_hermes_home()}/skills/. Existing "
-        "platform skills retain their current ACL until the platform read-only increment.\n\n"
+        f"CLI/non-API callers keep {display_hermes_home()}/skills/. Explicit "
+        "platform actions use the authenticated isolated writer; raw file, terminal, "
+        "and local-code paths are not shared-skill authority.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
-        "delete, write_file, remove_file.\n\n"
+        "delete, write_file, remove_file, publish, rollback.\n\n"
         "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
         "pruning it with no forwarding target. This lets the curator tell "
@@ -1447,7 +1536,10 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": [
+                    "create", "patch", "edit", "delete", "write_file",
+                    "remove_file", "publish", "rollback",
+                ],
                 "description": "The action to perform."
             },
             "name": {
@@ -1462,8 +1554,8 @@ SKILL_MANAGE_SCHEMA = {
                 "enum": ["user", "platform"],
                 "description": (
                     "Optional target namespace. On OpenWebUI, create defaults to "
-                    "the caller's own user namespace. Existing platform skills "
-                    "keep their current ACL."
+                    "the caller's own user namespace. Platform mutations require "
+                    "KM group authority and use the isolated native writer."
                 ),
             },
             "content": {
@@ -1528,6 +1620,21 @@ SKILL_MANAGE_SCHEMA = {
                     "rewriting) will have to guess at intent."
                 )
             },
+            "target_name": {
+                "type": "string",
+                "description": (
+                    "Required for publish: explicit shared skill name. The personal "
+                    "source SKILL.md name must match it."
+                ),
+            },
+            "target_category": {
+                "type": "string",
+                "description": "Optional shared category for publish.",
+            },
+            "transaction_id": {
+                "type": "string",
+                "description": "Required for rollback: committed shared transaction ID.",
+            },
         },
         "required": ["action", "name"],
     },
@@ -1552,6 +1659,9 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
-        absorbed_into=args.get("absorbed_into")),
+        absorbed_into=args.get("absorbed_into"),
+        target_name=args.get("target_name"),
+        target_category=args.get("target_category"),
+        transaction_id=args.get("transaction_id")),
     emoji="📝",
 )

@@ -47,6 +47,40 @@ logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
+
+def _acl_local_vision_path_block(image_url: str) -> Optional[str]:
+    """Apply file ownership ACLs before vision reads a same-uid local path."""
+
+    if not isinstance(image_url, str) or not image_url.strip():
+        return None
+    parsed = urlparse(image_url)
+    if parsed.scheme.lower() in {"http", "https", "data"}:
+        return None
+    if parsed.scheme and parsed.scheme.lower() != "file":
+        return None
+    local_value = image_url[len("file://") :] if image_url.startswith("file://") else image_url
+    try:
+        from tools.file_tools import _acl_protected_path_block
+
+        return _acl_protected_path_block(local_value, mode="read")
+    except Exception:
+        # A local-file auxiliary tool must not become the fail-open path around
+        # an enabled api_server ACL. Non-api and ACL-disabled behavior is decided
+        # inside the shared guard.
+        try:
+            from gateway.session_context import get_session_env
+            from tools.skill_acl import load_skill_acl_config
+
+            if (
+                get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+                and load_skill_acl_config().get("enabled")
+            ):
+                return "Hermes skills ACL: local vision path could not be verified; denied."
+        except Exception:
+            return "Hermes skills ACL: local vision path could not be verified; denied."
+    return None
+
+
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
 # Resolution: config.yaml auxiliary.vision.download_timeout → env var → 30s default.
@@ -703,6 +737,9 @@ async def _vision_analyze_native(
     """
     if not isinstance(image_url, str) or not image_url.strip():
         return tool_error("image_url is required", success=False)
+    acl_denial = _acl_local_vision_path_block(image_url)
+    if acl_denial:
+        return tool_error(acl_denial, success=False)
 
     temp_image_path: Optional[Path] = None
     should_cleanup = False
@@ -837,6 +874,9 @@ async def vision_analyze_tool(
     """
     if not isinstance(user_prompt, str):
         user_prompt = str(user_prompt) if user_prompt is not None else ""
+    acl_denial = _acl_local_vision_path_block(image_url)
+    if acl_denial:
+        return tool_error(acl_denial, success=False)
     debug_call_data = {
         "parameters": {
             "image_url": image_url,
@@ -1363,6 +1403,10 @@ async def video_analyze_tool(
         from tools.interrupt import is_interrupted
         if is_interrupted():
             return tool_error("Interrupted", success=False)
+
+        acl_denial = _acl_local_vision_path_block(video_url)
+        if acl_denial:
+            return tool_error(acl_denial, success=False)
 
         logger.info("Analyzing video: %s", video_url[:60])
         logger.info("User prompt: %s", user_prompt[:100])

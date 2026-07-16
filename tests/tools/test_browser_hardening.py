@@ -1,6 +1,7 @@
 """Tests for browser_tool.py hardening: caching, security, thread safety, truncation."""
 
 import inspect
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -178,6 +179,38 @@ class TestUrlDecodedSecretCheck:
         result = json.loads(browser_navigate(url, task_id="test"))
         assert result["success"] is False
         assert "API key" in result["error"] or "Blocked" in result["error"]
+
+
+class TestNavigationSchemeBoundary:
+    """The web browser must never become a same-uid local-file reader."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///home/hermes/user-skills/other-user/private/SKILL.md",
+            "file:///run/secrets/hermes_skill_writer_key",
+            "javascript:document.body.innerText='local'",
+            "data:text/plain,local",
+        ],
+    )
+    def test_navigate_rejects_non_http_schemes_before_browser_launch(
+        self, monkeypatch, url
+    ):
+        import tools.browser_tool as browser_tool
+
+        launched = False
+
+        def _unexpected_launch(*_args, **_kwargs):
+            nonlocal launched
+            launched = True
+            return {"success": True}
+
+        monkeypatch.setattr(browser_tool, "_run_browser_command", _unexpected_launch)
+        result = json.loads(browser_tool.browser_navigate(url, task_id="scheme-boundary"))
+
+        assert result["success"] is False
+        assert result["error_code"] == "unsupported_url_scheme"
+        assert launched is False
 
 
 # ---------------------------------------------------------------------------

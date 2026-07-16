@@ -789,15 +789,101 @@ _ACL_PROTECTED_READ_DENY = (
     "read permission for the current OpenWebUI role/group scope; denied."
 )
 _ACL_PROTECTED_WRITE_DENY = (
-    "Hermes skills ACL: writing under a protected skills path requires the "
-    "matching skill create/update/delete permission for the current OpenWebUI "
-    "role/group scope; denied."
+    "Hermes skills ACL: raw writes under protected skills paths are denied; "
+    "use trusted native skill_manage with an explicit namespace."
 )
-_PLATFORM_IMMUTABLE_WRITE_DENY = (
-    "Platform skills are read-only in chat/agent contexts; use the "
-    "out-of-band platform-skills operator workflow."
+_ACL_RAW_FILE_WRITE_DENY = (
+    "Hermes skills ACL: raw file writes are unavailable on the multi-user "
+    "api_server; use trusted native skill_manage for skill mutations or a "
+    "purpose-built tool for generated artifacts."
 )
-_VALID_ACL_FILE_PERMISSIONS = frozenset({"read", "create", "update", "delete"})
+
+
+def _acl_raw_file_write_block() -> str | None:
+    """Deny every raw file mutation on the ACL-enabled multi-user surface.
+
+    Skill Editor/Admin authority governs the shared library only through the
+    native ``skill_manage`` contract; it is not shell or generic filesystem
+    authority. This runtime gate backs up schema minimization so an
+    unadvertised/direct dispatch of ``write_file`` or ``patch`` cannot persist
+    same-UID code and bypass the isolated writer's authenticated boundary.
+
+    Local CLI/cron surfaces and ACL-disabled deployments retain their existing
+    file-write behavior. Once the surface is known to be ``api_server``, ACL
+    configuration errors fail closed.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return None
+    except Exception:
+        return None
+    try:
+        from tools.skill_acl import load_skill_acl_config
+
+        if not load_skill_acl_config().get("enabled"):
+            return None
+    except Exception:
+        logger.warning(
+            "skills_acl_raw_file_write_denied platform=api_server "
+            "reason=acl_config_unavailable"
+        )
+        return _ACL_RAW_FILE_WRITE_DENY
+    logger.warning(
+        "skills_acl_raw_file_write_denied platform=api_server reason=acl_enabled"
+    )
+    return _ACL_RAW_FILE_WRITE_DENY
+
+
+def _path_is_at_or_under(target: Path, root: Path) -> bool:
+    """Return True when *target* is *root* or a descendant of *root*."""
+    return target == root or root in target.parents
+
+
+def _acl_builtin_skill_path_scope(target: Path) -> str | None:
+    """Classify built-in skill roots for api_server ACL decisions.
+
+    Returns one of:
+    - ``platform``: shared platform skill library
+    - ``own_user``: current OpenWebUI caller's own user namespace
+    - ``other_user``: the user-skills base itself or a sibling user's namespace
+    - ``writer_control``: isolated-writer socket or authentication material
+    - ``None``: not a built-in skill root path
+
+    The classification is intentionally ownership-aware for ``user-skills``.
+    Generic ``read``/``update`` permission must never reveal or mutate sibling
+    user roots.
+    """
+    from agent.skill_namespaces import (
+        get_current_user_skills_dir,
+        get_user_skills_base_dir,
+    )
+    from tools.shared_skill_writer import writer_secret_path, writer_socket_path
+    from tools.skill_state import platform_skills_dir
+
+    writer_socket_root = writer_socket_path().resolve().parent
+    writer_secret = writer_secret_path().resolve()
+    if _path_is_at_or_under(target, writer_socket_root) or target == writer_secret:
+        return "writer_control"
+
+    platform_root = platform_skills_dir().resolve()
+    if _path_is_at_or_under(target, platform_root):
+        return "platform"
+
+    user_base = get_user_skills_base_dir().resolve()
+    if not _path_is_at_or_under(target, user_base):
+        return None
+
+    current_user_dir = get_current_user_skills_dir()
+    if current_user_dir is not None:
+        try:
+            own_root = current_user_dir.resolve()
+            if _path_is_at_or_under(target, own_root):
+                return "own_user"
+        except OSError:
+            pass
+    return "other_user"
 
 
 def _acl_protected_path_block(
@@ -809,13 +895,17 @@ def _acl_protected_path_block(
     """Return a non-leaky denial if a file *mode* op on *path* would bypass the
     skill ACL by touching a protected skills directory, else ``None`` (allow).
 
-    *mode* is ``"read"`` (requires skill read permission) or ``"write"``. Write
-    callers should pass the concrete ACL *permission* they need (``create``,
-    ``update``, or ``delete``). If omitted, write defaults to ``create`` for a
-    missing target and ``update`` for an existing target. This keeps ``delete``
-    independent from ``update`` instead of treating every write-capable operation
-    as a single broad "manage" bypass. **api_server-platform only** — CLI/cron/chat
-    are the trusted owner / gated elsewhere and exempt. ACL disabled => allow.
+    *mode* is ``"read"`` (requires skill read permission for shared/protected
+    roots) or ``"write"``. Raw writes to protected skill roots are never
+    authorized by shared create/update/delete grants; callers must use the
+    trusted native ``skill_manage`` API, which preserves action-level ACLs and
+    delete independence. ``permission`` remains a compatibility argument for
+    existing file-tool callers but cannot authorize a protected raw write.
+    **api_server-platform only** — CLI/cron/chat are the trusted owner / gated
+    elsewhere and exempt. The concrete platform root remains write-protected even
+    when ACL is disabled. User namespaces are always ownership-aware: own user
+    reads are allowed, sibling user roots are hidden, and raw writes are denied.
+    Other configured protected roots use legacy behavior when ACL is disabled.
     When ACL is ENABLED on api_server, any resolution error **fails CLOSED**.
     ``..``/symlink traversal is neutralised via ``Path.resolve()``. The reason
     reveals no skill names/contents.
@@ -833,18 +923,20 @@ def _acl_protected_path_block(
     try:
         from tools.skill_acl import load_skill_acl_config, resolve_skill_permissions
         from gateway.session_context import get_session_env
-        from tools.skill_state import platform_skills_dir
 
         try:
             target = Path(_resolve_path_for_task(path, task_id))
         except Exception:
             target = Path(os.path.expanduser(str(path)))
         target = target.resolve()
-        platform_root = platform_skills_dir().resolve()
-        if mode != "read" and (
-            target == platform_root or platform_root in target.parents
-        ):
-            return _PLATFORM_IMMUTABLE_WRITE_DENY
+
+        builtin_scope = _acl_builtin_skill_path_scope(target)
+        if builtin_scope in {"other_user", "writer_control"}:
+            return deny
+        if builtin_scope == "own_user":
+            return None if mode == "read" else _ACL_PROTECTED_WRITE_DENY
+        if builtin_scope == "platform" and mode != "read":
+            return _ACL_PROTECTED_WRITE_DENY
 
         cfg = load_skill_acl_config()
         if not cfg.get("enabled"):
@@ -860,81 +952,66 @@ def _acl_protected_path_block(
                 root_p = Path(os.path.expanduser(str(root))).resolve()
             except Exception:
                 continue
-            if target == root_p or root_p in target.parents:
+            if _path_is_at_or_under(target, root_p):
                 under = True
                 break
         if not under:
             return None  # not a protected path -> normal file op
+        if mode != "read":
+            return _ACL_PROTECTED_WRITE_DENY
         role = get_session_env("HERMES_SESSION_USER_ROLE", "")
         groups = get_session_env("HERMES_SESSION_USER_GROUPS", "")
         perms = resolve_skill_permissions(role, groups, cfg)
-        if mode == "read":
-            needed = "read"
-        else:
-            needed = (permission or "").strip().lower()
-            if needed not in _VALID_ACL_FILE_PERMISSIONS or needed == "read":
-                needed = "update" if target.exists() else "create"
-        if needed in perms:
+        if "read" in perms:
             return None  # caller is permitted for this protected-path op
         return deny
     except Exception:
         return deny  # fail closed
 
 
-# Locally-launched code-exec MCP servers: they run a subprocess with hermes-
-# container filesystem access and a caller-supplied working directory (e.g.
-# ``opencode_runner`` runs ``opencode`` in an arbitrary ``cwd``). They are NOT
-# members of ``_ACL_MANAGED_TOOLSET_KEYS``, so ``_apply_skill_acl_toolset_
-# minimization`` never withholds them — an api_server caller lacking skill perms
-# could otherwise point one at a protected skills path to read/mutate skills,
-# bypassing the skills ACL (#13 code-exec extension). REMOTE MCP servers (e.g.
-# ``soc_v2``) run in their own container and cannot reach a hermes ``protect_path``,
-# so they are intentionally NOT guarded here (keeps SOCv2 working normally).
+# Locally-launched code-exec MCP servers run a subprocess with gateway filesystem
+# access. Cwd inspection is not isolation because subprocesses can use absolute
+# paths. Remote MCP servers run in their own container and are not listed here.
 _ACL_GUARDED_CODE_EXEC_MCP_SERVERS = frozenset({"opencode_runner"})
-# Argument keys a code-exec MCP tool may use to name a working dir / target path.
-_ACL_MCP_PATH_ARG_KEYS = (
-    "cwd", "path", "directory", "working_dir", "workdir", "dir", "root",
-)
 
 
 def _acl_guard_code_exec_mcp_call(server_name, args, task_id: str = "default"):
-    """Return a non-leaky denial if a code-exec MCP call would operate under a
-    protected skills path without the required skill permission, else ``None``.
+    """Deny local arbitrary-code MCP on the multi-user ACL surface.
 
-    Only servers in :data:`_ACL_GUARDED_CODE_EXEC_MCP_SERVERS` are checked; every
-    path-like argument is tested via :func:`_acl_protected_path_block` (which is
-    api_server-only, ACL-disabled => allow, ``..``/symlink resolved, and
-    fail-closed). Running under a ``protect_path`` requires ``delete`` permission,
-    because arbitrary code can delete/rewrite skills — so only a full skill-admin
-    may operate there, mirroring the ``terminal`` toolset restriction. Legit
-    non-protected working dirs (e.g. ``/tmp``, ``/home/hermes/workspace``) and
-    non-guarded / remote MCP servers are unaffected.
+    A cwd-only check cannot constrain absolute-path access by a subprocess. When
+    the skills ACL is enabled for ``api_server``, every locally launched server in
+    :data:`_ACL_GUARDED_CODE_EXEC_MCP_SERVERS` is therefore denied regardless of
+    its cwd. Remote isolated MCP servers (notably ``soc_v2``) remain unaffected.
+    ACL-disabled and non-api_server surfaces preserve legacy behavior.
     """
     if server_name not in _ACL_GUARDED_CODE_EXEC_MCP_SERVERS:
         return None
-    if not isinstance(args, dict):
-        return None
-    for key in _ACL_MCP_PATH_ARG_KEYS:
-        val = args.get(key)
-        if isinstance(val, str) and val.strip():
-            denial = _acl_protected_path_block(
-                val, mode="write", task_id=task_id, permission="delete"
-            )
-            if denial:
-                return denial
-    return None
+    try:
+        from gateway.session_context import get_session_env
+        from tools.skill_acl import load_skill_acl_config
 
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return None
+        if not load_skill_acl_config().get("enabled"):
+            return None
+    except Exception:
+        return _ACL_PROTECTED_WRITE_DENY
+    if not isinstance(args, dict):
+        return _ACL_PROTECTED_WRITE_DENY
+    return (
+        "Hermes skills ACL: local arbitrary-code MCP is unavailable on the "
+        "multi-user api_server surface; use trusted native tools."
+    )
 
 def _acl_filter_search_result(result, task_id: str = "default"):
-    """Exclude search matches/files/counts under a protected skills path when the
-    api_server caller lacks skill READ permission (#13 search read-bypass closure).
+    """Exclude search matches/files/counts under protected or sibling skill roots.
 
     Per-RESULT filtering (not just the search root) so legitimate non-protected
-    matches still return while protected paths AND their content/snippets are
+    matches still return while hidden paths AND their content/snippets are
     withheld; ``total_count`` is recomputed so hidden matches are not implied.
-    api_server-platform only; ACL disabled => unchanged; **fail-CLOSED** (drop all
-    results) on resolution error when enabled+api_server. Callers WITH read
-    permission are unaffected (they may read protected skills).
+    api_server-platform only; ACL disabled leaves shared/configured roots
+    unchanged, but sibling ``user-skills`` roots remain hidden. Resolution errors
+    while api_server+enabled fail CLOSED by dropping all results.
     """
     if result is None:
         return result
@@ -962,12 +1039,12 @@ def _acl_filter_search_result(result, task_id: str = "default"):
         from gateway.session_context import get_session_env
 
         cfg = load_skill_acl_config()
-        if not cfg.get("enabled"):
-            return result
-        role = get_session_env("HERMES_SESSION_USER_ROLE", "")
-        groups = get_session_env("HERMES_SESSION_USER_GROUPS", "")
-        if "read" in resolve_skill_permissions(role, groups, cfg):
-            return result  # caller may read protected skills -> no filtering
+        acl_enabled = bool(cfg.get("enabled"))
+        shared_read_allowed = True
+        if acl_enabled:
+            role = get_session_env("HERMES_SESSION_USER_ROLE", "")
+            groups = get_session_env("HERMES_SESSION_USER_GROUPS", "")
+            shared_read_allowed = "read" in resolve_skill_permissions(role, groups, cfg)
         protect = list(cfg.get("protect_paths") or [])
         if not protect:
             from hermes_constants import get_hermes_home
@@ -980,28 +1057,35 @@ def _acl_filter_search_result(result, task_id: str = "default"):
             except Exception:
                 continue
     except Exception:
-        return _blank(result)  # enabled+api_server but unresolvable -> fail closed
+        return _blank(result)  # api_server but unresolvable -> fail closed
 
-    def _protected(p) -> bool:
+    def _hidden(p) -> bool:
         try:
             tp = Path(_resolve_path_for_task(p, task_id)).resolve()
         except Exception:
             try:
                 tp = Path(os.path.expanduser(str(p))).resolve()
             except Exception:
-                return True  # unresolvable -> treat as protected (fail closed)
+                return True  # unresolvable -> treat as hidden (fail closed)
+        scope = _acl_builtin_skill_path_scope(tp)
+        if scope in {"other_user", "writer_control"}:
+            return True
+        if scope == "own_user":
+            return False
+        if scope == "platform":
+            return not shared_read_allowed
         for root in roots:
-            if tp == root or root in tp.parents:
-                return True
+            if _path_is_at_or_under(tp, root):
+                return not shared_read_allowed
         return False
 
     try:
         if getattr(result, "matches", None):
-            result.matches = [m for m in result.matches if not _protected(m.path)]
+            result.matches = [m for m in result.matches if not _hidden(m.path)]
         if getattr(result, "files", None):
-            result.files = [f for f in result.files if not _protected(f)]
+            result.files = [f for f in result.files if not _hidden(f)]
         if getattr(result, "counts", None):
-            result.counts = {k: v for k, v in result.counts.items() if not _protected(k)}
+            result.counts = {k: v for k, v in result.counts.items() if not _hidden(k)}
         result.total_count = (
             len(getattr(result, "matches", []) or [])
             + len(getattr(result, "files", []) or [])
@@ -1432,6 +1516,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    raw_write_err = _acl_raw_file_write_block()
+    if raw_write_err:
+        return tool_error(raw_write_err)
     # Skill ACL (#13): block writing protected skill files without manage perm.
     acl_err = _acl_protected_path_block(path, mode="write", task_id=task_id)
     if acl_err:
@@ -1562,6 +1649,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    raw_write_err = _acl_raw_file_write_block()
+    if raw_write_err:
+        return tool_error(raw_write_err)
     # Skill ACL (#13): block patching protected skill files without the concrete
     # permission for the requested operation. Update/Add/Delete/Move are kept
     # distinct so update never implies delete and delete never implies update.
