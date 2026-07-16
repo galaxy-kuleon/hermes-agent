@@ -138,6 +138,17 @@ def _containing_skills_root(skill_path: Path) -> Path:
     return SKILLS_DIR
 
 
+def _namespace_relative(path: Path, root: Path) -> str:
+    """Render a skill path relative to its namespace root so tool results never
+    echo the absolute filesystem layout (e.g. ``/home/hermes/user-skills/<uid>/``)
+    back to the caller. Falls back to the leaf name if ``path`` is not under
+    ``root`` (defensive — constructed paths always are)."""
+    try:
+        return str(path.relative_to(root))
+    except (ValueError, TypeError):
+        return path.name
+
+
 def _is_path_redirect(path: Path) -> bool:
     """True when ``path`` is a symlink or (on Windows) a directory junction.
 
@@ -752,7 +763,7 @@ def _create_skill(
         "success": True,
         "message": f"Skill '{bare_name}' created.",
         "path": str(skill_dir.relative_to(root.path)),
-        "skill_md": str(skill_md),
+        "skill_md": _namespace_relative(skill_md, root.path),
         "namespace": root.namespace,
         "_skills_root": str(root.path),
         "_change": {"description": _desc},
@@ -809,7 +820,7 @@ def _edit_skill(
     return {
         "success": True,
         "message": f"Skill '{name}' updated (full rewrite).",
-        "path": str(existing["path"]),
+        "path": _namespace_relative(existing["path"], existing["root"]),
         "namespace": existing["namespace"],
         "qualified_name": existing["qualified_name"],
         "_skills_root": str(existing["root"]),
@@ -1044,7 +1055,7 @@ def _write_file(
     return {
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
-        "path": str(target),
+        "path": _namespace_relative(target, existing["root"]),
         "namespace": existing["namespace"],
         "qualified_name": existing["qualified_name"],
         "_skills_root": str(existing["root"]),
