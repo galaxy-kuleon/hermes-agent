@@ -94,11 +94,195 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+TOOL_PROGRESS_SSE_LINE_MAX_BYTES = 65_536
+# Two 2 KiB previews leave headroom for worst-case quote HTML-entity expansion,
+# outer JSON escaping, lifecycle metadata, and the completion wrapper.
+TOOL_PROGRESS_VALUE_PREVIEW_MAX_BYTES = 2_048
+TOOL_PROGRESS_SSE_DATA_PREFIX = b"data: "
 HANDOFF_DIR = Path(os.environ.get("SKIP_RAG_HANDOFF_DIR", "/handoff")).resolve()
 HANDOFF_SIGNING_KEY = os.environ.get(
     "SKIP_RAG_HANDOFF_SIGNING_KEY",
     os.environ.get("OPENWEBUI_BRIDGE_API_KEY", ""),
 )
+
+
+def _json_safe_tool_progress_value(value: Any) -> tuple[Any, str, bool]:
+    """Return a JSON-native value, canonical text, and coercion indicator."""
+    if isinstance(value, str):
+        return value, value, False
+    try:
+        text = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        return json.loads(text), text, False
+    except (TypeError, ValueError):
+        try:
+            text = json.dumps(
+                value,
+                ensure_ascii=False,
+                default=str,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            return json.loads(text), text, True
+        except Exception:
+            # A hostile __str__ must not abort the assistant stream. Type is
+            # diagnostic enough; repr(value) may contain document content.
+            text = f"<unserializable {type(value).__name__}>"
+            return text, text, True
+    except Exception:
+        # A hostile __str__ must not abort the assistant stream. Type is
+        # diagnostic enough; repr(value) may contain document content.
+        text = f"<unserializable {type(value).__name__}>"
+        return text, text, True
+
+
+def _truncate_utf8_bytes(text: str, max_bytes: int) -> str:
+    """Truncate text without emitting an invalid partial UTF-8 code point."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _bound_tool_progress_field(field: str, value: Any) -> tuple[Any, Dict[str, Any]]:
+    """Build one JSON-safe transport field with explicit truncation metadata."""
+    safe_value, original_text, json_coerced = _json_safe_tool_progress_value(value)
+    original_bytes = original_text.encode("utf-8")
+    metadata: Dict[str, Any] = {}
+    if json_coerced:
+        metadata.update({
+            f"{field}JsonCoerced": True,
+            f"{field}OriginalChars": len(original_text),
+            f"{field}OriginalUtf8Bytes": len(original_bytes),
+        })
+    if len(original_bytes) <= TOOL_PROGRESS_VALUE_PREVIEW_MAX_BYTES:
+        return safe_value, metadata
+
+    preview = _truncate_utf8_bytes(
+        original_text,
+        TOOL_PROGRESS_VALUE_PREVIEW_MAX_BYTES,
+    )
+    metadata.update({
+        f"{field}Truncated": True,
+        f"{field}OriginalChars": len(original_text),
+        f"{field}OriginalUtf8Bytes": len(original_bytes),
+    })
+    return preview, metadata
+
+
+def _bounded_tool_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy and bound document-bearing fields without mutating agent values."""
+    bounded = dict(payload)
+    for field in ("arguments", "result"):
+        if field not in bounded:
+            continue
+        bounded_value, metadata = _bound_tool_progress_field(field, bounded[field])
+        bounded[field] = bounded_value
+        bounded.update(metadata)
+        if metadata:
+            logger.info(
+                "tool_progress_payload_normalized tool=%s status=%s field=%s "
+                "truncated=%s json_coerced=%s original_chars=%d "
+                "original_utf8_bytes=%d preview_max_bytes=%d",
+                bounded.get("tool", ""),
+                bounded.get("status", ""),
+                field,
+                bool(metadata.get(f"{field}Truncated")),
+                bool(metadata.get(f"{field}JsonCoerced")),
+                metadata[f"{field}OriginalChars"],
+                metadata[f"{field}OriginalUtf8Bytes"],
+                TOOL_PROGRESS_VALUE_PREVIEW_MAX_BYTES,
+            )
+    return bounded
+
+
+def _minimal_tool_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Retain lifecycle correlation when the normal bounded event is still large."""
+    tool = str(payload.get("tool", ""))
+    tool_bytes = tool.encode("utf-8")
+    bounded_tool = _truncate_utf8_bytes(
+        tool,
+        TOOL_PROGRESS_VALUE_PREVIEW_MAX_BYTES,
+    )
+    fallback: Dict[str, Any] = {
+        "tool": bounded_tool,
+        "toolCallId": str(payload.get("toolCallId", "")),
+        "status": str(payload.get("status", "")),
+        "transportTruncated": True,
+    }
+    if (
+        payload.get("toolTruncated")
+        or len(tool_bytes) > TOOL_PROGRESS_VALUE_PREVIEW_MAX_BYTES
+    ):
+        fallback.update({
+            "toolTruncated": True,
+            "toolOriginalChars": payload.get("toolOriginalChars", len(tool)),
+            "toolOriginalUtf8Bytes": payload.get(
+                "toolOriginalUtf8Bytes",
+                len(tool_bytes),
+            ),
+        })
+    for field in ("arguments", "result"):
+        if field not in payload:
+            continue
+        _, bounded_text, _ = _json_safe_tool_progress_value(payload[field])
+        fallback[f"{field}Truncated"] = True
+        fallback[f"{field}OriginalChars"] = payload.get(
+            f"{field}OriginalChars",
+            len(bounded_text),
+        )
+        fallback[f"{field}OriginalUtf8Bytes"] = payload.get(
+            f"{field}OriginalUtf8Bytes",
+            len(bounded_text.encode("utf-8")),
+        )
+        if payload.get(f"{field}JsonCoerced"):
+            fallback[f"{field}JsonCoerced"] = True
+    return fallback
+
+
+def _serialize_tool_progress_payload(
+    payload: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    """Serialize and return the exact bounded payload written to the wire."""
+    event_data = json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+        allow_nan=False,
+    )
+    line_bytes = len(TOOL_PROGRESS_SSE_DATA_PREFIX) + len(event_data.encode("utf-8"))
+    if line_bytes <= TOOL_PROGRESS_SSE_LINE_MAX_BYTES:
+        return event_data, payload
+
+    fallback = _minimal_tool_progress_payload(payload)
+    fallback_data = json.dumps(
+        fallback,
+        ensure_ascii=False,
+        default=str,
+        allow_nan=False,
+    )
+    fallback_line_bytes = (
+        len(TOOL_PROGRESS_SSE_DATA_PREFIX)
+        + len(fallback_data.encode("utf-8"))
+    )
+    if fallback_line_bytes > TOOL_PROGRESS_SSE_LINE_MAX_BYTES:
+        # Provider tool-call IDs are short correlation tokens. Refuse an
+        # impossible oversized identity rather than writing an invalid line.
+        raise ValueError("minimal tool-progress lifecycle payload exceeds SSE limit")
+
+    logger.warning(
+        "tool_progress_event_fallback tool=%s status=%s "
+        "serialized_bytes=%d limit_bytes=%d",
+        "<truncated>" if fallback.get("toolTruncated") else fallback["tool"],
+        fallback["status"],
+        line_bytes,
+        TOOL_PROGRESS_SSE_LINE_MAX_BYTES,
+    )
+    return fallback_data, fallback
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -2714,14 +2898,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                payload = _bounded_tool_progress_payload({
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
                     "arguments": function_args,
-                }))
+                })
+                _stream_q.put(("__tool_progress__", payload))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -2733,13 +2918,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
+                payload = _bounded_tool_progress_payload({
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
                     "arguments": function_args,
                     "result": function_result,
-                }))
+                })
+                _stream_q.put(("__tool_progress__", payload))
 
             def _on_reasoning(text):
                 """Forward incremental reasoning/thinking text to the SSE stream
@@ -2961,7 +3147,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # block (open-webui middleware.py:4117-4150).
             _owui_state = {"reasoning_open": False}
             import html as _html_mod
-            _MAX_TOOL_RESULT_LEN = 4096
 
             def _render_tool_call_html(payload: Dict[str, Any]) -> str:
                 """Build a ``<details type="tool_calls">`` block matching the
@@ -2973,8 +3158,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 call_id = payload.get("toolCallId", "") or ""
                 status = payload.get("status", "")
                 args = payload.get("arguments")
-                args_str = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
-                args_attr = _html_mod.escape(json.dumps(args_str))
+                args_str = (
+                    args if isinstance(args, str)
+                    else json.dumps(
+                        args or {},
+                        ensure_ascii=False,
+                        default=str,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                )
+                args_attr = _html_mod.escape(
+                    json.dumps(args_str, ensure_ascii=False, allow_nan=False)
+                )
 
                 if status == "running":
                     return (
@@ -2990,14 +3186,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 raw_result = payload.get("result", "")
                 result_str = (
                     raw_result if isinstance(raw_result, str)
-                    else json.dumps(raw_result, ensure_ascii=False, default=str)
-                )
-                if len(result_str) > _MAX_TOOL_RESULT_LEN:
-                    result_str = (
-                        result_str[:_MAX_TOOL_RESULT_LEN]
-                        + f"\n…[truncated, full output is {len(result_str)} chars]"
+                    else json.dumps(
+                        raw_result,
+                        ensure_ascii=False,
+                        default=str,
+                        allow_nan=False,
+                        separators=(",", ":"),
                     )
-                result_body = _html_mod.escape(json.dumps(result_str, ensure_ascii=False))
+                )
+                if payload.get("resultTruncated"):
+                    original_chars = payload.get("resultOriginalChars")
+                    if isinstance(original_chars, int) and not isinstance(
+                        original_chars,
+                        bool,
+                    ):
+                        result_str += (
+                            "\n…[truncated, full output is "
+                            f"{original_chars} chars]"
+                        )
+                    else:
+                        result_str += "\n…[truncated output]"
+                result_body = _html_mod.escape(
+                    json.dumps(
+                        result_str,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                )
                 return (
                     f'\n<details type="tool_calls" done="true" '
                     f'id="{_html_mod.escape(call_id)}" '
@@ -3006,14 +3221,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     f'<summary>Tool Executed</summary>\n{result_body}\n</details>\n'
                 )
 
-            async def _write_content_delta(text: str) -> None:
-                """Send ``text`` as a standard OpenAI ``delta.content`` chunk."""
+            def _encode_content_delta(text: str) -> bytes:
+                """Encode the exact OpenAI ``delta.content`` bytes to be written."""
                 content_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                 }
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                return (
+                    f"data: {json.dumps(content_chunk, ensure_ascii=False, default=str, allow_nan=False)}\n\n".encode()
+                )
+
+            async def _write_content_delta(text: str) -> None:
+                """Send ``text`` using the shared checked content encoder."""
+                await response.write(_encode_content_delta(text))
+
+            def _encode_tool_progress_event(event_data: str) -> bytes:
+                return (
+                    f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                )
+
+            def _max_physical_line_bytes(encoded_event: bytes) -> int:
+                return max(
+                    (len(line) for line in encoded_event.splitlines()),
+                    default=0,
+                )
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
@@ -3039,10 +3271,68 @@ class APIServerAdapter(BasePlatformAdapter):
                     # (a) legacy custom event for native clients — fires
                     # on BOTH running and completed so native UIs (TUI,
                     # ACP) can show live tool start.
-                    event_data = json.dumps(payload)
-                    await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
-                    )
+                    event_data, wire_payload = _serialize_tool_progress_payload(payload)
+                    custom_event_bytes = _encode_tool_progress_event(event_data)
+                    html_event_bytes = None
+
+                    if wire_payload.get("status") == "completed":
+                        html_event_bytes = _encode_content_delta(
+                            _render_tool_call_html(wire_payload)
+                        )
+                        html_line_bytes = _max_physical_line_bytes(html_event_bytes)
+                        if html_line_bytes > TOOL_PROGRESS_SSE_LINE_MAX_BYTES:
+                            custom_line_bytes = _max_physical_line_bytes(
+                                custom_event_bytes
+                            )
+                            minimal_payload = _minimal_tool_progress_payload(
+                                wire_payload
+                            )
+                            fallback_data, fallback_wire_payload = (
+                                _serialize_tool_progress_payload(minimal_payload)
+                            )
+                            fallback_custom_event_bytes = (
+                                _encode_tool_progress_event(fallback_data)
+                            )
+                            fallback_html_event_bytes = _encode_content_delta(
+                                _render_tool_call_html(fallback_wire_payload)
+                            )
+                            fallback_custom_line_bytes = (
+                                _max_physical_line_bytes(
+                                    fallback_custom_event_bytes
+                                )
+                            )
+                            fallback_html_line_bytes = _max_physical_line_bytes(
+                                fallback_html_event_bytes
+                            )
+                            if (
+                                fallback_custom_line_bytes
+                                > TOOL_PROGRESS_SSE_LINE_MAX_BYTES
+                                or fallback_html_line_bytes
+                                > TOOL_PROGRESS_SSE_LINE_MAX_BYTES
+                            ):
+                                raise ValueError(
+                                    "minimal completed tool-progress lifecycle "
+                                    "payload exceeds SSE limit"
+                                )
+                            logger.warning(
+                                "tool_progress_html_fallback status=%s "
+                                "custom_line_bytes=%d html_line_bytes=%d "
+                                "fallback_custom_line_bytes=%d "
+                                "fallback_html_line_bytes=%d limit_bytes=%d",
+                                fallback_wire_payload.get("status", ""),
+                                custom_line_bytes,
+                                html_line_bytes,
+                                fallback_custom_line_bytes,
+                                fallback_html_line_bytes,
+                                TOOL_PROGRESS_SSE_LINE_MAX_BYTES,
+                            )
+                            wire_payload = fallback_wire_payload
+                            custom_event_bytes = fallback_custom_event_bytes
+                            html_event_bytes = fallback_html_event_bytes
+
+                    # Completed custom + HTML bytes are chosen together above;
+                    # never write the normal custom event before the HTML gate.
+                    await response.write(custom_event_bytes)
                     # (b) inline HTML for OpenWebUI — fires ONLY on
                     # ``completed``.  We deliberately skip the running
                     # placeholder: OpenWebUI's marked-extension snapshots
@@ -3055,12 +3345,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``done="true"`` block per tool gives a clean
                     # checkmark + result, matching the pattern Claude
                     # Desktop and the OpenAI Responses-API path use.
-                    if payload.get("status") == "completed":
+                    if wire_payload.get("status") == "completed":
                         # Any non-empty content delta implicitly closes
                         # a streaming reasoning block on OpenWebUI's
                         # side (middleware.py:4153-4179).
                         _owui_state["reasoning_open"] = False
-                        await _write_content_delta(_render_tool_call_html(payload))
+                        assert html_event_bytes is not None
+                        await response.write(html_event_bytes)
                 elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__reasoning_delta__":
                     text = item[1]
                     chunk = {
