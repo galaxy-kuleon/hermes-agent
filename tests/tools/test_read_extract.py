@@ -15,6 +15,7 @@ import os
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 
 from tools.read_extract import (
     ExtractionError,
@@ -64,11 +65,55 @@ class TestIsExtractable(unittest.TestCase):
         self.assertTrue(is_extractable_document("a.ipynb"))
         self.assertTrue(is_extractable_document("/x/B.DOCX"))
         self.assertTrue(is_extractable_document("report.xlsx"))
+        self.assertTrue(is_extractable_document("a.pdf"))
+        self.assertTrue(is_extractable_document("/synthetic/REPORT.PDF"))
 
     def test_unrecognized_extensions(self):
         self.assertFalse(is_extractable_document("a.py"))
-        self.assertFalse(is_extractable_document("a.pdf"))
         self.assertFalse(is_extractable_document("a.txt"))
+
+
+# ---------------------------------------------------------------------------
+# PDF dispatch / failure contract
+# ---------------------------------------------------------------------------
+
+class TestPdfExtraction(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rex_pdf_")
+        self.path = os.path.join(self.tmp, "synthetic.PDF")
+        with open(self.path, "wb") as fh:
+            fh.write(b"%PDF-1.4\nsynthetic test bytes only\n\x00\xff")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_pdf_dispatches_to_pdf_extract_with_synthetic_path(self):
+        with patch(
+            "tools.pdf_extract.extract_pdf_text",
+            return_value="Synthetic PDF text\n",
+        ) as extract_pdf_text:
+            self.assertEqual(
+                extract_document_text(self.path),
+                "Synthetic PDF text\n",
+            )
+        extract_pdf_text.assert_called_once_with(self.path)
+
+    def test_pdf_error_propagates_then_read_file_falls_back_to_normal_read(self):
+        with patch(
+            "tools.pdf_extract.extract_pdf_text",
+            side_effect=ExtractionError("synthetic extractor failure"),
+        ):
+            with self.assertRaisesRegex(
+                ExtractionError,
+                "synthetic extractor failure",
+            ):
+                extract_document_text(self.path)
+
+            result = json.loads(read_file_tool(self.path))
+
+        self.assertNotIn("extracted_document", result)
+        self.assertIn("%PDF-1.4", result["content"])
 
 
 # ---------------------------------------------------------------------------
