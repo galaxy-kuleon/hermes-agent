@@ -247,6 +247,18 @@ async def test_runs_api_handoff_input_becomes_path_only_metadata(monkeypatch, tm
             task_id=None,
         ):
             captured["user_message"] = user_message
+            from tools.file_grants import file_grant_error
+
+            captured["grant_error"] = file_grant_error(
+                str(original),
+                task_id=task_id,
+                operation="read",
+            )
+            captured["ungranted_error"] = file_grant_error(
+                str(original.with_name("other.pdf")),
+                task_id=task_id,
+                operation="read",
+            )
             return {"final_response": "ok"}
 
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -290,3 +302,47 @@ async def test_runs_api_handoff_input_becomes_path_only_metadata(monkeypatch, tm
     assert '<attached_files source="openwebui-skip-rag-handoff">' in user_message
     assert f'<file original="{original}"/>' in user_message
     assert 'markdown="' not in user_message
+    assert captured["grant_error"] is None
+    assert "not granted" in captured["ungranted_error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_shared_api_executor_binds_exact_handoff_grants(monkeypatch, tmp_path):
+    original = _prepare_handoff(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            from tools.file_grants import file_grant_error
+
+            captured["allowed"] = file_grant_error(
+                str(original),
+                task_id=task_id,
+                operation="read",
+            )
+            captured["denied"] = file_grant_error(
+                str(original.with_name("other.pdf")),
+                task_id=task_id,
+                operation="read",
+            )
+            return {"final_response": "ok"}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent())
+
+    result, _usage = await adapter._run_agent(
+        user_message="inspect",
+        conversation_history=[],
+        session_id="session-1",
+        user_id="user-1",
+        chat_id="chat-1",
+        granted_file_paths=[str(original)],
+    )
+
+    assert result["final_response"] == "ok"
+    assert captured["allowed"] is None
+    assert "not granted" in captured["denied"].lower()

@@ -3115,6 +3115,47 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        capability_meta = None
+        if server_name == "soc_v2" and tool_name in {
+            "submit_conversion",
+            "resubmit_conversion",
+        }:
+            from tools.file_grants import (
+                _CAPABILITY_META_KEY,
+                file_grant_error,
+                make_file_capability,
+            )
+
+            task_id = kwargs.get("task_id") or "default"
+            path = str(args.get("path") or "")
+            grant_denial = file_grant_error(
+                path,
+                task_id=task_id,
+                operation=f"soc_v2.{tool_name}",
+            )
+            if grant_denial:
+                return json.dumps(
+                    {"error": grant_denial, "success": False},
+                    ensure_ascii=False,
+                )
+            try:
+                capability_meta = {
+                    _CAPABILITY_META_KEY: make_file_capability(
+                        path,
+                        operation=f"soc_v2.{tool_name}",
+                    )
+                }
+            except ValueError as exc:
+                return json.dumps(
+                    {"error": str(exc), "success": False},
+                    ensure_ascii=False,
+                )
+
+            # Reserved capability data is protocol metadata, never model input.
+            args = dict(args)
+            args.pop(_CAPABILITY_META_KEY, None)
+            args.pop("_meta", None)
+
         # Skill ACL (#13 code-exec extension): block a locally-launched code-exec
         # MCP server (e.g. opencode_runner) from operating under a protected
         # skills path when the api_server caller lacks skill permission. This is
@@ -3170,7 +3211,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if capability_meta is None:
+                        result = await server.session.call_tool(
+                            tool_name,
+                            arguments=args,
+                        )
+                    else:
+                        result = await server.session.call_tool(
+                            tool_name,
+                            arguments=args,
+                            meta=capability_meta,
+                        )
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError

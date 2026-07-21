@@ -526,7 +526,11 @@ def _verify_handoff_entry(entry: Dict[str, str], scope: Dict[str, str]) -> bool:
     return True
 
 
-def _build_handoff_context(entries: List[Dict[str, str]], scope: Dict[str, str]) -> str:
+def _build_handoff_context(
+    entries: List[Dict[str, str]],
+    scope: Dict[str, str],
+    granted_paths: Optional[List[str]] = None,
+) -> str:
     """
     Validate skip-rag handoff file entries and expose path metadata only.
 
@@ -566,6 +570,8 @@ def _build_handoff_context(entries: List[Dict[str, str]], scope: Dict[str, str])
             attrs.append(f'sha256="{html.escape(entry["sha256"], quote=True)}"')
 
         sections.append(f'<file {" ".join(attrs)}/>')
+        if granted_paths is not None:
+            granted_paths.append(str(safe_orig))
         accepted += 1
 
     if accepted == 0:
@@ -574,13 +580,17 @@ def _build_handoff_context(entries: List[Dict[str, str]], scope: Dict[str, str])
     return "\n".join(sections)
 
 
-def _augment_handoff_text(text: str, scope: Dict[str, str]) -> str:
+def _augment_handoff_text(
+    text: str,
+    scope: Dict[str, str],
+    granted_paths: Optional[List[str]] = None,
+) -> str:
     """Strip raw <files> blocks and append validated path-only metadata."""
     if "<files>" not in text:
         return text
     scope = scope or {}
     entries = _parse_handoff_file_entries(text)
-    context = _build_handoff_context(entries, scope)
+    context = _build_handoff_context(entries, scope, granted_paths)
     message_without_raw_files = _FILES_BLOCK_RE.sub("", text).rstrip()
     if not context:
         return message_without_raw_files
@@ -588,11 +598,15 @@ def _augment_handoff_text(text: str, scope: Dict[str, str]) -> str:
     return f"{message_without_raw_files}\n\n{context}"
 
 
-def _augment_message_with_handoff_context(user_message: Any, scope: Optional[Dict[str, str]] = None) -> Any:
+def _augment_message_with_handoff_context(
+    user_message: Any,
+    scope: Optional[Dict[str, str]] = None,
+    granted_paths: Optional[List[str]] = None,
+) -> Any:
     """Replace raw signed /handoff blocks with validated path-only metadata."""
     scope = scope or {}
     if isinstance(user_message, str):
-        return _augment_handoff_text(user_message, scope)
+        return _augment_handoff_text(user_message, scope, granted_paths)
     if isinstance(user_message, list):
         augmented_parts: List[Any] = []
         for part in user_message:
@@ -601,7 +615,11 @@ def _augment_message_with_handoff_context(user_message: Any, scope: Optional[Dic
                 text = part.get("text")
                 if part_type in _TEXT_PART_TYPES and isinstance(text, str):
                     new_part = dict(part)
-                    new_part["text"] = _augment_handoff_text(text, scope)
+                    new_part["text"] = _augment_handoff_text(
+                        text,
+                        scope,
+                        granted_paths,
+                    )
                     augmented_parts.append(new_part)
                     continue
             augmented_parts.append(part)
@@ -2514,6 +2532,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            granted_file_paths=[],
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -2605,6 +2624,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    granted_file_paths=[],
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2774,7 +2794,12 @@ class APIServerAdapter(BasePlatformAdapter):
             user_message = conversation_messages[-1].get("content", "")
             history = conversation_messages[:-1]
 
-        user_message = _augment_message_with_handoff_context(user_message, scope)
+        granted_file_paths: List[str] = []
+        user_message = _augment_message_with_handoff_context(
+            user_message,
+            scope,
+            granted_file_paths,
+        )
 
         if not _content_has_visible_payload(user_message):
             return web.json_response(
@@ -2963,6 +2988,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_name=user_name,
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
+                granted_file_paths=granted_file_paths,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2987,6 +3013,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_name=user_name,
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
+                granted_file_paths=granted_file_paths,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4176,7 +4203,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Last input message is the user_message
         user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
-        user_message = _augment_message_with_handoff_context(user_message, scope)
+        granted_file_paths: List[str] = []
+        user_message = _augment_message_with_handoff_context(
+            user_message,
+            scope,
+            granted_file_paths,
+        )
         if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
@@ -4253,6 +4285,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_name=user_name,
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
+                granted_file_paths=granted_file_paths,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4292,6 +4325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_name=user_name,
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
+                granted_file_paths=granted_file_paths,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4899,6 +4933,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_name: Optional[str] = None,
         user_role: Optional[str] = None,
         user_groups: Optional[str] = None,
+        granted_file_paths: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4919,6 +4954,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 reset_trusted_export_context,
                 set_trusted_export_context,
             )
+            from tools.file_grants import file_grant_scope
 
             # Bind OpenWebUI identity (incl. role/groups) into concurrency-safe
             # session contextvars so skill ACL checks in tool handlers can read
@@ -4963,11 +4999,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
-                result = agent.run_conversation(
-                    user_message=user_message,
-                    conversation_history=conversation_history,
-                    task_id=effective_task_id,
-                )
+                if granted_file_paths is None:
+                    result = agent.run_conversation(
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        task_id=effective_task_id,
+                    )
+                else:
+                    with file_grant_scope(effective_task_id, granted_file_paths):
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
                 usage = {
                     "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -5089,7 +5133,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        user_message = _augment_message_with_handoff_context(user_message, scope)
+        granted_file_paths: List[str] = []
+        user_message = _augment_message_with_handoff_context(
+            user_message,
+            scope,
+            granted_file_paths,
+        )
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
@@ -5238,6 +5287,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         reset_trusted_export_context,
                         set_trusted_export_context,
                     )
+                    from tools.file_grants import file_grant_scope
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -5273,11 +5323,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             user_groups=scope.get("user_groups", ""),
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
-                        r = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                            task_id=effective_task_id,
-                        )
+                        with file_grant_scope(effective_task_id, granted_file_paths):
+                            r = agent.run_conversation(
+                                user_message=user_message,
+                                conversation_history=conversation_history,
+                                task_id=effective_task_id,
+                            )
                     finally:
                         try:
                             unregister_gateway_notify(approval_session_key)

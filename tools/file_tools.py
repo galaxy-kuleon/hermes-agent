@@ -1102,6 +1102,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
+        from tools.file_grants import file_grant_error
+
+        grant_err = file_grant_error(path, task_id=task_id, operation="read")
+        if grant_err:
+            return json.dumps({"error": grant_err, "success": False}, ensure_ascii=False)
+
         # Skill ACL (#13): block reading protected skill files without read perm.
         acl_err = _acl_protected_path_block(path, mode="read", task_id=task_id)
         if acl_err:
@@ -1796,6 +1802,12 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+
+        from tools.file_grants import file_grant_error
+
+        grant_err = file_grant_error(path, task_id=task_id, operation="search")
+        if grant_err:
+            return json.dumps({"error": grant_err, "success": False}, ensure_ascii=False)
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated

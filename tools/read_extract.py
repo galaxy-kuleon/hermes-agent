@@ -18,7 +18,7 @@ from xml.etree import ElementTree as ET
 
 __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
 
-EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".pdf"})
+EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".pdf", ".msg"})
 MAX_XLSX_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
@@ -55,6 +55,13 @@ def extract_document_text(path: str) -> str:
         from tools.pdf_extract import extract_pdf_text
 
         return extract_pdf_text(path)
+    if ext == ".msg":
+        from tools.msg_extract import MsgExtractionError, extract_msg_text
+
+        try:
+            return extract_msg_text(path)
+        except MsgExtractionError as exc:
+            raise ExtractionError(str(exc)) from exc
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 

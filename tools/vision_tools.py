@@ -48,7 +48,10 @@ logger = logging.getLogger(__name__)
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
 
-def _acl_local_vision_path_block(image_url: str) -> Optional[str]:
+def _acl_local_vision_path_block(
+    image_url: str,
+    task_id: str = "default",
+) -> Optional[str]:
     """Apply file ownership ACLs before vision reads a same-uid local path."""
 
     if not isinstance(image_url, str) or not image_url.strip():
@@ -59,6 +62,15 @@ def _acl_local_vision_path_block(image_url: str) -> Optional[str]:
     if parsed.scheme and parsed.scheme.lower() != "file":
         return None
     local_value = image_url[len("file://") :] if image_url.startswith("file://") else image_url
+    from tools.file_grants import file_grant_error
+
+    grant_error = file_grant_error(
+        local_value,
+        task_id=task_id,
+        operation="vision",
+    )
+    if grant_error:
+        return grant_error
     try:
         from tools.file_tools import _acl_protected_path_block
 
@@ -722,6 +734,7 @@ def _build_native_vision_tool_result(
 async def _vision_analyze_native(
     image_url: str,
     question: str,
+    task_id: str = "default",
 ) -> Any:
     """Fast path for vision-capable main models.
 
@@ -737,7 +750,7 @@ async def _vision_analyze_native(
     """
     if not isinstance(image_url, str) or not image_url.strip():
         return tool_error("image_url is required", success=False)
-    acl_denial = _acl_local_vision_path_block(image_url)
+    acl_denial = _acl_local_vision_path_block(image_url, task_id)
     if acl_denial:
         return tool_error(acl_denial, success=False)
 
@@ -839,6 +852,7 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    task_id: str = "default",
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -874,7 +888,7 @@ async def vision_analyze_tool(
     """
     if not isinstance(user_prompt, str):
         user_prompt = str(user_prompt) if user_prompt is not None else ""
-    acl_denial = _acl_local_vision_path_block(image_url)
+    acl_denial = _acl_local_vision_path_block(image_url, task_id)
     if acl_denial:
         return tool_error(acl_denial, success=False)
     debug_call_data = {
@@ -1237,6 +1251,7 @@ VISION_ANALYZE_SCHEMA = {
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
+    task_id = kw.get("task_id") or "default"
 
     # Fast path: when native image routing is in effect for the active main
     # model (provider accepts images in tool results, or the user set the
@@ -1246,7 +1261,7 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     # information loss, no extra latency.
     if _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
-        return _vision_analyze_native(image_url, question)
+        return _vision_analyze_native(image_url, question, task_id=task_id)
 
     # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
@@ -1254,7 +1269,7 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         f"following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model)
+    return vision_analyze_tool(image_url, full_prompt, model, task_id=task_id)
 
 
 registry.register(
