@@ -1,4 +1,4 @@
-FROM ubuntu:26.04
+FROM ubuntu:24.04
 
 # Disable Python stdout buffering
 ENV PYTHONUNBUFFERED=1
@@ -40,7 +40,7 @@ RUN apt-get update && \
     vim \
     ffmpeg \
     openssh-client \
-    docker-cli \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Create hermes user ───────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Install a real, image-baked Chromium ─────────────────────────────────────
-# Ubuntu 26.04's `chromium` package is only a Snap launcher stub. Containers do
+# Ubuntu's `chromium` package is only a Snap launcher stub. Containers do
 # not run snapd, so the stub exists and passes executable-presence checks but
 # fails every launch. Use Playwright's pinned headless shell instead and expose
 # it through one stable path for both Hermes setup and agent-browser runtime.
