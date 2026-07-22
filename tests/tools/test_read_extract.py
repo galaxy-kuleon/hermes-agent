@@ -160,6 +160,131 @@ def _write_msg(
             fh.write(sector)
 
 
+def _write_msg_with_directory_collision(
+    path,
+    root_body,
+    nested_body,
+    *,
+    cycle=False,
+    root_sid=0,
+):
+    """Write a mini-stream MSG whose embedded message has the first body entry."""
+    free_sector = 0xFFFFFFFF
+    end_of_chain = 0xFFFFFFFE
+    fat_sector = 0xFFFFFFFD
+    sector_size = 512
+
+    header = bytearray(sector_size)
+    header[:8] = bytes.fromhex("d0cf11e0a1b11ae1")
+    struct.pack_into("<HHHH", header, 24, 0x003E, 3, 0xFFFE, 9)
+    struct.pack_into("<H", header, 32, 6)
+    struct.pack_into(
+        "<IIIIIIIII",
+        header,
+        40,
+        0,
+        1,
+        1,
+        0,
+        4096,
+        2,
+        1,
+        end_of_chain,
+        0,
+    )
+    struct.pack_into("<I", header, 76, 0)
+    for offset in range(80, sector_size, 4):
+        struct.pack_into("<I", header, offset, free_sector)
+
+    fat = bytearray(b"\xff" * sector_size)
+    for index, value in enumerate((fat_sector, end_of_chain, end_of_chain, end_of_chain)):
+        struct.pack_into("<I", fat, index * 4, value)
+
+    def directory_entry(
+        name,
+        entry_type,
+        *,
+        color=1,
+        left=free_sector,
+        right=free_sector,
+        child=free_sector,
+        start_sector=end_of_chain,
+        stream_size=0,
+    ):
+        entry = bytearray(128)
+        encoded_name = (name + "\0").encode("utf-16le")
+        entry[: len(encoded_name)] = encoded_name
+        struct.pack_into(
+            "<HBBIII",
+            entry,
+            64,
+            len(encoded_name),
+            entry_type,
+            color,
+            left,
+            right,
+            child,
+        )
+        struct.pack_into("<I", entry, 116, start_sector)
+        struct.pack_into("<Q", entry, 120, stream_size)
+        return entry
+
+    nested_bytes = (nested_body + "\r\n\0").encode("utf-16le")
+    root_bytes = (root_body + "\r\n\0").encode("utf-16le")
+    if not (64 < len(nested_bytes) <= 128 and 64 < len(root_bytes) <= 128):
+        raise ValueError("collision fixture bodies must span exactly two mini sectors")
+
+    if root_sid not in {0, 1}:
+        raise ValueError("root_sid must be 0 or 1")
+
+    directory = bytearray(sector_size)
+    root_entry = directory_entry(
+        "Root Entry",
+        5,
+        child=1 if root_sid == 0 else 3,
+        start_sector=3,
+        stream_size=256,
+    )
+    attachment_entry = directory_entry(
+        "__attach_version1.0_#00000000",
+        1,
+        left=1 if cycle else free_sector,
+        right=3,
+        child=2,
+    )
+    if root_sid == 0:
+        directory[:128] = root_entry
+        directory[128:256] = attachment_entry
+    else:
+        directory[:128] = directory_entry("Decoy Storage", 1)
+        directory[128:256] = root_entry
+    directory[256:384] = directory_entry(
+        "__substg1.0_1000001F",
+        2,
+        start_sector=0,
+        stream_size=len(nested_bytes),
+    )
+    directory[384:512] = directory_entry(
+        "__substg1.0_1000001F",
+        2,
+        color=0 if root_sid == 0 else 1,
+        start_sector=2,
+        stream_size=len(root_bytes),
+    )
+
+    mini_fat = bytearray(b"\xff" * sector_size)
+    for index, value in enumerate((1, end_of_chain, 3, end_of_chain)):
+        struct.pack_into("<I", mini_fat, index * 4, value)
+    mini_stream = bytearray(sector_size)
+    mini_stream[: len(nested_bytes)] = nested_bytes
+    mini_stream[128 : 128 + len(root_bytes)] = root_bytes
+
+    with open(path, "wb") as fh:
+        fh.write(header)
+        for sector in (fat, directory, mini_fat, mini_stream):
+            fh.write(sector)
+
+
 _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
@@ -249,6 +374,49 @@ class TestMsgExtraction(unittest.TestCase):
         text = extract_document_text(path)
 
         self.assertIn(body, text)
+
+    def test_root_message_body_wins_over_nested_duplicate_stream(self):
+        path = os.path.join(self.tmp, "nested-body.msg")
+        root_body = "Root message body is the expected audit text."
+        nested_body = "Nested attachment body must never be selected."
+        _write_msg_with_directory_collision(path, root_body, nested_body)
+
+        text = extract_document_text(path)
+
+        self.assertIn(root_body, text)
+        self.assertNotIn(nested_body, text)
+
+    def test_directory_sibling_cycle_is_rejected(self):
+        path = os.path.join(self.tmp, "directory-cycle.msg")
+        _write_msg_with_directory_collision(
+            path,
+            "Root message body is the expected audit text.",
+            "Nested attachment body must never be selected.",
+            cycle=True,
+        )
+
+        with self.assertRaisesRegex(ExtractionError, r"(?i)directory.*cycle|cycle.*directory"):
+            extract_document_text(path)
+
+    def test_directory_root_must_be_sid_zero(self):
+        path = os.path.join(self.tmp, "root-not-sid-zero.msg")
+        _write_msg_with_directory_collision(
+            path,
+            "Root message body is the expected audit text.",
+            "Nested attachment body must never be selected.",
+            root_sid=1,
+        )
+
+        with self.assertRaisesRegex(ExtractionError, r"(?i)root.*SID.?0|SID.?0.*root"):
+            extract_document_text(path)
+
+    def test_directory_root_self_cycle_is_rejected(self):
+        from tools.msg_extract import MsgExtractionError, _CompoundFile
+
+        root = {"child": 0}
+
+        with self.assertRaisesRegex(MsgExtractionError, r"(?i)cycle"):
+            _CompoundFile._direct_children([root], root)
 
     def test_fat_cycle_is_rejected(self):
         path = os.path.join(self.tmp, "malformed-fat.msg")

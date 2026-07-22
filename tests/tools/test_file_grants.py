@@ -1,6 +1,7 @@
 """Authorization contracts for request-scoped local file grants."""
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
@@ -244,3 +245,174 @@ def test_granted_socv2_path_uses_hidden_trusted_mcp_metadata(
     capability = call.kwargs["meta"][_CAPABILITY_META_KEY]
     assert capability != "model-forged-token"
     assert capability not in result
+
+
+def test_socv2_capability_is_minted_after_rpc_lock_is_acquired(tmp_path):
+    from tools.file_grants import _CAPABILITY_META_KEY
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    class ObservedAsyncLock:
+        entered = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            self.entered = False
+            return False
+
+    lock = ObservedAsyncLock()
+    granted = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-1" / "allowed.pdf"
+    session = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(text='{"ok":true}')],
+                isError=False,
+            )
+        )
+    )
+    fake_server = SimpleNamespace(
+        session=session,
+        _rpc_lock=lock,
+        _pending_call_context=None,
+    )
+
+    def mint_after_lock(path, *, operation):
+        assert lock.entered, "capability TTL must start after RPC queueing"
+        assert str(path) == str(granted)
+        assert operation == "soc_v2.submit_conversion"
+        return "fresh-capability"
+
+    def run_locally(coro_or_factory, timeout=30):
+        del timeout
+        coroutine = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coroutine)
+
+    handler = _make_tool_handler("soc_v2", "submit_conversion", 30)
+    with _file_grant_scope("task-1", [str(granted)]), patch.dict(
+        _servers,
+        {"soc_v2": fake_server},
+    ), patch(
+        "tools.mcp_tool._run_on_mcp_loop",
+        side_effect=run_locally,
+    ), patch(
+        "tools.file_grants.make_file_capability",
+        side_effect=mint_after_lock,
+    ):
+        handler({"path": str(granted)}, task_id="task-1")
+
+    call = session.call_tool.await_args
+    assert call.kwargs["meta"][_CAPABILITY_META_KEY] == "fresh-capability"
+
+
+def test_socv2_capability_path_is_pinned_before_rpc_lock(monkeypatch, tmp_path):
+    from tools.file_grants import _CAPABILITY_META_KEY
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    allowed = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-1" / "allowed.pdf"
+    denied = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-2" / "denied.pdf"
+    allowed.parent.mkdir(parents=True)
+    denied.parent.mkdir(parents=True)
+    allowed.write_bytes(b"allowed")
+    denied.write_bytes(b"denied")
+    supplied_path = tmp_path / "report.pdf"
+    supplied_path.symlink_to(allowed)
+
+    class SwappingAsyncLock:
+        async def __aenter__(self):
+            supplied_path.unlink()
+            supplied_path.symlink_to(denied)
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    session = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(text='{"ok":true}')],
+                isError=False,
+            )
+        )
+    )
+    fake_server = SimpleNamespace(
+        session=session,
+        _rpc_lock=SwappingAsyncLock(),
+        _pending_call_context=None,
+    )
+
+    def run_locally(coro_or_factory, timeout=30):
+        del timeout
+        coroutine = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coroutine)
+
+    monkeypatch.setenv("HERMES_FILE_CAPABILITY_KEY", "test-capability-secret")
+    handler = _make_tool_handler("soc_v2", "submit_conversion", 30)
+    with _file_grant_scope("task-1", [str(supplied_path)]), patch.dict(
+        _servers,
+        {"soc_v2": fake_server},
+    ), patch("tools.mcp_tool._run_on_mcp_loop", side_effect=run_locally):
+        handler({"path": str(supplied_path)}, task_id="task-1")
+
+    call = session.call_tool.await_args
+    canonical_allowed = str(allowed.resolve())
+    assert call.kwargs["arguments"]["path"] == canonical_allowed
+    capability = call.kwargs["meta"][_CAPABILITY_META_KEY]
+    encoded_payload = capability.split(".", 1)[0]
+    encoded_payload += "=" * (-len(encoded_payload) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded_payload))
+    assert payload["path"] == canonical_allowed
+    assert str(denied.resolve()) not in {call.kwargs["arguments"]["path"], payload["path"]}
+
+
+def test_missing_capability_key_does_not_trip_socv2_breaker(monkeypatch, tmp_path):
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    class AsyncLock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    session = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(text="ok")],
+                isError=False,
+                structuredContent=None,
+            )
+        )
+    )
+    fake_server = SimpleNamespace(
+        session=session,
+        _rpc_lock=AsyncLock(),
+        _pending_call_context=None,
+    )
+    granted = tmp_path / "handoff" / "allowed.pdf"
+
+    def run_locally(coro_or_factory, timeout=30):
+        del timeout
+        coroutine = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coroutine)
+
+    monkeypatch.delenv("HERMES_FILE_CAPABILITY_KEY", raising=False)
+    mcp_tool._server_error_counts.pop("soc_v2", None)
+    capability_handler = _make_tool_handler("soc_v2", "submit_conversion", 30)
+    ordinary_handler = _make_tool_handler("soc_v2", "health", 30)
+    with _file_grant_scope("task-1", [str(granted)]), patch.dict(
+        _servers,
+        {"soc_v2": fake_server},
+    ), patch("tools.mcp_tool._run_on_mcp_loop", side_effect=run_locally):
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            result = json.loads(
+                capability_handler({"path": str(granted)}, task_id="task-1")
+            )
+            assert "not configured" in result["error"]
+
+        assert mcp_tool._server_error_counts.get("soc_v2", 0) == 0
+        assert json.loads(ordinary_handler({}))["result"] == "ok"
+
+    session.call_tool.assert_awaited_once()

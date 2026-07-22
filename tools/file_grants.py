@@ -40,19 +40,34 @@ def file_grant_scope(task_id: str, paths: Iterable[str | Path]) -> Iterator[None
         _GRANTS.reset(token)
 
 
-def file_grant_error(path: str | Path, *, task_id: str, operation: str) -> str | None:
-    """Return a denial message when an active request did not grant *path*."""
+def resolve_file_grant(
+    path: str | Path,
+    *,
+    task_id: str,
+    operation: str,
+) -> tuple[str | None, str | None]:
+    """Resolve *path* once and return its authorized canonical identity."""
+    canonical_path = _canonical_path(path)
     scopes = _GRANTS.get()
-    if scopes is None:
-        return None
     task_key = str(task_id or "default")
-    granted = scopes.get(task_key)
-    if granted is not None and _canonical_path(path) in granted:
-        return None
-    return (
+    if scopes is None or canonical_path in (scopes.get(task_key) or ()):
+        return canonical_path, None
+    return None, (
         f"Local file access not granted for {operation}: {path!s}. "
         "Use an exact path supplied in this request's validated attached files."
     )
+
+
+def file_grant_error(path: str | Path, *, task_id: str, operation: str) -> str | None:
+    """Return a denial message when an active request did not grant *path*."""
+    if _GRANTS.get() is None:
+        return None
+    _, denial = resolve_file_grant(
+        path,
+        task_id=task_id,
+        operation=operation,
+    )
+    return denial
 
 
 def _capability_key() -> bytes:
@@ -67,17 +82,17 @@ def _capability_key() -> bytes:
 
 
 def make_file_capability(
-    path: str | Path,
+    canonical_path: str,
     *,
     operation: str,
     now: int | None = None,
 ) -> str:
-    """Create a short-lived, operation- and path-bound cross-process token."""
+    """Create a token bound to an already-authorized canonical path."""
     issued_at = int(time.time() if now is None else now)
     payload = {
         "v": _CAPABILITY_VERSION,
         "op": str(operation),
-        "path": _canonical_path(path),
+        "path": canonical_path,
         "exp": issued_at + _CAPABILITY_TTL_SECONDS,
     }
     encoded = base64.urlsafe_b64encode(
@@ -92,4 +107,5 @@ __all__ = [
     "file_grant_error",
     "file_grant_scope",
     "make_file_capability",
+    "resolve_file_grant",
 ]

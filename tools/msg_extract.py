@@ -133,12 +133,12 @@ class _CompoundFile:
             value = value[:declared_size]
         return value
 
-    def _directory_entries(self) -> list[dict[str, int | str]]:
+    def _directory_entries(self) -> list[dict[str, int | str] | None]:
         directory = self._regular_chain(
             self.first_directory_sector,
             label="directory",
         )
-        entries: list[dict[str, int | str]] = []
+        entries: list[dict[str, int | str] | None] = []
         for offset in range(0, len(directory), 128):
             raw = directory[offset : offset + 128]
             if len(raw) < 128:
@@ -146,6 +146,7 @@ class _CompoundFile:
             name_bytes = struct.unpack_from("<H", raw, 64)[0]
             entry_type = raw[66]
             if entry_type == 0:
+                entries.append(None)
                 continue
             if name_bytes < 2 or name_bytes > 64 or name_bytes % 2:
                 raise MsgExtractionError("MSG directory has an invalid entry name")
@@ -160,25 +161,65 @@ class _CompoundFile:
                 {
                     "name": name,
                     "type": entry_type,
+                    "left": struct.unpack_from("<I", raw, 68)[0],
+                    "right": struct.unpack_from("<I", raw, 72)[0],
+                    "child": struct.unpack_from("<I", raw, 76)[0],
                     "start": struct.unpack_from("<I", raw, 116)[0],
                     "size": size,
                 }
             )
         return entries
 
+    @staticmethod
+    def _direct_children(
+        entries: list[dict[str, int | str] | None],
+        root: dict[str, int | str],
+    ) -> list[dict[str, int | str]]:
+        """Traverse only the root storage's sibling tree, never nested storages."""
+        pending = [int(root["child"])]
+        visited: set[int] = {0}
+        children: list[dict[str, int | str]] = []
+        while pending:
+            entry_id = pending.pop()
+            if entry_id == _FREE_SECTOR:
+                continue
+            if entry_id in visited:
+                raise MsgExtractionError("MSG directory sibling cycle detected")
+            if entry_id in _SPECIAL_SECTORS or entry_id >= len(entries):
+                raise MsgExtractionError("MSG directory references an invalid entry")
+            entry = entries[entry_id]
+            if entry is None:
+                raise MsgExtractionError("MSG directory references an empty entry")
+            visited.add(entry_id)
+            children.append(entry)
+            pending.append(int(entry["right"]))
+            pending.append(int(entry["left"]))
+        return children
+
     def unicode_body(self) -> bytes:
         entries = self._directory_entries()
-        root = next((entry for entry in entries if entry["type"] == 5), None)
-        body = next(
-            (
-                entry
-                for entry in entries
-                if entry["type"] == 2 and entry["name"] == _UNICODE_BODY_STREAM
-            ),
-            None,
-        )
-        if root is None or body is None:
+        if not entries or entries[0] is None:
             raise MsgExtractionError("MSG contains no Unicode plain-text body")
+        root = entries[0]
+        if root["type"] != 5 or root["name"] != "Root Entry":
+            raise MsgExtractionError("MSG directory root must be SID 0 Root Entry")
+        if root["left"] != _FREE_SECTOR or root["right"] != _FREE_SECTOR:
+            raise MsgExtractionError("MSG directory root has invalid siblings")
+        if any(
+            entry is not None and entry["type"] == 5
+            for entry in entries[1:]
+        ):
+            raise MsgExtractionError("MSG directory contains multiple root entries")
+        bodies = [
+            entry
+            for entry in self._direct_children(entries, root)
+            if entry["type"] == 2 and entry["name"] == _UNICODE_BODY_STREAM
+        ]
+        if not bodies:
+            raise MsgExtractionError("MSG contains no Unicode plain-text body")
+        if len(bodies) > 1:
+            raise MsgExtractionError("MSG contains ambiguous Unicode plain-text bodies")
+        body = bodies[0]
         body_size = int(body["size"])
         if body_size <= 0:
             raise MsgExtractionError("MSG Unicode body is empty")
