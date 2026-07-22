@@ -3107,6 +3107,11 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
+
+class _LocalMCPConfigurationError(RuntimeError):
+    """A local preflight failure that must not count as a server outage."""
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -3115,6 +3120,35 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        capability_request = None
+        if server_name == "soc_v2" and tool_name in {
+            "submit_conversion",
+            "resubmit_conversion",
+        }:
+            from tools.file_grants import (
+                _CAPABILITY_META_KEY,
+                resolve_file_grant,
+            )
+
+            task_id = kwargs.get("task_id") or "default"
+            path = str(args.get("path") or "")
+            canonical_path, grant_denial = resolve_file_grant(
+                path,
+                task_id=task_id,
+                operation=f"soc_v2.{tool_name}",
+            )
+            if grant_denial:
+                return json.dumps(
+                    {"error": grant_denial, "success": False},
+                    ensure_ascii=False,
+                )
+            # Reserved capability data is protocol metadata, never model input.
+            args = dict(args)
+            args.pop(_CAPABILITY_META_KEY, None)
+            args.pop("_meta", None)
+            args["path"] = canonical_path
+            capability_request = (canonical_path, f"soc_v2.{tool_name}")
+
         # Skill ACL (#13 code-exec extension): block a locally-launched code-exec
         # MCP server (e.g. opencode_runner) from operating under a protected
         # skills path when the api_server caller lacks skill permission. This is
@@ -3164,13 +3198,40 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
+                capability_meta = None
+                if capability_request is not None:
+                    from tools.file_grants import (
+                        _CAPABILITY_META_KEY,
+                        make_file_capability,
+                    )
+
+                    capability_path, capability_operation = capability_request
+                    try:
+                        capability_meta = {
+                            _CAPABILITY_META_KEY: make_file_capability(
+                                capability_path,
+                                operation=capability_operation,
+                            )
+                        }
+                    except ValueError as exc:
+                        raise _LocalMCPConfigurationError(str(exc)) from exc
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if capability_meta is None:
+                        result = await server.session.call_tool(
+                            tool_name,
+                            arguments=args,
+                        )
+                    else:
+                        result = await server.session.call_tool(
+                            tool_name,
+                            arguments=args,
+                            meta=capability_meta,
+                        )
                 finally:
                     server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
@@ -3235,6 +3296,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
             return result
+        except _LocalMCPConfigurationError as exc:
+            return json.dumps(
+                {"error": str(exc), "success": False},
+                ensure_ascii=False,
+            )
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:

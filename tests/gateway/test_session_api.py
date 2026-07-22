@@ -241,6 +241,7 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     assert kwargs["session_id"] == session_id
     assert kwargs["gateway_session_key"] == "client-42"
     assert kwargs["ephemeral_system_prompt"] == "stay focused"
+    assert kwargs["granted_file_paths"] is None
     history = kwargs["conversation_history"]
     assert len(history) == 2
     assert isinstance(history[0].pop("timestamp"), (int, float))
@@ -309,6 +310,7 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
 
     assert "event: assistant.completed" in body
     assert captured_kwargs["user_message"] == expected_user_message
+    assert captured_kwargs["granted_file_paths"] is None
 
 
 @pytest.mark.asyncio
