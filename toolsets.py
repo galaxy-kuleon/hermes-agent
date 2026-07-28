@@ -208,8 +208,12 @@ TOOLSETS = {
     # skill ACL (#13) can withhold write-capable file tools from unprivileged
     # api_server users while preserving read + document export.
     "file_read": {
-        "description": "Read files, search files, and export documents (read-only; no writes)",
-        "tools": ["read_file", "search_files", "local_document_export"],
+        "description": "Read files, search files, list attachments, and export documents (read-only; no writes)",
+        # `attachments` belongs here, not in file_write: it is read-only
+        # introspection over the current request's own grants, and the roles
+        # most likely to be restricted to file_read are exactly the ones that
+        # upload documents and need to know which of them they have read.
+        "tools": ["read_file", "search_files", "local_document_export", "attachments"],
         "includes": []
     },
 

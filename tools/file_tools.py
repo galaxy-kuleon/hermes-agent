@@ -2111,3 +2111,11 @@ registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, han
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+
+# Attachment ledger. Registered in "file_read", not "file": it is read-only
+# introspection over the current request's own grants, and a role restricted to
+# read-only file access is precisely the one that uploads documents and needs to
+# know which of them it has actually read.
+from tools.attachments_tool import ATTACHMENTS_SCHEMA, _handle_attachments  # noqa: E402
+
+registry.register(name="attachments", toolset="file_read", schema=ATTACHMENTS_SCHEMA, handler=_handle_attachments, check_fn=_check_file_reqs, emoji="📎", max_result_size_chars=100_000)

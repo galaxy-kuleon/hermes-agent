@@ -99,6 +99,12 @@ def resolve_grant_alias(value: str | Path, *, task_id: str) -> str:
     return aliases.get(match.group(1).upper(), raw)
 
 
+def list_file_handles(task_id: str) -> list[tuple[str, str]]:
+    """Return `(handle, canonical_path)` for this request, in handle order."""
+    aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
+    return sorted(aliases.items())
+
+
 def _known_handles_hint(task_id: str) -> str:
     aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
     if not aliases:
@@ -180,6 +186,7 @@ __all__ = [
     "file_grant_error",
     "file_grant_scope",
     "make_file_capability",
+    "list_file_handles",
     "make_file_handles",
     "resolve_file_grant",
     "resolve_grant_alias",
