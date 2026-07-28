@@ -375,3 +375,27 @@ async def test_shared_api_executor_binds_exact_handoff_grants(monkeypatch, tmp_p
     # The denial must name the handles the model may actually use.
     assert "F01" in captured["handle_denied"]
     assert captured["cache_scope_open"] is True
+
+
+def test_handoff_guidance_refuses_names_from_outside_the_list(monkeypatch, tmp_path):
+    """The block must tell the model where filenames may legitimately come from.
+
+    The live incident's `read_file("…example-never-attached.docx")` was
+    not degeneration: the caller's persistent USER.md said "use simplified file
+    names (not full /handoff paths). Format: YYYYMMDD_Description.ext (e.g.
+    "example-never-attached.docx" …)", and that memory is embedded
+    verbatim into every session's system prompt. The model followed a naming
+    instruction and had no authoritative list to name from.
+    """
+    original = _prepare_handoff(monkeypatch, tmp_path)
+    sig = api_server._sign_handoff_entry("user-1", "chat-1", str(original))
+    message = f'audit these<files><file original="{original}" sig="{sig}"/></files>'
+
+    out = api_server._augment_message_with_handoff_context(message, _scope())
+
+    assert "never invent a filename" in out
+    assert "instruction, example" in out
+    assert "the file was not attached" in out
+    # And the roster is the authority the guidance points at.
+    assert '<file id="F01" name="report.pdf"/>' in out
+    assert "attachments()" in out
