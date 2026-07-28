@@ -1242,6 +1242,11 @@ DEFAULT_CONFIG = {
     "tool_loop_guardrails": {
         "warnings_enabled": True,
         "hard_stop_enabled": False,
+        # Platforms where hard stops apply even with hard_stop_enabled False.
+        # An unattended api_server turn has nobody to notice a loop; a live
+        # 46-file audit burned 45 minutes and 96 read calls over 18 files with
+        # 48 advisory warnings ignored, and only ended when the user hit Stop.
+        "hard_stop_platforms": ["api_server"],
         "warn_after": {
             "exact_failure": 2,
             "same_tool_failure": 3,

@@ -62,7 +62,12 @@ def _acl_local_vision_path_block(
     if parsed.scheme and parsed.scheme.lower() != "file":
         return None
     local_value = image_url[len("file://") :] if image_url.startswith("file://") else image_url
-    from tools.file_grants import file_grant_error
+    from tools.file_grants import file_grant_error, resolve_grant_alias
+
+    # Defence in depth: the dispatcher already resolved handles, but this guard
+    # is also reachable from other callers. Resolution is idempotent — a real
+    # path is never shaped like a handle.
+    local_value = resolve_grant_alias(local_value, task_id=task_id)
 
     grant_error = file_grant_error(
         local_value,
@@ -1252,6 +1257,15 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     task_id = kw.get("task_id") or "default"
+
+    # Attached images may be addressed by short handle (`F07`). Resolve at the
+    # single dispatch point so both the native fast path and the auxiliary-LLM
+    # path receive a real path — the downstream code opens `image_url` directly,
+    # so resolving only inside the ACL guard would authorize a handle and then
+    # try to open it as a filename.
+    from tools.file_grants import resolve_grant_alias
+
+    image_url = resolve_grant_alias(image_url, task_id=task_id)
 
     # Fast path: when native image routing is in effect for the active main
     # model (provider accepts images in tool results, or the user set the

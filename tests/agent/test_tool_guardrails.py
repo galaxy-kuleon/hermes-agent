@@ -256,3 +256,66 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+# --- 2026-07-28: platform-scoped hard stops ---------------------------------
+
+
+def test_default_config_hard_stops_on_api_server_only():
+    from agent.tool_guardrails import ToolCallGuardrailConfig
+
+    config = ToolCallGuardrailConfig()
+    # Warnings alone did not stop a live 46-file audit from issuing 96 read
+    # calls over 18 files: 48 no-progress warnings were emitted and ignored.
+    assert config.hard_stop_enabled is False
+    assert "api_server" in config.hard_stop_platforms
+    # A CLI/TUI loop has a human who can interrupt within seconds, so it keeps
+    # the gentler behaviour.
+    assert "cli" not in config.hard_stop_platforms
+    assert "tui" not in config.hard_stop_platforms
+
+
+def test_hard_stop_platforms_is_configurable():
+    from agent.tool_guardrails import ToolCallGuardrailConfig
+
+    config = ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_platforms": ["discord", " ", "api_server"]}
+    )
+    assert config.hard_stop_platforms == frozenset({"discord", "api_server"})
+
+
+def test_hard_stop_platforms_falls_back_to_default_on_garbage():
+    from agent.tool_guardrails import ToolCallGuardrailConfig
+
+    defaults = ToolCallGuardrailConfig()
+    for garbage in ("api_server", 7, None):
+        config = ToolCallGuardrailConfig.from_mapping(
+            {"hard_stop_platforms": garbage}
+        )
+        assert config.hard_stop_platforms == defaults.hard_stop_platforms, garbage
+
+
+def test_repeated_identical_read_blocks_once_hard_stops_are_on():
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    args = {"path": "/handoff/user/u/chat/c/message/m/001-report.pdf"}
+    result = '{"content": "same text every time"}'
+
+    blocked_at = None
+    for attempt in range(1, 12):
+        decision = controller.before_call("read_file", args)
+        if decision.should_halt:
+            blocked_at = attempt
+            break
+        controller.after_call("read_file", args, result, failed=False)
+
+    assert blocked_at is not None, "an unchanging read must eventually be blocked"
+    # The live incident re-read single files 14 times; the block must land far
+    # below that to be worth anything.
+    assert blocked_at <= 8, blocked_at

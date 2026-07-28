@@ -54,9 +54,14 @@ def test_handoff_context_accepts_minimal_signed_path_metadata(monkeypatch, tmp_p
 
     assert "<files>" not in out
     assert '<attached_files source="openwebui-skip-rag-handoff">' in out
-    assert f'<file original="{original}"/>' in out
+    # Files are addressed by short handle. The signed path must NOT reach the
+    # model at all: it is ~190 characters the model can only get wrong, and
+    # every path it invented in the live incident was a variation on one it
+    # had been shown.
+    assert '<file id="F01" name="report.pdf"/>' in out
+    assert str(original) not in out
+    assert 'original="' not in out
     assert 'markdown="' not in out
-    assert 'name="' not in out
     assert "%PDF original" not in out
 
 
@@ -79,7 +84,11 @@ def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeyp
     out = api_server._augment_message_with_handoff_context(message, _scope())
 
     assert "<files>" not in out
-    assert f'<file original="{original}" file_id="owui-file-1" sha256="{sha256}"/>' in out
+    assert '<file id="F01" name="report.pdf" file_id="owui-file-1"/>' in out
+    # sha256 is verified on the way in and is useless to the model, so it is
+    # not re-emitted: 64 chars per file over a 46-file audit is pure noise.
+    assert sha256 not in out
+    assert str(original) not in out
     assert "%PDF original" not in out
 
 
@@ -165,7 +174,8 @@ def test_legacy_markdown_signature_is_accepted_without_hydrating_markdown(
     out = api_server._augment_message_with_handoff_context(message, _scope())
 
     assert "<files>" not in out
-    assert f'<file original="{original}"/>' in out
+    assert '<file id="F01" name="report.pdf"/>' in out
+    assert str(original) not in out
     assert 'markdown="' not in out
     assert "SECRET MARKDOWN CONTENT" not in out
 
@@ -209,7 +219,8 @@ def test_multimodal_text_part_handoff_is_stripped_and_augmented(monkeypatch, tmp
     text = out[0]["text"]
     assert "<files>" not in text
     assert '<attached_files source="openwebui-skip-rag-handoff">' in text
-    assert f'<file original="{original}"/>' in text
+    assert '<file id="F01" name="report.pdf"/>' in text
+    assert str(original) not in text
     assert 'markdown="' not in text
 
 
@@ -300,7 +311,8 @@ async def test_runs_api_handoff_input_becomes_path_only_metadata(monkeypatch, tm
     user_message = captured["user_message"]
     assert "<files>" not in user_message
     assert '<attached_files source="openwebui-skip-rag-handoff">' in user_message
-    assert f'<file original="{original}"/>' in user_message
+    assert '<file id="F01" name="report.pdf"/>' in user_message
+    assert str(original) not in user_message
     assert 'markdown="' not in user_message
     assert captured["grant_error"] is None
     assert "not granted" in captured["ungranted_error"].lower()
@@ -329,6 +341,18 @@ async def test_shared_api_executor_binds_exact_handoff_grants(monkeypatch, tmp_p
                 task_id=task_id,
                 operation="read",
             )
+            # The handle the <attached_files> block showed the model must
+            # authorize the same file, and a handle that was never issued
+            # must be denied like any other ungranted path.
+            captured["handle_allowed"] = file_grant_error(
+                "F01", task_id=task_id, operation="read"
+            )
+            captured["handle_denied"] = file_grant_error(
+                "F99", task_id=task_id, operation="read"
+            )
+            from tools import request_file_cache
+
+            captured["cache_scope_open"] = request_file_cache.is_active(task_id)
             return {"final_response": "ok"}
 
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -346,3 +370,8 @@ async def test_shared_api_executor_binds_exact_handoff_grants(monkeypatch, tmp_p
     assert result["final_response"] == "ok"
     assert captured["allowed"] is None
     assert "not granted" in captured["denied"].lower()
+    assert captured["handle_allowed"] is None
+    assert "not granted" in captured["handle_denied"].lower()
+    # The denial must name the handles the model may actually use.
+    assert "F01" in captured["handle_denied"]
+    assert captured["cache_scope_open"] is True

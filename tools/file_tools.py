@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -22,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+# Path B writes attachments as "<3-digit ordinal>-<8-hex nonce>-<name>"; only
+# the trailing part is meaningful when naming a file back to the model.
+_HANDOFF_NAME_PREFIX_RE = re.compile(r"^\d{3}-[0-9a-f]{8}-")
 
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
@@ -1098,11 +1103,67 @@ def _acl_filter_search_result(result, task_id: str = "default"):
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
-    """Read a file with pagination and line numbers."""
+    """Read a file with pagination and line numbers.
+
+    Repeated identical reads inside one request are answered from a memo
+    instead of re-reading the file and re-inserting its full text into the
+    prompt. See ``tools/request_file_cache.py`` for why advisory loop warnings
+    were not enough on their own.
+    """
+    from tools import request_file_cache
+    from tools.file_grants import resolve_grant_alias
+
+    resolved_arg = resolve_grant_alias(path, task_id=task_id)
+    handle = str(path).strip() if resolved_arg != str(path) else ""
+
+    if request_file_cache.is_active(task_id):
+        memo = request_file_cache.lookup(resolved_arg, offset, limit, task_id=task_id)
+        if memo is not None:
+            return json.dumps(
+                request_file_cache.repeat_notice(memo, handle=handle),
+                ensure_ascii=False,
+            )
+
+    result = _read_file_tool_impl(resolved_arg, offset, limit, task_id)
+
+    if request_file_cache.is_active(task_id):
+        try:
+            parsed = json.loads(result)
+        except (TypeError, ValueError):
+            parsed = None
+        # Memoise only a real content read. Errors, denials and binary guards
+        # must stay repeatable — the model may legitimately retry them after
+        # changing something.
+        if (
+            isinstance(parsed, dict)
+            and not parsed.get("error")
+            and isinstance(parsed.get("content"), str)
+        ):
+            request_file_cache.remember(
+                resolved_arg,
+                offset,
+                limit,
+                task_id=task_id,
+                content=parsed["content"],
+                display_name=_HANDOFF_NAME_PREFIX_RE.sub(
+                    "", str(resolved_arg).rsplit("/", 1)[-1], count=1
+                ),
+            )
+
+    return result
+
+
+def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> str:
+    """Uncached read. Every guard and return shape is unchanged."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
-        from tools.file_grants import file_grant_error
+        from tools.file_grants import file_grant_error, resolve_grant_alias
+
+        # Attached files may be addressed by short handle (`F07`) instead of
+        # their ~190-character signed path. Rewrite first so every check below,
+        # and the read itself, operate on the real path.
+        path = resolve_grant_alias(path, task_id=task_id)
 
         grant_err = file_grant_error(path, task_id=task_id, operation="read")
         if grant_err:
@@ -1803,7 +1864,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
-        from tools.file_grants import file_grant_error
+        from tools.file_grants import file_grant_error, resolve_grant_alias
+
+        # Accept an attached-file handle here too, so a model that has only
+        # ever seen `F07` is not forced to invent a path to search in.
+        path = resolve_grant_alias(path, task_id=task_id)
 
         grant_err = file_grant_error(path, task_id=task_id, operation="search")
         if grant_err:

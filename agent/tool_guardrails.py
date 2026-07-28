@@ -71,6 +71,15 @@ class ToolCallGuardrailConfig:
 
     warnings_enabled: bool = True
     hard_stop_enabled: bool = False
+    # Platforms where hard stops are on regardless of ``hard_stop_enabled``.
+    # A CLI/TUI loop has a human watching who can interrupt it within seconds.
+    # An api_server (OpenWebUI) loop does not: a live 46-file audit spent 45
+    # minutes and 96 read calls looping over 18 files while the guardrail
+    # emitted 48 advisory warnings that the model ignored, and the only thing
+    # that ended it was the user pressing Stop.
+    hard_stop_platforms: frozenset[str] = field(
+        default_factory=lambda: frozenset({"api_server"})
+    )
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
@@ -94,9 +103,16 @@ class ToolCallGuardrailConfig:
             hard_stop_after = {}
 
         defaults = cls()
+        raw_platforms = data.get("hard_stop_platforms")
+        platforms = (
+            frozenset(str(name).strip() for name in raw_platforms if str(name).strip())
+            if isinstance(raw_platforms, (list, tuple, set, frozenset))
+            else defaults.hard_stop_platforms
+        )
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
+            hard_stop_platforms=platforms,
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
