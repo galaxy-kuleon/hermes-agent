@@ -18,7 +18,15 @@ from xml.etree import ElementTree as ET
 
 __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
 
-EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".pdf", ".msg"})
+# `.doc`/`.xls` are legacy binary formats with no stdlib reader. They are
+# converted to their OOXML equivalent through the shared soffice sidecar and
+# then handed to the extractor that already exists for that type — see
+# tools/legacy_office.py for why the previous binary-guard rejection was not
+# an acceptable answer for a document.
+_LEGACY_EXTENSIONS = frozenset({".doc", ".xls"})
+EXTRACTABLE_EXTENSIONS = frozenset(
+    {".ipynb", ".docx", ".xlsx", ".pdf", ".msg"} | _LEGACY_EXTENSIONS
+)
 MAX_XLSX_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
@@ -44,6 +52,19 @@ def is_extractable_document(path: str) -> bool:
 
 def extract_document_text(path: str) -> str:
     ext = _extension(path)
+    if ext in _LEGACY_EXTENSIONS:
+        import os as _os
+
+        from tools.legacy_office import convert_to_ooxml
+
+        converted, _target = convert_to_ooxml(path)
+        try:
+            return extract_document_text(converted)
+        finally:
+            try:
+                _os.unlink(converted)
+            except OSError:
+                pass
     if ext == ".ipynb":
         return _extract_notebook(path)
     if ext == ".docx":
