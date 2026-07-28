@@ -77,6 +77,24 @@ def request_file_cache_scope(task_id: str) -> Iterator[None]:
         _CACHE.reset(token)
 
 
+def invalidate(task_id: str) -> int:
+    """Forget every memo for *task_id*, returning how many were dropped.
+
+    A memo says "the text is in the earlier tool result above". Context
+    compression can delete or summarise that result mid-request, at which point
+    the statement is false and the model has no way to recover the content — it
+    would have to guess at different pagination arguments. Compression therefore
+    invalidates the memo: the next identical read costs one real read again,
+    which is the correct price for not lying about what is in context.
+    """
+    memos = _memos(task_id)
+    if not memos:
+        return 0
+    dropped = len(memos)
+    memos.clear()
+    return dropped
+
+
 def _memos(task_id: str) -> Optional[dict[tuple[str, int, int], dict[str, object]]]:
     return (_CACHE.get() or {}).get(_task_key(task_id))
 
@@ -139,6 +157,7 @@ def repeat_notice(memo: dict, *, handle: str = "") -> dict:
 
 __all__ = [
     "MAX_MEMOS_PER_REQUEST",
+    "invalidate",
     "is_active",
     "lookup",
     "remember",

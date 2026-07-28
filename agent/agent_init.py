@@ -1115,17 +1115,18 @@ def init_agent(
         _tlg_cfg = ToolCallGuardrailConfig.from_mapping(
             _agent_cfg.get("tool_loop_guardrails", {})
         )
-        # Resolve the platform-scoped hard stop here so tool_guardrails itself
-        # stays a pure decision module with no ambient-state reads.
-        if not _tlg_cfg.hard_stop_enabled and _tlg_cfg.hard_stop_platforms:
-            from dataclasses import replace as _dc_replace
 
+        def _current_platform() -> str:
+            # Read at decision time: one api_server entry point constructs the
+            # agent before binding session contextvars, so anything resolved
+            # here and now would see an empty platform.
             from gateway.session_context import get_session_env
 
-            _platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip()
-            if _platform in _tlg_cfg.hard_stop_platforms:
-                _tlg_cfg = _dc_replace(_tlg_cfg, hard_stop_enabled=True)
-        agent._tool_guardrails = ToolCallGuardrailController(_tlg_cfg)
+            return get_session_env("HERMES_SESSION_PLATFORM", "")
+
+        agent._tool_guardrails = ToolCallGuardrailController(
+            _tlg_cfg, platform_resolver=_current_platform
+        )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
     # Cache only the derived auxiliary compression context override that is

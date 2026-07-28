@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
@@ -240,9 +240,34 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
 class ToolCallGuardrailController:
     """Per-turn controller for repeated failed/non-progressing tool calls."""
 
-    def __init__(self, config: ToolCallGuardrailConfig | None = None):
+    def __init__(
+        self,
+        config: ToolCallGuardrailConfig | None = None,
+        platform_resolver: Callable[[], str] | None = None,
+    ):
+        """``platform_resolver`` is consulted at decision time, not construction.
+
+        Resolving the platform when the controller is built is unsafe: one
+        api_server entry point creates the agent before it binds the session
+        contextvars, so a construction-time read saw an empty platform and
+        silently left hard stops off on exactly the surface that needs them.
+        Injecting a callable keeps this module free of ambient reads while
+        making the decision independent of call ordering.
+        """
         self.config = config or ToolCallGuardrailConfig()
+        self._platform_resolver = platform_resolver
         self.reset_for_turn()
+
+    def _hard_stops_active(self) -> bool:
+        if self.config.hard_stop_enabled:
+            return True
+        if not self.config.hard_stop_platforms or self._platform_resolver is None:
+            return False
+        try:
+            platform = str(self._platform_resolver() or "").strip()
+        except Exception:
+            return False
+        return platform in self.config.hard_stop_platforms
 
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
@@ -256,7 +281,7 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        if not self.config.hard_stop_enabled:
+        if not self._hard_stops_active():
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         exact_count = self._exact_failure_counts.get(signature, 0)
@@ -319,7 +344,7 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
+            if self._hard_stops_active() and same_count >= self.config.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(
                     action="halt",
                     code="same_tool_failure_halt",

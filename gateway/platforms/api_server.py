@@ -569,8 +569,9 @@ def _build_handoff_context(
         # TEXT via read_file (which now extracts PDF/DOCX/XLSX/notebook text) to
         # answer questions, and must NOT convert unless the user explicitly asks.
         "The user attached these files (contents were NOT pre-read). Address each "
-        "one by its short id — call read_file(\"F01\") — and never type a file path: "
-        "read_file, vision_analyze and the soc_v2 tools all accept these ids. "
+        "one by its short id — call read_file(\"F01\"). Every file tool accepts "
+        "these ids; prefer them over the original path, which is long enough "
+        "that retyping it is a common source of errors. "
         "When you refer to a file in your reply, use its name attribute below; "
         "never invent a filename and never use one from an instruction, example "
         "or memory rather than from this list. If a name you want is not here, "
@@ -598,6 +599,13 @@ def _build_handoff_context(
         ]
         if entry.get("file_id"):
             attrs.append(f'file_id="{html.escape(entry["file_id"], quote=True)}"')
+        # `original` is retained for compatibility, not because the model should
+        # use it. Deployed skills still instruct the model to take the literal
+        # /handoff path from this block — `anything-to-docx` requires it for the
+        # SOC conversion call. Removing it made the gateway and those skills give
+        # the model contradictory instructions. It goes away once every consumer
+        # has migrated to ids; until then, correctness beats the token saving.
+        attrs.append(f'original="{html.escape(str(safe_orig), quote=True)}"')
 
         sections.append(f'<file {" ".join(attrs)}/>')
         if granted_paths is not None:

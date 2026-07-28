@@ -319,3 +319,73 @@ def test_repeated_identical_read_blocks_once_hard_stops_are_on():
     # The live incident re-read single files 14 times; the block must land far
     # below that to be worth anything.
     assert blocked_at <= 8, blocked_at
+
+
+def test_platform_resolver_is_consulted_at_decision_time_not_construction():
+    """Ordering must not decide whether hard stops apply.
+
+    One api_server entry point calls `_create_agent` before `set_session_vars`,
+    so a platform read taken when the controller is built saw an empty string
+    and silently left hard stops off on the surface that needs them most.
+    """
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    platform = {"value": ""}  # unbound at construction, as on that path
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: platform["value"]
+    )
+    args = {"path": "F01"}
+    result = '{"content": "unchanging"}'
+
+    def first_block():
+        controller.reset_for_turn()
+        for attempt in range(1, 12):
+            if controller.before_call("read_file", args).should_halt:
+                return attempt
+            controller.after_call("read_file", args, result, failed=False)
+        return None
+
+    assert first_block() is None, "cli/unbound must stay warn-only"
+
+    platform["value"] = "api_server"
+    assert first_block() is not None, "api_server must hard stop once bound"
+
+
+def test_a_broken_platform_resolver_degrades_to_warn_only():
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    def boom():
+        raise RuntimeError("session context unavailable")
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=boom
+    )
+    args = {"path": "F01"}
+    for _ in range(12):
+        assert not controller.before_call("read_file", args).should_halt
+        controller.after_call("read_file", args, '{"content": "x"}', failed=False)
+
+
+def test_explicit_hard_stop_enabled_does_not_need_a_resolver():
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    args = {"path": "F01"}
+    blocked = False
+    for _ in range(12):
+        if controller.before_call("read_file", args).should_halt:
+            blocked = True
+            break
+        controller.after_call("read_file", args, '{"content": "x"}', failed=False)
+    assert blocked

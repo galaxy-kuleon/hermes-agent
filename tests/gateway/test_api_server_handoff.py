@@ -58,9 +58,10 @@ def test_handoff_context_accepts_minimal_signed_path_metadata(monkeypatch, tmp_p
     # model at all: it is ~190 characters the model can only get wrong, and
     # every path it invented in the live incident was a variation on one it
     # had been shown.
-    assert '<file id="F01" name="report.pdf"/>' in out
-    assert str(original) not in out
-    assert 'original="' not in out
+    assert '<file id="F01" name="report.pdf"' in out
+    # `original` stays until every deployed skill consumer has migrated to ids:
+    # anything-to-docx still requires the literal /handoff path for SOC.
+    assert f'original="{original}"' in out
     assert 'markdown="' not in out
     assert "%PDF original" not in out
 
@@ -84,11 +85,11 @@ def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeyp
     out = api_server._augment_message_with_handoff_context(message, _scope())
 
     assert "<files>" not in out
-    assert '<file id="F01" name="report.pdf" file_id="owui-file-1"/>' in out
+    assert '<file id="F01" name="report.pdf" file_id="owui-file-1"' in out
     # sha256 is verified on the way in and is useless to the model, so it is
     # not re-emitted: 64 chars per file over a 46-file audit is pure noise.
     assert sha256 not in out
-    assert str(original) not in out
+    assert f'original="{original}"' in out
     assert "%PDF original" not in out
 
 
@@ -174,8 +175,7 @@ def test_legacy_markdown_signature_is_accepted_without_hydrating_markdown(
     out = api_server._augment_message_with_handoff_context(message, _scope())
 
     assert "<files>" not in out
-    assert '<file id="F01" name="report.pdf"/>' in out
-    assert str(original) not in out
+    assert '<file id="F01" name="report.pdf"' in out
     assert 'markdown="' not in out
     assert "SECRET MARKDOWN CONTENT" not in out
 
@@ -219,8 +219,7 @@ def test_multimodal_text_part_handoff_is_stripped_and_augmented(monkeypatch, tmp
     text = out[0]["text"]
     assert "<files>" not in text
     assert '<attached_files source="openwebui-skip-rag-handoff">' in text
-    assert '<file id="F01" name="report.pdf"/>' in text
-    assert str(original) not in text
+    assert '<file id="F01" name="report.pdf"' in text
     assert 'markdown="' not in text
 
 
@@ -311,8 +310,7 @@ async def test_runs_api_handoff_input_becomes_path_only_metadata(monkeypatch, tm
     user_message = captured["user_message"]
     assert "<files>" not in user_message
     assert '<attached_files source="openwebui-skip-rag-handoff">' in user_message
-    assert '<file id="F01" name="report.pdf"/>' in user_message
-    assert str(original) not in user_message
+    assert '<file id="F01" name="report.pdf"' in user_message
     assert 'markdown="' not in user_message
     assert captured["grant_error"] is None
     assert "not granted" in captured["ungranted_error"].lower()
@@ -397,5 +395,5 @@ def test_handoff_guidance_refuses_names_from_outside_the_list(monkeypatch, tmp_p
     assert "instruction, example" in out
     assert "the file was not attached" in out
     # And the roster is the authority the guidance points at.
-    assert '<file id="F01" name="report.pdf"/>' in out
+    assert '<file id="F01" name="report.pdf"' in out
     assert "attachments()" in out

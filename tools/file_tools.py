@@ -509,6 +509,28 @@ _file_ops_cache: dict = {}
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
 
+
+def forget_task_reads(task_id: str = "default") -> int:
+    """Drop the per-task read dedup state, returning how many keys were cleared.
+
+    The dedup answers a repeated read with "refer to your earlier result".
+    After context compression that earlier result may no longer exist, so the
+    suppression has to be released together with the request-scoped memo —
+    otherwise the model is told to look at something that is gone and has no
+    way to ask for it again.
+    """
+    key = str(task_id or "default")
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(key)
+        if not task_data:
+            return 0
+        cleared = len(task_data.get("dedup") or {})
+        task_data["dedup"] = {}
+        task_data["dedup_hits"] = {}
+        task_data["last_key"] = None
+        task_data["consecutive"] = 0
+    return cleared
+
 # Track consecutive patch failures per (task_id, resolved_path).  Used to
 # escalate the hint when the model repeatedly fails to patch the same file
 # (typical cause: stale view of file contents, ambiguous old_string, or

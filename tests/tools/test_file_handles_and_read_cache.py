@@ -294,3 +294,79 @@ class ExtractedDocumentRepeatTests(unittest.TestCase):
         for pass_results in (second_pass, third_pass):
             self.assertTrue(all(r.get("already_read") for r in pass_results))
             self.assertFalse(any("content" in r for r in pass_results))
+
+
+class MemoCompressionInvalidationTests(unittest.TestCase):
+    """A memo must never outlive the tool result it points at.
+
+    The memo tells the model "the full text is in the earlier tool result
+    above". Mid-request context compression can delete or summarise that
+    result, and the model then has no way to recover the content — it would
+    have to guess at different pagination arguments, because there is no
+    explicit force-reread. Codex's round-2 review demonstrated exactly this
+    with a compressed-message reproduction, so it is a correctness gap rather
+    than an efficiency tradeoff.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "001-da36574d-long.txt"
+        self.path.write_text("unique body marker\n" * 40, encoding="utf-8")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _read(self, arg, task_id="task-c"):
+        from tools.file_tools import read_file_tool
+
+        return json.loads(read_file_tool(arg, task_id=task_id))
+
+    def _clear(self, task_id):
+        """What _compress_context does: release both suppression layers."""
+        from tools.file_tools import forget_task_reads
+
+        return request_file_cache.invalidate(task_id) + forget_task_reads(task_id)
+
+    def test_invalidate_reports_what_it_dropped(self):
+        handles = make_file_handles([str(self.path)])
+        with file_grant_scope("task-c", [str(self.path)], handles=handles), (
+            request_file_cache.request_file_cache_scope("task-c")
+        ):
+            self._read("F01")
+            self.assertEqual(request_file_cache.invalidate("task-c"), 1)
+            self.assertEqual(request_file_cache.invalidate("task-c"), 0)
+
+    def test_content_is_available_again_after_invalidation(self):
+        handles = make_file_handles([str(self.path)])
+        with file_grant_scope("task-c", [str(self.path)], handles=handles), (
+            request_file_cache.request_file_cache_scope("task-c")
+        ):
+            first = self._read("F01")
+            memoed = self._read("F01")
+            self._clear("task-c")
+            after = self._read("F01")
+
+        self.assertIn("unique body marker", first["content"])
+        self.assertTrue(memoed.get("already_read"))
+        self.assertNotIn("content", memoed)
+        # The whole point: once the earlier result may be gone, a repeat read
+        # must return the text rather than pointing at something absent.
+        self.assertIn("unique body marker", after["content"])
+        self.assertFalse(after.get("already_read"))
+
+    def test_invalidation_is_scoped_to_one_task(self):
+        handles = make_file_handles([str(self.path)])
+        with file_grant_scope("task-c", [str(self.path)], handles=handles), (
+            request_file_cache.request_file_cache_scope("task-c")
+        ), file_grant_scope("task-d", [str(self.path)], handles=handles), (
+            request_file_cache.request_file_cache_scope("task-d")
+        ):
+            self._read("F01", "task-c")
+            self._read("F01", "task-d")
+            self._clear("task-c")
+            self.assertTrue(self._read("F01", "task-d").get("already_read"))
+            self.assertIn("unique body marker", self._read("F01", "task-c")["content"])
+
+    def test_invalidate_is_safe_without_a_scope(self):
+        self.assertEqual(request_file_cache.invalidate("no-such-task"), 0)
