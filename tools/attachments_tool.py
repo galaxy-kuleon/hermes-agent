@@ -25,15 +25,39 @@ import re
 from pathlib import Path
 
 from tools import request_file_cache
+from tools.binary_extensions import has_binary_extension, has_image_extension
 from tools.file_grants import list_file_handles
+from tools.read_extract import is_extractable_document
 
 
 # Path B basenames are "<3-digit ordinal>-<8-hex nonce>-<sanitised name>".
 _HANDOFF_NAME_PREFIX = re.compile(r"^\d{3}-[0-9a-f]{8}-")
 
+READ_WITH_FILE = "read_file"
+READ_WITH_VISION = "vision_analyze"
+READ_WITH_UNSUPPORTED = "unsupported"
+
 
 def _display_name(path: str) -> str:
     return _HANDOFF_NAME_PREFIX.sub("", Path(path).name, count=1) or Path(path).name
+
+
+def _reader_guidance(handle: str, path: str) -> tuple[str, str]:
+    """Return the model-facing reader route without inspecting file contents."""
+    if has_image_extension(path):
+        return (
+            READ_WITH_VISION,
+            f'Call vision_analyze(image_url="{handle}"). Do not call read_file first.',
+        )
+    # Mirror read_file's own gate: extractable documents are attempted before
+    # its binary guard, while unknown extensions remain eligible for read_file.
+    # Keeping that fallback here avoids a second, drifting "text extensions" list.
+    if is_extractable_document(path) or not has_binary_extension(path):
+        return READ_WITH_FILE, f'Call read_file("{handle}").'
+    return (
+        READ_WITH_UNSUPPORTED,
+        "No direct reader is available for this binary attachment.",
+    )
 
 
 def attachments_tool(task_id: str = "default") -> str:
@@ -66,6 +90,10 @@ def attachments_tool(task_id: str = "default") -> str:
             "name": _display_name(path),
             "read": memo is not None,
         }
+        entry["read_with"], entry["read_instruction"] = _reader_guidance(
+            handle,
+            path,
+        )
         if memo is not None:
             read_count += 1
             entry["chars"] = memo.get("chars")
@@ -84,9 +112,11 @@ def attachments_tool(task_id: str = "default") -> str:
     if unread:
         payload["note"] = (
             f"{len(unread)} of {len(files)} attached files have not been read "
-            "yet. Read them by id, e.g. read_file(\"" + unread[0] + "\"). Do not "
-            "report on a file you have not read, and do not claim full coverage "
-            "while this list is non-empty."
+            f"yet, starting with {unread[0]}. Follow each file's read_with and "
+            "read_instruction fields; do not send vision_analyze or unsupported "
+            "attachments to read_file first. Do not report on a file you have "
+            "not read, and do not claim full coverage while this list is "
+            "non-empty."
         )
     else:
         payload["note"] = (
@@ -100,11 +130,12 @@ ATTACHMENTS_SCHEMA = {
     "name": "attachments",
     "description": (
         "List the files attached to the current request and which of them you "
-        "have already read. Returns each file's short id and name, plus the ids "
-        "still unread. Call this before claiming an audit or summary is "
-        "complete, and whenever you are unsure which files you were given — it "
-        "is authoritative, unlike your recollection of earlier turns. Takes no "
-        "arguments."
+        "have already read. Each file says whether to use read_file, "
+        "vision_analyze, or no direct reader, including an exact instruction. "
+        "Returns each file's short id and name, plus the ids still unread. Call "
+        "this before claiming an audit or summary is complete, and whenever "
+        "you are unsure which files you were given — it is authoritative, "
+        "unlike your recollection of earlier turns. Takes no arguments."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }

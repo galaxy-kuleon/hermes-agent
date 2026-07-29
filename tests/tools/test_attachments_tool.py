@@ -20,10 +20,10 @@ from tools.file_tools import read_file_tool
 class AttachmentsLedgerTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
+        self.root = Path(self._tmp.name)
         self.paths = []
         for index in (1, 2, 3):
-            path = root / f"00{index}-da36574d-letter{index}.txt"
+            path = self.root / f"00{index}-da36574d-letter{index}.txt"
             path.write_text(f"body {index}\n", encoding="utf-8")
             self.paths.append(str(path))
         self.handles = make_file_handles(self.paths)
@@ -31,6 +31,18 @@ class AttachmentsLedgerTests(unittest.TestCase):
 
     def _ledger(self, task_id="task-1"):
         return json.loads(attachments_tool(task_id))
+
+    def _ledger_for_names(self, names, task_id):
+        paths = []
+        for index, name in enumerate(names, start=1):
+            path = self.root / f"{index:03d}-da36574d-{name}"
+            path.write_bytes(b"fixture")
+            paths.append(str(path))
+        handles = make_file_handles(paths)
+        with file_grant_scope(task_id, paths, handles=handles), (
+            request_file_cache.request_file_cache_scope(task_id)
+        ):
+            return self._ledger(task_id)
 
     def test_reports_every_attachment_before_anything_is_read(self):
         with file_grant_scope("task-1", self.paths, handles=self.handles), (
@@ -43,6 +55,10 @@ class AttachmentsLedgerTests(unittest.TestCase):
         self.assertEqual(
             [f["name"] for f in ledger["files"]],
             ["letter1.txt", "letter2.txt", "letter3.txt"],
+        )
+        self.assertEqual(
+            [f["read_with"] for f in ledger["files"]],
+            ["read_file", "read_file", "read_file"],
         )
 
     def test_read_progress_is_tracked_per_file(self):
@@ -57,7 +73,60 @@ class AttachmentsLedgerTests(unittest.TestCase):
         by_id = {f["id"]: f for f in ledger["files"]}
         self.assertTrue(by_id["F01"]["read"])
         self.assertFalse(by_id["F02"]["read"])
+        self.assertEqual(by_id["F01"]["read_with"], "read_file")
+        self.assertEqual(by_id["F02"]["read_with"], "read_file")
+        self.assertEqual(by_id["F01"]["read_instruction"], 'Call read_file("F01").')
+        self.assertEqual(by_id["F02"]["read_instruction"], 'Call read_file("F02").')
         self.assertIn("chars", by_id["F01"])
+        self.assertIn("lines", by_id["F01"])
+        self.assertNotIn("chars", by_id["F02"])
+        self.assertNotIn("lines", by_id["F02"])
+
+    def test_png_and_jpg_route_directly_to_vision(self):
+        ledger = self._ledger_for_names(
+            ["diagram.png", "scan.JPG"],
+            "image-routing",
+        )
+        for entry in ledger["files"]:
+            self.assertEqual(entry["read_with"], "vision_analyze")
+            self.assertIn(
+                f'vision_analyze(image_url="{entry["id"]}")',
+                entry["read_instruction"],
+            )
+            self.assertIn("Do not call read_file first", entry["read_instruction"])
+
+    def test_text_markdown_and_pdf_route_to_read_file(self):
+        ledger = self._ledger_for_names(
+            ["notes.txt", "brief.md", "contract.pdf"],
+            "read-file-routing",
+        )
+        for entry in ledger["files"]:
+            self.assertEqual(entry["read_with"], "read_file")
+            self.assertEqual(
+                entry["read_instruction"],
+                f'Call read_file("{entry["id"]}").',
+            )
+
+    def test_unknown_extension_follows_existing_non_binary_guard(self):
+        ledger = self._ledger_for_names(
+            ["evidence.future-format"],
+            "unknown-routing",
+        )
+        entry = ledger["files"][0]
+        self.assertEqual(entry["read_with"], "read_file")
+        self.assertEqual(entry["read_instruction"], 'Call read_file("F01").')
+
+    def test_other_binary_is_explicitly_not_directly_readable(self):
+        ledger = self._ledger_for_names(
+            ["bundle.zip"],
+            "binary-routing",
+        )
+        entry = ledger["files"][0]
+        self.assertEqual(entry["read_with"], "unsupported")
+        self.assertEqual(
+            entry["read_instruction"],
+            "No direct reader is available for this binary attachment.",
+        )
 
     def test_incomplete_coverage_says_so_in_actionable_terms(self):
         # The single fact chat f248f12e never surfaced: 28 files untouched.
@@ -82,10 +151,22 @@ class AttachmentsLedgerTests(unittest.TestCase):
         self.assertIn("Every attached file has been read", ledger["note"])
 
     def test_no_attachments_tells_the_model_not_to_guess(self):
-        ledger = self._ledger("task-with-nothing")
-        self.assertEqual(ledger["total"], 0)
-        self.assertEqual(ledger["files"], [])
-        self.assertIn("Do not guess", ledger["note"])
+        raw = attachments_tool("task-with-nothing")
+        self.assertEqual(
+            raw,
+            json.dumps(
+                {
+                    "success": True,
+                    "total": 0,
+                    "note": (
+                        "No files are attached to this request. Do not guess "
+                        "file names or paths — ask the user to attach them."
+                    ),
+                    "files": [],
+                },
+                ensure_ascii=False,
+            ),
+        )
 
     def test_ledger_never_exposes_paths(self):
         # The model is addressed in handles; leaking the signed path back would
