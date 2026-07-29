@@ -110,6 +110,26 @@ ENV HERMES_HOME=/home/hermes
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV PATH="/opt/hermes/venv/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
 
-VOLUME ["/home/hermes", "/opt/data"]
+# No VOLUME instruction. Declaring one makes Docker create an anonymous
+# read-write volume at that path for any container that does not mount
+# something there itself, which had three consequences:
+#
+#   * `read_only: true` stopped meaning read-only. hermes-skill-admin declares
+#     read_only, cap_drop ALL, no-new-privileges and network_mode none, and
+#     still received two writable volumes, because volume paths are not part
+#     of the read-only rootfs.
+#   * Every such container stranded a volume. Creating one added two and
+#     `docker rm` without `-v` left both behind; four orphans accumulated on
+#     the deployment host, one holding 8,246 entries / 276 MB of abandoned
+#     Hermes state.
+#   * Each one copied the image layer in first — 7,916 files per container.
+#
+# Every service that needs persistence at these paths mounts it explicitly in
+# docker-compose.yml, so nothing loses data. A container that mounts nothing
+# now writes to its own layer and discards it on removal, which is the honest
+# behaviour for a path nobody asked to persist.
+#
+# Verified before removal: no container outside this Compose project uses this
+# image, and the repository contains no `docker run` invocation of it.
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh"]
 CMD ["hermes", "gateway", "run"]
