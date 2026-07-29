@@ -25,39 +25,15 @@ import re
 from pathlib import Path
 
 from tools import request_file_cache
-from tools.binary_extensions import has_binary_extension, has_image_extension
 from tools.file_grants import list_file_handles
-from tools.read_extract import is_extractable_document
+from tools.file_reader_routing import reader_guidance as _reader_guidance
 
 
 # Path B basenames are "<3-digit ordinal>-<8-hex nonce>-<sanitised name>".
 _HANDOFF_NAME_PREFIX = re.compile(r"^\d{3}-[0-9a-f]{8}-")
 
-READ_WITH_FILE = "read_file"
-READ_WITH_VISION = "vision_analyze"
-READ_WITH_UNSUPPORTED = "unsupported"
-
-
 def _display_name(path: str) -> str:
     return _HANDOFF_NAME_PREFIX.sub("", Path(path).name, count=1) or Path(path).name
-
-
-def _reader_guidance(handle: str, path: str) -> tuple[str, str]:
-    """Return the model-facing reader route without inspecting file contents."""
-    if has_image_extension(path):
-        return (
-            READ_WITH_VISION,
-            f'Call vision_analyze(image_url="{handle}"). Do not call read_file first.',
-        )
-    # Mirror read_file's own gate: extractable documents are attempted before
-    # its binary guard, while unknown extensions remain eligible for read_file.
-    # Keeping that fallback here avoids a second, drifting "text extensions" list.
-    if is_extractable_document(path) or not has_binary_extension(path):
-        return READ_WITH_FILE, f'Call read_file("{handle}").'
-    return (
-        READ_WITH_UNSUPPORTED,
-        "No direct reader is available for this binary attachment.",
-    )
 
 
 def attachments_tool(task_id: str = "default") -> str:

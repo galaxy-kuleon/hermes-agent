@@ -105,6 +105,16 @@ def list_file_handles(task_id: str) -> list[tuple[str, str]]:
     return sorted(aliases.items())
 
 
+def file_handle_for_path(path: str | Path, *, task_id: str) -> str | None:
+    """Return the current request's handle for *path*, if it has one."""
+    canonical_path = _canonical_path(path)
+    aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
+    for handle, target in aliases.items():
+        if target == canonical_path:
+            return handle
+    return None
+
+
 def _known_handles_hint(task_id: str) -> str:
     aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
     if not aliases:
@@ -183,6 +193,7 @@ def make_file_capability(
 
 __all__ = [
     "_CAPABILITY_META_KEY",
+    "file_handle_for_path",
     "file_grant_error",
     "file_grant_scope",
     "make_file_capability",

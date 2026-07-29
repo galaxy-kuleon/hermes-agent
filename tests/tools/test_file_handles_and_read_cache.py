@@ -202,6 +202,106 @@ class ReadFileHandleAndCacheTests(unittest.TestCase):
             self.assertFalse(result.get("already_read"))
 
 
+class VisionReadRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.image = self.root / "001-da36574d-diagram.png"
+        self.image.write_bytes(b"fixture")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _read(self, path, task_id):
+        from tools.file_tools import read_file_tool
+
+        return json.loads(read_file_tool(path, task_id=task_id))
+
+    def test_image_handle_error_names_the_exact_vision_call(self):
+        handles = make_file_handles([str(self.image)])
+        with file_grant_scope(
+            "vision-handle",
+            [str(self.image)],
+            handles=handles,
+        ):
+            result = self._read("F01", "vision-handle")
+
+        self.assertTrue(
+            result["error"].endswith(
+                'Call vision_analyze(image_url="F01") instead.'
+            ),
+            result["error"],
+        )
+
+    def test_attached_image_absolute_path_recovers_to_its_handle(self):
+        handles = make_file_handles([str(self.image)])
+        with file_grant_scope(
+            "vision-absolute",
+            [str(self.image)],
+            handles=handles,
+        ):
+            result = self._read(str(self.image), "vision-absolute")
+
+        self.assertIn(
+            'Call vision_analyze(image_url="F01") instead.',
+            result["error"],
+        )
+
+    def test_unaliased_absolute_image_uses_its_resolved_path(self):
+        result = self._read(str(self.image), "vision-cli")
+
+        self.assertIn(
+            f'Call vision_analyze(image_url="{self.image.resolve()}") instead.',
+            result["error"],
+        )
+
+    def test_non_image_binary_keeps_the_generic_error(self):
+        archive = self.root / "bundle.zip"
+        archive.write_bytes(b"fixture")
+
+        result = self._read(str(archive), "non-image-binary")
+
+        self.assertIn(
+            "Use vision_analyze for images, or terminal to inspect binary files.",
+            result["error"],
+        )
+        self.assertNotIn("Call vision_analyze(", result["error"])
+
+    def test_extractable_document_is_still_read(self):
+        notebook = self.root / "notes.ipynb"
+        notebook.write_text(
+            json.dumps(
+                {
+                    "cells": [
+                        {
+                            "cell_type": "markdown",
+                            "source": ["extractable marker"],
+                        }
+                    ],
+                    "metadata": {},
+                    "nbformat": 4,
+                    "nbformat_minor": 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self._read(str(notebook), "extractable-document")
+
+        self.assertTrue(result["extracted_document"])
+        self.assertIn("extractable marker", result["content"])
+
+    def test_unknown_extension_is_still_read_as_text(self):
+        unknown = self.root / "notes.future-format"
+        unknown.write_text("unknown extension marker\n", encoding="utf-8")
+
+        result = self._read(str(unknown), "unknown-extension")
+
+        self.assertNotIn("error", result)
+        self.assertIn("unknown extension marker", result["content"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

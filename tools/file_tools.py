@@ -1524,6 +1524,26 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
+            from tools.file_grants import file_handle_for_path
+            from tools.file_reader_routing import (
+                READ_WITH_VISION,
+                reader_call,
+                reader_route,
+            )
+
+            read_with = reader_route(str(_resolved))
+            if read_with == READ_WITH_VISION:
+                target = (
+                    file_handle_for_path(_resolved, task_id=task_id)
+                    or str(_resolved)
+                )
+                recovery_call = reader_call(read_with, target)
+                return json.dumps({
+                    "error": (
+                        f"Cannot read binary file '{path}' ({_ext}). "
+                        f"Call {recovery_call} instead."
+                    ),
+                })
             return json.dumps({
                 "error": (
                     f"Cannot read binary file '{path}' ({_ext}). "
