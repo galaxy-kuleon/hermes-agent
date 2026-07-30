@@ -1,9 +1,12 @@
 """Regression tests for Hermes' Spectrum mixed text+attachment workaround."""
 from __future__ import annotations
 
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
+
+import pytest
 
 
 _PATCHER = Path("plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs")
@@ -17,6 +20,7 @@ def test_sidecar_applies_spectrum_patch_before_importing_sdk() -> None:
     assert index.index("patchSpectrumTs();") < index.index('await import("spectrum-ts")')
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required")
 def test_spectrum_patch_preserves_text_when_single_attachment(tmp_path: Path) -> None:
     """The sidecar dependency patch must turn text+one attachment into group content."""
     dist = tmp_path / "node_modules" / "spectrum-ts" / "dist"

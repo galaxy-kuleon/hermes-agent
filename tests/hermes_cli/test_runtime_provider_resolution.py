@@ -3,6 +3,14 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+class _EmptyPool:
+    def has_credentials(self):
+        return False
+
+    def select(self):
+        return None
+
+
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     class _Entry:
         access_token = "pool-token"
@@ -152,6 +160,7 @@ def test_resolve_runtime_provider_codex(monkeypatch):
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _EmptyPool())
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -212,6 +221,7 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _EmptyPool())
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",

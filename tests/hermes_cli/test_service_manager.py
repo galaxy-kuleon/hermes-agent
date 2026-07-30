@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from hermes_cli.service_manager import (
@@ -436,7 +438,9 @@ def test_s6_manager_kind_and_supports_registration() -> None:
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+def test_seed_supervise_skeleton_creates_expected_layout(
+    tmp_path, monkeypatch
+) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
 
@@ -445,6 +449,12 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
 
+    # Exercise the ownership-before-mode ordering without requiring root.
+    real_chown = os.chown
+    monkeypatch.setattr(
+        "os.chown",
+        lambda path, _uid, _gid: real_chown(path, os.getuid(), os.getgid()),
+    )
     _seed_supervise_skeleton(svc_dir)
 
     # Top-level event/ — s6-svlisten1 event subscription dir.
@@ -473,7 +483,9 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     assert stat.S_IMODE(control.stat().st_mode) == 0o660
 
 
-def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
+def test_seed_supervise_skeleton_handles_log_subservice(
+    tmp_path, monkeypatch
+) -> None:
     """When a log/ subdir exists, its supervise tree also gets seeded.
 
     Without this, ``unregister_profile_gateway``'s rmtree would EACCES
@@ -488,6 +500,11 @@ def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
     svc_dir.mkdir()
     (svc_dir / "log").mkdir()  # logger subdir present
 
+    real_chown = os.chown
+    monkeypatch.setattr(
+        "os.chown",
+        lambda path, _uid, _gid: real_chown(path, os.getuid(), os.getgid()),
+    )
     _seed_supervise_skeleton(svc_dir)
 
     # Logger's own supervise tree is seeded the same way.
