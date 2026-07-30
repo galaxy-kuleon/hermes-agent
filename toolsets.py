@@ -36,8 +36,11 @@ _HERMES_CORE_TOOLS = [
     # Read the desktop GUI's embedded terminal pane (gated on HERMES_DESKTOP
     # via check_fn in tools/read_terminal_tool.py — hidden outside the GUI).
     "read_terminal",
-    # File manipulation
-    "read_file", "write_file", "patch", "search_files",
+    # File manipulation. Keep this aligned with the backward-compatible
+    # ``file`` composite below so reverse-mapping a platform composite does
+    # not silently drop the whole file toolset when new read tools are added.
+    "attachments", "read_file", "write_file", "patch", "search_files",
+    "local_document_export",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills

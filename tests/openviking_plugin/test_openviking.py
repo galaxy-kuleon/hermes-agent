@@ -150,8 +150,20 @@ class TestOpenVikingSkillQuerySafety:
         assert RecordingVikingClient.calls == [
             (
                 "/api/v1/search/find",
-                {"query": "make a skill for release triage", "limit": 5},
-            )
+                {
+                    "query": "make a skill for release triage",
+                    "limit": 5,
+                    "target_uri": "viking://user/default/",
+                },
+            ),
+            (
+                "/api/v1/search/find",
+                {
+                    "query": "make a skill for release triage",
+                    "limit": 5,
+                    "target_uri": "viking://resources/",
+                },
+            ),
         ]
 
     def test_queue_prefetch_searches_only_skill_bundle_user_instruction(self, monkeypatch):
@@ -181,8 +193,20 @@ class TestOpenVikingSkillQuerySafety:
         assert RecordingVikingClient.calls == [
             (
                 "/api/v1/search/find",
-                {"query": "fix the failing retrieval test", "limit": 5},
-            )
+                {
+                    "query": "fix the failing retrieval test",
+                    "limit": 5,
+                    "target_uri": "viking://user/default/",
+                },
+            ),
+            (
+                "/api/v1/search/find",
+                {
+                    "query": "fix the failing retrieval test",
+                    "limit": 5,
+                    "target_uri": "viking://resources/",
+                },
+            ),
         ]
 
     def test_queue_prefetch_skips_slash_skill_without_user_instruction(self, monkeypatch):
