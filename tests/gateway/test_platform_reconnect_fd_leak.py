@@ -296,6 +296,10 @@ class TestAPIServerDisconnectClosesResponseStore:
         adapter._site = None
         adapter._runner = None
         adapter._app = None
+        adapter._idle_commit_task = None
+        adapter._sweep_task = None
+        adapter._dreaming_scheduler_task = None
+        adapter._openwebui_bridge_service = None
         adapter._response_store = store
         adapter.platform = Platform.API_SERVER
         return adapter

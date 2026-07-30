@@ -11,7 +11,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestServer
+
+from tests.gateway.api_server_test_client import ScopedTestClient as TestClient
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (

@@ -366,7 +366,7 @@ TIPS = [
     # --- Curator ---
     'hermes curator run --dry-run previews what the curator would archive or consolidate without mutating anything.',
     "hermes curator pin <skill> hard-fences a skill against both auto-archival and the agent's skill_manage tool.",
-    'hermes curator rollback restores mutable profile skills from a pre-run snapshot; platform snapshots live under skill-state/platform/curator-backups and require the operator workflow.',
+    'hermes curator rollback restores profile skills; platform backups under skill-state/platform/curator-backups require the operator workflow.',
 
     # --- Credential Pools & Routing ---
     'hermes auth reset <provider> clears all cooldowns and exhaustion flags on a credential pool.',
