@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import socket
+import tarfile
 import threading
 import time
 from pathlib import Path
@@ -170,8 +171,46 @@ def test_editor_create_update_denied_delete_and_structured_audit(writer_runtime)
     }
     assert receipt["result"]["before_hash"] is None
     assert receipt["result"]["after_hash"] == created["after_hash"]
+    outbox = receipt["result"]["governance_outbox"]
+    assert outbox["state"] == "present"
+    assert outbox["destination"] == "shared-one"
+    assert outbox["tree_hash"] == created["after_hash"]
+    archive = receipt_path.parent / outbox["archive"]
+    assert archive.is_file()
+    with tarfile.open(archive, "r:gz") as handle:
+        assert "shared-one/SKILL.md" in handle.getnames()
     assert "_change" not in receipt["result"]
     assert "version-one" not in receipt_path.read_text()
+
+
+def test_missing_governance_outbox_rolls_back_shared_mutation(
+    writer_runtime, monkeypatch
+):
+    from tools import platform_skill_store as store
+
+    def fail_capture(*_args, **_kwargs):
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(store, "capture_transaction_post_state", fail_capture)
+    tokens = _scope(EDITOR_GROUP)
+    try:
+        result = writer.request_shared_skill_mutation(
+            "create",
+            "must-rollback",
+            arguments={
+                "content": VALID_SKILL.format(
+                    name="must-rollback",
+                    body="must never commit without evidence",
+                )
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["success"] is False
+    assert result["error_code"] == "mutation_failed"
+    assert not (writer_runtime["platform"] / "must-rollback").exists()
+    assert store.read_generation(writer_runtime["home"] / "skill-state" / "platform") == 0
 
 
 def test_admin_delete_and_rollback_restore_content(writer_runtime):
@@ -221,6 +260,11 @@ def test_admin_delete_and_rollback_restore_content(writer_runtime):
     receipt = json.loads(receipt_path.read_text())
     assert receipt["rollback_request"]["actor"] == "alice"
     assert receipt["rollback_request"]["groups"] == [ADMIN_GROUP]
+    rollback_outbox = receipt["rollback_governance_outbox"]
+    assert rollback_outbox["state"] == "present"
+    assert rollback_outbox["destination"] == "restore-me"
+    assert rollback_outbox["tree_hash"] == rolled_back["audit"]["after_hash"]
+    assert (receipt_path.parent / rollback_outbox["archive"]).is_file()
 
 
 def test_publish_copies_only_explicit_personal_tree(writer_runtime):

@@ -490,6 +490,23 @@ def _target_hash(name: str) -> Optional[str]:
     return skill_tree_hash(found["path"]) if found else None
 
 
+def _platform_destination(found: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return one found platform skill's stable store-relative destination."""
+
+    if not found:
+        return None
+    from tools.skill_state import platform_skills_dir
+
+    root = platform_skills_dir()
+    try:
+        return found["path"].relative_to(root).as_posix()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SharedSkillWriterError(
+            "shared skill resolved outside the platform store",
+            code="invalid_platform_target",
+        ) from exc
+
+
 def _audit_event(
     payload: Dict[str, Any], *, result: str, reason_code: str = "", **extra: Any
 ) -> Dict[str, Any]:
@@ -604,7 +621,9 @@ def _execute_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "audit_index_status": "ok" if audit_index_ok else "degraded",
         }
 
+    found_before = _find_platform_skill(name)
     before_hash = _target_hash(name)
+    before_destination = _platform_destination(found_before)
     started = time.monotonic()
     transaction_context: Dict[str, Optional[str]] = {"id": None}
     try:
@@ -700,6 +719,19 @@ def _execute_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 sanitized.pop("file_preview", None)
                 sanitized["before_hash"] = before_hash
                 sanitized["after_hash"] = _target_hash(name)
+                after_destination = _platform_destination(_find_platform_skill(name))
+                destination = after_destination or before_destination
+                if not destination:
+                    raise SharedSkillWriterError(
+                        "shared skill destination is unavailable after mutation",
+                        code="invalid_platform_target",
+                    )
+                sanitized["governance_outbox"] = (
+                    store.capture_transaction_post_state(
+                        transaction_id,
+                        destination,
+                    )
+                )
                 return sanitized
 
             identity = payload["identity"]
