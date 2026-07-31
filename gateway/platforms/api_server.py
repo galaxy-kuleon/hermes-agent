@@ -60,6 +60,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from tools.file_reader_routing import reader_guidance
 
 logger = logging.getLogger(__name__)
 
@@ -565,18 +566,16 @@ def _build_handoff_context(
     handle_offset = len(granted_paths) if granted_paths is not None else 0
     sections: List[str] = [
         '<attached_files source="openwebui-skip-rag-handoff">',
-        # Path-B guidance (2026-07-15): the agent must read the delivered file's
-        # TEXT via read_file (which now extracts PDF/DOCX/XLSX/notebook text) to
-        # answer questions, and must NOT convert unless the user explicitly asks.
-        "The user attached these files (contents were NOT pre-read). Address each "
-        "one by its short id — call read_file(\"F01\"). Every file tool accepts "
-        "these ids; prefer them over the original path, which is long enough "
-        "that retyping it is a common source of errors. "
+        "The user attached these files (contents were NOT pre-read). Call "
+        "attachments() first, then follow each file's read_with and "
+        "read_instruction exactly; do not choose a reader from habit. Every "
+        "file tool accepts the short ids, so prefer them over the original "
+        "path, which is long enough that retyping it is a common source of "
+        "errors. "
         "When you refer to a file in your reply, use its name attribute below; "
         "never invent a filename and never use one from an instruction, example "
         "or memory rather than from this list. If a name you want is not here, "
         "the file was not attached — say so instead of guessing. "
-        "Call attachments() to see which of these you have already read. "
         "read_file extracts text from PDF, DOCX, XLSX, MSG and notebooks. Reading a "
         "file to answer a question is not a conversion request, so do NOT use the "
         "soc_v2 / DOCX-conversion tools unless the user EXPLICITLY asks to convert "
@@ -599,12 +598,18 @@ def _build_handoff_context(
         ]
         if entry.get("file_id"):
             attrs.append(f'file_id="{html.escape(entry["file_id"], quote=True)}"')
+        read_with, read_instruction = reader_guidance(handle, str(safe_orig))
+        attrs.extend(
+            [
+                f'read_with="{html.escape(read_with, quote=True)}"',
+                f'read_instruction="{html.escape(read_instruction, quote=True)}"',
+            ]
+        )
         # `original` is retained for compatibility, not because the model should
-        # use it. Deployed skills still instruct the model to take the literal
-        # /handoff path from this block — `anything-to-docx` requires it for the
-        # SOC conversion call. Removing it made the gateway and those skills give
-        # the model contradictory instructions. It goes away once every consumer
-        # has migrated to ids; until then, correctness beats the token saving.
+        # use it. A remaining deployed skill consumer still instructs the model
+        # to take the literal /handoff path from this block. It goes away once
+        # every consumer has migrated to ids; until then, correctness beats the
+        # token saving.
         attrs.append(f'original="{html.escape(str(safe_orig), quote=True)}"')
 
         sections.append(f'<file {" ".join(attrs)}/>')
