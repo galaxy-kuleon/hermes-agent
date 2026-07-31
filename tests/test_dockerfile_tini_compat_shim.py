@@ -1,49 +1,31 @@
-"""Regression test for #34192 — Dockerfile must keep the tini compat shim
-for orchestration templates that still reference /usr/bin/tini.
+"""Contract tests for this fork's tini-based container entrypoint.
 
-This is a documentation-as-test guard: removing the shim is a real
-choice, but it should be done deliberately (e.g. once Hostinger's
-'Hermes WebUI' catalog updates to /init) and not by accident.
+The hosted stack deliberately uses a small tini PID 1 plus the bootstrap
+entrypoint.  Upstream's s6 ``/init`` contract is a different image design and
+must not be reintroduced here by stale tests.
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 
 
-def _dockerfile_text() -> str:
-    return (Path(__file__).parent.parent / "Dockerfile").read_text(encoding="utf-8")
+DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 
 
-def test_tini_compat_symlink_present():
-    """The /usr/bin/tini -> /init symlink line must exist for #34192."""
-    df = _dockerfile_text()
-    assert "ln -sf /init /usr/bin/tini" in df, (
-        "Dockerfile must keep the tini compat symlink (#34192). "
-        "Removing it breaks orchestration templates that still pin "
-        "/usr/bin/tini as the entrypoint (Hostinger 'Hermes WebUI' "
-        "catalog as of v0.14.x)."
-    )
+def _text() -> str:
+    return DOCKERFILE.read_text(encoding="utf-8")
 
 
-def test_tini_compat_comment_explains_why():
-    """The symlink line is comment-anchored to #34192 so a future reader
-    knows why it exists. Removing the comment makes it look like dead
-    code worth deleting."""
-    df = _dockerfile_text()
-    assert "#34192" in df, (
-        "The Dockerfile tini compat shim must keep its #34192 anchor "
-        "comment so future maintainers know why the symlink is there."
-    )
+def test_tini_is_installed() -> None:
+    assert "    tini \\\n" in _text()
 
 
-def test_entrypoint_still_init_not_tini():
-    """Sanity check: the actual ENTRYPOINT is still /init (s6-overlay).
-    The shim is for legacy external wrappers, not for the image's own
-    runtime — that path must continue to use the canonical /init."""
-    df = _dockerfile_text()
-    assert 'ENTRYPOINT [ "/init"' in df, (
-        "Dockerfile ENTRYPOINT must remain /init (s6-overlay). The "
-        "tini shim is only for external wrappers that haven't been "
-        "updated yet."
-    )
+def test_entrypoint_routes_bootstrap_through_tini() -> None:
+    assert (
+        'ENTRYPOINT ["/usr/bin/tini", "-g", "--", '
+        '"/opt/hermes/docker/entrypoint.sh"]'
+    ) in _text()
+
+
+def test_s6_entrypoint_is_not_part_of_this_image_contract() -> None:
+    assert 'ENTRYPOINT [ "/init"' not in _text()
+    assert "ln -sf /init /usr/bin/tini" not in _text()

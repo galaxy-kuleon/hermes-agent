@@ -2046,9 +2046,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             pass
 
     # Registry-driven enable for plugin platforms.  Built-ins have explicit
-    # blocks above; plugins expose check_fn() which is the single source of
-    # truth for "are my env vars set?".  When it returns True, ensure the
-    # platform is enabled so start() will create its adapter.  Plugins that
+    # blocks above. Plugins expose is_connected() as the opt-in/configuration
+    # probe and check_fn() as the dependency/availability probe. Only when the
+    # applicable probes pass do we enable the platform for adapter creation.
+    # Plugins that
     # need to seed ``PlatformConfig.extra`` from env vars (e.g. Google Chat's
     # project_id / subscription_name) can supply ``env_enablement_fn`` on
     # their PlatformEntry — called here BEFORE adapter construction.
@@ -2068,12 +2069,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
-            try:
-                if not entry.check_fn():
-                    continue
-            except Exception as e:
-                logger.debug("check_fn for %s raised: %s", entry.name, e)
-                continue
             platform = Platform(entry.name)
             existing_cfg = config.platforms.get(platform)
             # Seed candidate extras from ``env_enablement_fn`` so plugins
@@ -2145,6 +2140,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                             entry.name,
                         )
                         continue
+            # Requirements checks may lazy-install an opt-in backend. Run
+            # them only after the configuration probe has established that
+            # the user actually enabled this platform. Legacy plugins without
+            # an is_connected probe retain their historical check_fn gate.
+            try:
+                if not entry.check_fn():
+                    continue
+            except Exception as e:
+                logger.debug("check_fn for %s raised: %s", entry.name, e)
+                continue
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()
             config.platforms[platform].enabled = True

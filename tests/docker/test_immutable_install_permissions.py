@@ -1,4 +1,4 @@
-"""Docker smoke tests for immutable install permissions."""
+"""Docker smoke tests for the sealed-code / writable-venv boundary."""
 from __future__ import annotations
 
 import subprocess
@@ -7,10 +7,10 @@ import textwrap
 
 def test_container_sets_hosted_write_policy_env(built_image: str) -> None:
     script = (
-        'test "$HERMES_HOME" = "/opt/data" && '
-        'test "$HERMES_WRITE_SAFE_ROOT" = "/opt/data" && '
-        'test "$HERMES_DISABLE_LAZY_INSTALLS" = "1" && '
-        'test "$PYTHONDONTWRITEBYTECODE" = "1"'
+        'test "$HERMES_HOME" = "/home/hermes" && '
+        'test "$HERMES_TUI_DIR" = "/opt/hermes/ui-tui" && '
+        'test "$PYTHONDONTWRITEBYTECODE" = "1" && '
+        'test -z "${HERMES_DISABLE_LAZY_INSTALLS:-}"'
     )
     result = subprocess.run(
         ["docker", "run", "--rm", "--entrypoint", "sh", built_image, "-c", script],
@@ -21,7 +21,9 @@ def test_container_sets_hosted_write_policy_env(built_image: str) -> None:
     assert result.returncode == 0, result.stderr[-2000:]
 
 
-def test_hermes_user_cannot_modify_install_but_can_write_data(built_image: str) -> None:
+def test_hermes_user_cannot_modify_source_but_can_write_venv_and_data(
+    built_image: str,
+) -> None:
     script = textwrap.dedent(
         r"""
         set -eu
@@ -37,7 +39,12 @@ def test_hermes_user_cannot_modify_install_but_can_write_data(built_image: str) 
         else:
             raise SystemExit("install source write unexpectedly succeeded")
 
-        skill_dir = Path("/opt/data/skills/permission-smoke")
+        venv_probe = Path("/opt/hermes/venv/.permission-smoke")
+        venv_probe.write_text("ok\n", encoding="utf-8")
+        if venv_probe.read_text(encoding="utf-8") != "ok\n":
+            raise SystemExit("venv write verification failed")
+
+        skill_dir = Path("/home/hermes/skills/permission-smoke")
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_file = skill_dir / "SKILL.md"
         skill_file.write_text("# Permission smoke\n", encoding="utf-8")
