@@ -1,7 +1,9 @@
 FROM ubuntu:24.04
 
-# Disable Python stdout buffering
+# Keep logs immediate and prevent imports from mutating the image's source
+# tree with __pycache__ files at runtime.
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── Locale setup ─────────────────────────────────────────────────────────────
@@ -100,15 +102,28 @@ ENV DOCKER_BUILD=true
 ENV UV_PYTHON_PREFERENCE=only-system
 RUN bash /opt/hermes/setup-hermes.sh
 
-# ── Create .venv symlink for entrypoint compatibility ────────────────────────
+# ── Seal the runtime install ──────────────────────────────────────────────────
 USER root
-RUN ln -sf /opt/hermes/venv /opt/hermes/.venv && \
-    chown -R hermes:hermes /opt/hermes
+RUN set -eux; \
+    test -f /opt/hermes/ui-tui/dist/entry.js; \
+    ln -sf /opt/hermes/venv /opt/hermes/.venv; \
+    printf 'docker\n' > /opt/hermes/.install_method; \
+    rm -rf /home/hermes/.cache /home/hermes/.npm; \
+    chown -R root:root /opt/hermes; \
+    chmod -R a+rX,a-w /opt/hermes; \
+    chown -R hermes:hermes /opt/hermes/venv; \
+    chmod -R u+w /opt/hermes/venv
 
 # ── Runtime config ───────────────────────────────────────────────────────────
 ENV HERMES_HOME=/home/hermes
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV PATH="/opt/hermes/venv/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
+
+# Source, bundled skills and frontend assets are root-owned and read-only.
+# The venv is the deliberate exception: opt-in platform backends use the
+# allowlisted lazy dependency installer, so only /opt/hermes/venv remains
+# writable by the unprivileged hermes runtime user.
 
 # No VOLUME instruction. Declaring one makes Docker create an anonymous
 # read-write volume at that path for any container that does not mount
