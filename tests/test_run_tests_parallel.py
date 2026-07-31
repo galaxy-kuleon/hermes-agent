@@ -30,12 +30,46 @@ from pathlib import Path
 
 import pytest
 
+from scripts.run_tests_parallel import _effective_file_timeout
+
 
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
 # so concurrent invocations of the suite don't clobber each other.
 _HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
 _HANDOFF_DIR.mkdir(exist_ok=True)
+
+
+@pytest.mark.parametrize(
+    ("test_count", "expected"),
+    [
+        (0, 140.0),
+        (1, 140.0),
+        (140, 140.0),
+        (384, 384.0),
+        (10_000, 600.0),
+    ],
+)
+def test_adaptive_file_timeout_is_bounded_by_floor_and_ceiling(
+    test_count: int, expected: float
+) -> None:
+    assert _effective_file_timeout(
+        test_count,
+        fixed_timeout=None,
+        floor_seconds=140.0,
+        per_test_seconds=1.0,
+        ceiling_seconds=600.0,
+    ) == expected
+
+
+def test_fixed_file_timeout_override_preserves_existing_contract() -> None:
+    assert _effective_file_timeout(
+        10_000,
+        fixed_timeout=37.0,
+        floor_seconds=140.0,
+        per_test_seconds=1.0,
+        ceiling_seconds=600.0,
+    ) == 37.0
 
 
 def _handoff_path_for(nonce: str) -> Path:
