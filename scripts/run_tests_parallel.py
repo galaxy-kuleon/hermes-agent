@@ -31,6 +31,10 @@ Usage:
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+    HERMES_TEST_FILE_TIMEOUT  Fixed per-file timeout override
+    HERMES_TEST_FILE_TIMEOUT_FLOOR  Adaptive timeout floor in seconds
+    HERMES_TEST_FILE_TIMEOUT_PER_TEST  Adaptive seconds per collected test
+    HERMES_TEST_FILE_TIMEOUT_CEILING  Adaptive timeout ceiling in seconds
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 """
@@ -70,14 +74,41 @@ _DEFAULT_ROOTS = ["tests"]
 #                        setup. The dedicated job sidesteps both costs.
 _SKIP_PARTS = {"integration", "e2e", "docker"}
 
-# Per-file wall-clock cap. Override
-# via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 140.0 # set by observing the slowest file at commit time was ~100s in CI and adding some leeway
+# Per-file wall-clock timeout policy. A single fixed default was originally
+# calibrated when the slowest file took ~100s, but test files grow: the current
+# 384-test run_agent file legitimately needs ~280s on a developer machine.
+# Keep the original 140s fail-fast floor for normal files, scale large files by
+# collected test count, and retain a hard ceiling for genuinely stuck suites.
+# Every knob is centralized here and can be overridden without editing code.
+_DEFAULT_FILE_TIMEOUT_FLOOR_SECONDS = 140.0
+_DEFAULT_FILE_TIMEOUT_PER_TEST_SECONDS = 1.0
+_DEFAULT_FILE_TIMEOUT_CEILING_SECONDS = 600.0
 
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+
+
+def _effective_file_timeout(
+    test_count: int,
+    *,
+    fixed_timeout: float | None,
+    floor_seconds: float,
+    per_test_seconds: float,
+    ceiling_seconds: float,
+) -> float:
+    """Return the wall-clock cap for one test file.
+
+    ``fixed_timeout`` preserves the existing explicit ``--file-timeout`` /
+    ``HERMES_TEST_FILE_TIMEOUT`` contract. Without that override, policy scales
+    with the already-collected test count while staying within a fail-fast
+    floor and hard ceiling. Files missing collection metadata use the floor.
+    """
+    if fixed_timeout is not None:
+        return fixed_timeout
+    scaled = max(0, test_count) * per_test_seconds
+    return min(ceiling_seconds, max(floor_seconds, scaled))
 
 
 def _count_tests(
@@ -618,14 +649,50 @@ def main() -> int:
     parser.add_argument(
         "--file-timeout",
         type=float,
-        default=float(
-            os.environ.get("HERMES_TEST_FILE_TIMEOUT", _DEFAULT_FILE_TIMEOUT_SECONDS)
+        default=(
+            float(os.environ["HERMES_TEST_FILE_TIMEOUT"])
+            if "HERMES_TEST_FILE_TIMEOUT" in os.environ
+            else None
         ),
         help=(
-            "Per-file wall-clock cap in seconds. On timeout, the pytest "
+            "Fixed per-file wall-clock cap in seconds (overrides the adaptive "
+            "policy). On timeout, the pytest "
             "subprocess and its full process tree are SIGKILL'd. "
-            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT."
+            "Env: HERMES_TEST_FILE_TIMEOUT."
         ),
+    )
+    parser.add_argument(
+        "--file-timeout-floor",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HERMES_TEST_FILE_TIMEOUT_FLOOR",
+                _DEFAULT_FILE_TIMEOUT_FLOOR_SECONDS,
+            )
+        ),
+        help="Adaptive per-file timeout floor in seconds.",
+    )
+    parser.add_argument(
+        "--file-timeout-per-test",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HERMES_TEST_FILE_TIMEOUT_PER_TEST",
+                _DEFAULT_FILE_TIMEOUT_PER_TEST_SECONDS,
+            )
+        ),
+        help="Adaptive timeout seconds per collected test.",
+    )
+    parser.add_argument(
+        "--file-timeout-ceiling",
+        type=float,
+        default=float(
+            os.environ.get(
+                "HERMES_TEST_FILE_TIMEOUT_CEILING",
+                _DEFAULT_FILE_TIMEOUT_CEILING_SECONDS,
+            )
+        ),
+        help="Adaptive per-file timeout ceiling in seconds.",
     )
     parser.add_argument(
         "--slice",
@@ -659,6 +726,18 @@ def main() -> int:
     else:
         our_args, pytest_passthrough = argv, []
     args = parser.parse_args(our_args)
+
+    timeout_values = {
+        "--file-timeout": args.file_timeout,
+        "--file-timeout-floor": args.file_timeout_floor,
+        "--file-timeout-per-test": args.file_timeout_per_test,
+        "--file-timeout-ceiling": args.file_timeout_ceiling,
+    }
+    for option, value in timeout_values.items():
+        if value is not None and value <= 0:
+            parser.error(f"{option} must be greater than zero")
+    if args.file_timeout_floor > args.file_timeout_ceiling:
+        parser.error("--file-timeout-floor cannot exceed --file-timeout-ceiling")
 
     # Parse --slice (or HERMES_TEST_SLICE) early so we can exit on bad input
     # before doing any expensive discovery.
@@ -715,6 +794,16 @@ def main() -> int:
         f"running with -j {args.jobs}",
         flush=True,
     )
+    if args.file_timeout is not None:
+        print(f"Per-file timeout policy: fixed {args.file_timeout:g}s", flush=True)
+    else:
+        print(
+            "Per-file timeout policy: adaptive "
+            f"floor={args.file_timeout_floor:g}s "
+            f"per_test={args.file_timeout_per_test:g}s "
+            f"ceiling={args.file_timeout_ceiling:g}s",
+            flush=True,
+        )
 
     # Capture and print on completion (out-of-order is fine — keeps the
     # terminal clean rather than interleaving N parallel pytest outputs).
@@ -775,8 +864,15 @@ def main() -> int:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
+            file_timeout = _effective_file_timeout(
+                test_counts.get(file, 0),
+                fixed_timeout=args.file_timeout,
+                floor_seconds=args.file_timeout_floor,
+                per_test_seconds=args.file_timeout_per_test,
+                ceiling_seconds=args.file_timeout_ceiling,
+            )
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout
+                _run_one_file, file, pytest_passthrough, repo_root, file_timeout
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
