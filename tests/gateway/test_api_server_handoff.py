@@ -59,11 +59,84 @@ def test_handoff_context_accepts_minimal_signed_path_metadata(monkeypatch, tmp_p
     # every path it invented in the live incident was a variation on one it
     # had been shown.
     assert '<file id="F01" name="report.pdf"' in out
-    # `original` stays until every deployed skill consumer has migrated to ids:
-    # anything-to-docx still requires the literal /handoff path for SOC.
+    # `original` stays until every deployed skill consumer has migrated to ids.
     assert f'original="{original}"' in out
     assert 'markdown="' not in out
     assert "%PDF original" not in out
+
+
+def test_handoff_context_routes_each_attachment_from_shared_reader_policy(
+    monkeypatch,
+    tmp_path,
+):
+    handoff_dir = tmp_path / "handoff"
+    monkeypatch.setattr(api_server, "HANDOFF_DIR", handoff_dir)
+    monkeypatch.setattr(api_server, "HANDOFF_SIGNING_KEY", "test-secret")
+    parent = (
+        handoff_dir
+        / "user"
+        / "user-1"
+        / "chat"
+        / "chat-1"
+        / "message"
+        / "msg-1"
+    )
+    paths = [parent / "diagram.png", parent / "notes.txt", parent / "bundle.zip"]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    entries = [
+        {
+            "original": str(path),
+            "sig": api_server._sign_handoff_entry(
+                "user-1",
+                "chat-1",
+                str(path),
+            ),
+        }
+        for path in paths
+    ]
+
+    out = api_server._build_handoff_context(entries, _scope())
+
+    assert "Call attachments() first" in out
+    assert 'read_with="vision_analyze"' in out
+    assert (
+        'read_instruction="Call vision_analyze(image_url=&quot;F01&quot;). '
+        'Do not call read_file first."' in out
+    )
+    assert 'read_with="read_file"' in out
+    assert 'read_instruction="Call read_file(&quot;F02&quot;)."' in out
+    assert 'read_with="unsupported"' in out
+    assert (
+        'read_instruction="No direct reader is available for this binary '
+        'attachment."' in out
+    )
+    assert 'call read_file("F01")' not in out
+
+
+def test_handoff_context_delegates_routing_to_shared_reader_policy(
+    monkeypatch,
+    tmp_path,
+):
+    original = _prepare_handoff(monkeypatch, tmp_path)
+    sig = api_server._sign_handoff_entry("user-1", "chat-1", str(original))
+    calls = []
+
+    def fake_reader_guidance(target, path):
+        calls.append((target, path))
+        return "sentinel_reader", "Call sentinel_reader(F01)."
+
+    monkeypatch.setattr(api_server, "reader_guidance", fake_reader_guidance)
+
+    out = api_server._build_handoff_context(
+        [{"original": str(original), "sig": sig}],
+        _scope(),
+    )
+
+    assert calls == [("F01", str(original))]
+    assert 'read_with="sentinel_reader"' in out
+    assert "Call sentinel_reader(F01)." in out
 
 
 def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeypatch, tmp_path):
