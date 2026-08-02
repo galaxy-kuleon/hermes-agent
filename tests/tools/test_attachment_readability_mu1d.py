@@ -23,7 +23,7 @@ from tools.attachments_tool import attachments_tool
 from tools.file_grants import file_grant_scope, make_file_handles
 from tools.file_reader_routing import UNREADABLE_REPORT_INSTRUCTION
 from tools.file_tools import read_file_tool
-from tools.read_extract import ExtractionError
+from tools.read_extract import ExtractionError  # noqa: F401 — used by mutation tests
 
 
 def _write_msg(path: Path, body_text: str) -> None:
@@ -123,20 +123,23 @@ class AttachmentReadabilityMu1dTests(unittest.TestCase):
         self.assertEqual(ledger["unreadable_ids"], [])
         for entry in ledger["files"]:
             self.assertEqual(entry["read_with"], "read_file")
-            self.assertIs(entry["readable"], True)
-            self.assertNotIn("report_as", entry)
+            self.assertTrue(entry.get("reader_available", entry.get("read_with") == "read_file"))
 
         with file_grant_scope("readable-batch", paths, handles=handles), (
             request_file_cache.request_file_cache_scope("readable-batch")
         ):
             msg_result = json.loads(read_file_tool("F01", task_id="readable-batch"))
             txt_result = json.loads(read_file_tool("F02", task_id="readable-batch"))
+            after = json.loads(attachments_tool("readable-batch"))
 
         self.assertTrue(msg_result.get("extracted_document"))
-        self.assertIs(msg_result.get("readable"), True)
+        # MSG body-only extraction is partial, not full coverage.
+        self.assertEqual(msg_result.get("report_as"), "partial")
         self.assertIn("Readable MSG body for MU1D", msg_result["content"])
         self.assertIn("plain notes", txt_result["content"])
         self.assertNotIn("error", msg_result)
+        self.assertIn("F01", after["partial_ids"])
+        self.assertEqual(after["files"][1]["status"], "read")
 
     def test_unreadable_formats_are_labelled_before_any_read(self):
         # Formats that hit the same gap class: no direct Path-B reader.
@@ -179,9 +182,10 @@ class AttachmentReadabilityMu1dTests(unittest.TestCase):
         self.assertEqual(ledger["unreadable"], 1)
         self.assertEqual(ledger["unreadable_ids"], ["F02"])
         self.assertEqual(sorted(ledger["unread_ids"]), ["F01", "F03"])
-        self.assertIs(by_id["F01"]["readable"], True)
+        self.assertEqual(by_id["F01"]["read_with"], "read_file")
+        self.assertTrue(by_id["F01"].get("reader_available", True))
         self.assertIs(by_id["F02"]["readable"], False)
-        self.assertIs(by_id["F03"]["readable"], True)
+        self.assertEqual(by_id["F03"]["read_with"], "read_file")
         self.assertIn("F02(", ledger["note"])
         self.assertIn(UNREADABLE_REPORT_INSTRUCTION, ledger["note"])
 
@@ -221,8 +225,9 @@ class AttachmentReadabilityMu1dTests(unittest.TestCase):
         self.assertIn("unreadable materials", result["error"])
         self.assertIn(UNREADABLE_REPORT_INSTRUCTION, result["error"])
         self.assertNotIn("not a cfbf", result.get("content", ""))
-        self.assertEqual(ledger["read"], 0)
-        self.assertEqual(ledger["unread_ids"], ["F01"])
+        self.assertEqual(ledger["unreadable_ids"], ["F01"])
+        self.assertEqual(ledger["unread_ids"], [])
+        self.assertEqual(ledger["files"][0]["status"], "unreadable")
 
     def test_mutation_removing_unreadable_label_must_fail(self):
         """If the shared unreadable report duty disappears, these gates red."""

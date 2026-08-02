@@ -1446,18 +1446,20 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
     result = _read_file_tool_impl(resolved_arg, offset, limit, task_id)
 
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        parsed = None
+
     if request_file_cache.is_active(task_id):
-        try:
-            parsed = json.loads(result)
-        except (TypeError, ValueError):
-            parsed = None
-        # Memoise only a real content read. Errors, denials and binary guards
-        # must stay repeatable — the model may legitimately retry them after
-        # changing something.
+        # Memoise only a real content read (full or partial). Errors and
+        # unreadable outcomes stay repeatable and are recorded on the ledger
+        # by the impl — not as successful content memos.
         if (
             isinstance(parsed, dict)
             and not parsed.get("error")
             and isinstance(parsed.get("content"), str)
+            and parsed.get("report_as") != "unreadable"
         ):
             request_file_cache.remember(
                 resolved_arg,
@@ -1469,6 +1471,47 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                     "", str(resolved_arg).rsplit("/", 1)[-1], count=1
                 ),
             )
+
+    # Authoritative ledger for plain-text success / binary-guard failure when
+    # the extract branch did not already settle the outcome.
+    try:
+        from tools.attachment_ledger import (
+            OUTCOME_READ,
+            OUTCOME_UNREADABLE,
+            get_outcome,
+            record_outcome,
+        )
+
+        display = _HANDOFF_NAME_PREFIX_RE.sub(
+            "", str(resolved_arg).rsplit("/", 1)[-1], count=1
+        )
+        existing = get_outcome(resolved_arg, task_id=task_id)
+        if isinstance(parsed, dict) and not existing:
+            if (
+                not parsed.get("error")
+                and isinstance(parsed.get("content"), str)
+                and parsed.get("report_as") not in {"partial", "unreadable"}
+            ):
+                record_outcome(
+                    resolved_arg,
+                    task_id=task_id,
+                    status=OUTCOME_READ,
+                    reason="text_read",
+                    display_name=display,
+                )
+            elif parsed.get("error") and (
+                "binary" in str(parsed.get("error", "")).lower()
+                or parsed.get("report_as") == "unreadable"
+            ):
+                record_outcome(
+                    resolved_arg,
+                    task_id=task_id,
+                    status=OUTCOME_UNREADABLE,
+                    reason=str(parsed.get("error") or "unreadable")[:200],
+                    display_name=display,
+                )
+    except Exception:
+        logger.debug("attachment ledger update skipped", exc_info=True)
 
     return result
 
@@ -1516,41 +1559,81 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
         # text open: that returns binary garbage as "content", the request
         # memo marks the file read, and the model reports a complete audit
         # that never actually read the document (MSG/PDF false-success disease).
-        from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
+        from tools.read_extract import (
+            ExtractionError,
+            extract_document_text,
+            is_extractable_document,
+            take_last_eml_gaps,
+        )
         from tools.file_reader_routing import UNREADABLE_REPORT_INSTRUCTION
+        from tools.attachment_ledger import (
+            OUTCOME_PARTIAL,
+            OUTCOME_READ,
+            OUTCOME_UNREADABLE,
+            record_outcome,
+        )
+        from tools.file_magic import magic_conflicts_with_suffix, sniff_kind
 
-        if is_extractable_document(str(_resolved)):
+        display = _HANDOFF_NAME_PREFIX_RE.sub(
+            "", Path(str(_resolved)).name, count=1
+        ) or Path(str(_resolved)).name
+        ext = Path(str(_resolved)).suffix.lower() or "document"
+        handle_for_ledger = path if str(path).upper().startswith("F") else ""
+
+        def _ledger(status: str, reason: str = "", gaps: list | None = None) -> None:
+            record_outcome(
+                str(_resolved),
+                task_id=task_id,
+                status=status,
+                reason=reason,
+                gaps=gaps,
+                display_name=display,
+                handle=handle_for_ledger,
+            )
+
+        # Magic/MIME honesty: declared suffix that conflicts with bytes → unreadable
+        # (or re-route PDF bytes under a bogus suffix through the PDF extractor).
+        conflict, sniffed, _suffix = magic_conflicts_with_suffix(str(_resolved))
+        extract_path = str(_resolved)
+        if conflict and sniffed == "pdf":
+            # e.g. .crdownload that is actually a PDF — extract as PDF.
+            extract_path_for_pdf = str(_resolved)
             try:
-                extracted_text = extract_document_text(str(_resolved))
+                from tools.pdf_extract import extract_pdf_text
+
+                extracted_text = extract_pdf_text(extract_path_for_pdf)
             except ExtractionError as exc:
                 logger.warning(
-                    "document extraction failed for %s: %s",
-                    path,
+                    "document extraction failed kind=%s ext=%s sniffed=%s",
                     type(exc).__name__,
-                    exc_info=True,
+                    ext,
+                    sniffed,
                 )
-                display = _HANDOFF_NAME_PREFIX_RE.sub(
-                    "", Path(str(_resolved)).name, count=1
-                ) or Path(str(_resolved)).name
-                ext = Path(str(_resolved)).suffix.lower() or "document"
-                reason = str(exc).strip() or type(exc).__name__
+                _ledger(
+                    OUTCOME_UNREADABLE,
+                    reason=f"magic={sniffed} but extraction failed: {exc}",
+                )
                 return json.dumps(
                     {
                         "error": (
                             f"Cannot extract readable text from '{display}' "
-                            f"({ext}): {reason}. "
+                            f"(declared {ext}, sniffed {sniffed}): {exc}. "
                             f"{UNREADABLE_REPORT_INSTRUCTION}"
                         ),
-                        "path": path,
                         "readable": False,
                         "extraction_failed": True,
-                        "failure_kind": type(exc).__name__,
                         "report_as": "unreadable",
                         "name": display,
+                        "sniffed_kind": sniffed,
                     },
                     ensure_ascii=False,
                 )
             else:
+                _ledger(
+                    OUTCOME_PARTIAL,
+                    reason=f"declared suffix {ext} but sniffed {sniffed}; extracted as PDF",
+                    gaps=["suffix_magic_mismatch"],
+                )
                 file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
@@ -1562,8 +1645,115 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     "file_size": os.path.getsize(_resolved),
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
-                    "readable": True,
+                    "readable": False,
+                    "report_as": "partial",
+                    "coverage": "partial",
+                    "gaps": ["suffix_magic_mismatch"],
+                    "name": display,
+                    "sniffed_kind": sniffed,
                 }
+                if result_dict["content"]:
+                    result_dict["content"] = redact_sensitive_text(
+                        result_dict["content"], code_file=True
+                    )
+                return json.dumps(result_dict, ensure_ascii=False)
+        elif conflict:
+            logger.warning(
+                "attachment magic/suffix conflict kind=mismatch ext=%s sniffed=%s",
+                ext,
+                sniffed,
+            )
+            _ledger(
+                OUTCOME_UNREADABLE,
+                reason=f"declared suffix {ext} conflicts with sniffed type {sniffed}",
+            )
+            return json.dumps(
+                {
+                    "error": (
+                        f"Cannot safely read '{display}': declared extension "
+                        f"{ext} conflicts with file content ({sniffed}). "
+                        f"{UNREADABLE_REPORT_INSTRUCTION}"
+                    ),
+                    "readable": False,
+                    "extraction_failed": True,
+                    "report_as": "unreadable",
+                    "name": display,
+                    "sniffed_kind": sniffed,
+                },
+                ensure_ascii=False,
+            )
+
+        if is_extractable_document(str(_resolved)):
+            try:
+                extracted_text = extract_document_text(str(_resolved))
+            except ExtractionError as exc:
+                logger.warning(
+                    "document extraction failed kind=%s ext=%s",
+                    type(exc).__name__,
+                    ext,
+                )
+                reason = str(exc).strip() or type(exc).__name__
+                _ledger(OUTCOME_UNREADABLE, reason=reason)
+                return json.dumps(
+                    {
+                        "error": (
+                            f"Cannot extract readable text from '{display}' "
+                            f"({ext}): {reason}. "
+                            f"{UNREADABLE_REPORT_INSTRUCTION}"
+                        ),
+                        "readable": False,
+                        "extraction_failed": True,
+                        "failure_kind": type(exc).__name__,
+                        "report_as": "unreadable",
+                        "name": display,
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                gaps: list[str] = []
+                report_as = "read"
+                if ext == ".msg":
+                    from tools.msg_extract import inspect_msg_capability_gaps
+
+                    gaps = inspect_msg_capability_gaps(str(_resolved))
+                    report_as = "partial"
+                elif ext == ".eml":
+                    gaps = take_last_eml_gaps() or ["body_only_extraction"]
+                    report_as = "partial" if gaps else "read"
+
+                if report_as == "partial":
+                    _ledger(
+                        OUTCOME_PARTIAL,
+                        reason="extraction incomplete for this format",
+                        gaps=gaps,
+                    )
+                else:
+                    _ledger(OUTCOME_READ, reason="extracted")
+
+                file_ops = _get_file_ops(task_id)
+                lines = extracted_text.splitlines()
+                total_lines = len(lines)
+                end_line = offset + limit - 1
+                page_text = "\n".join(lines[offset - 1:end_line])
+                result_dict = {
+                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
+                    "total_lines": total_lines,
+                    "file_size": os.path.getsize(_resolved),
+                    "truncated": total_lines > end_line,
+                    "extracted_document": True,
+                    # reader_available ≠ full coverage: partial MSG/EML stay honest
+                    "readable": report_as == "read",
+                    "report_as": report_as,
+                    "coverage": report_as,
+                    "name": display,
+                }
+                if gaps:
+                    result_dict["gaps"] = gaps
+                    result_dict["coverage_note"] = (
+                        "Partial extraction only. Gaps: "
+                        + ", ".join(gaps)
+                        + ". Do not claim full coverage of this attachment."
+                    )
                 if result_dict["truncated"]:
                     result_dict["hint"] = (
                         f"Use offset={end_line + 1} to continue reading "

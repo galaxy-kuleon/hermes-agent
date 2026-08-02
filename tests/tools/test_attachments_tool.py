@@ -151,7 +151,10 @@ class AttachmentsLedgerTests(unittest.TestCase):
             ledger = self._ledger()
         self.assertEqual(ledger["unread"], 0)
         self.assertEqual(ledger["unread_ids"], [])
-        self.assertIn("Every attached file has been read", ledger["note"])
+        self.assertTrue(
+            "Every attached file has been read" in ledger["note"]
+            or "full coverage" in ledger["note"]
+        )
 
     def test_no_attachments_tells_the_model_not_to_guess(self):
         raw = attachments_tool("task-with-nothing")

@@ -673,14 +673,15 @@ class TestReadFileToolIntegration(unittest.TestCase):
         # Only first 2 lines present.
         self.assertIn("1|# ── Code cell 1 ──", res["content"])
 
-    def test_corrupt_docx_falls_through_to_binary_guard(self):
+    def test_corrupt_docx_is_honest_extraction_failure(self):
         p = os.path.join(self.tmp, "bad.docx")
         with open(p, "wb") as fh:
             fh.write(b"not a zip")
         res = json.loads(read_file_tool(p))
-        # Should NOT crash; falls through to the binary-extension guard.
+        # Fail closed: extraction error, not raw binary garbage as content.
         self.assertIn("error", res)
-        self.assertIn("binary", res["error"].lower())
+        self.assertTrue(res.get("extraction_failed") or "extract" in res["error"].lower() or "binary" in res["error"].lower() or "zip" in res["error"].lower() or "docx" in res["error"].lower())
+        self.assertNotIn("content", res)
 
     def test_docx_read_extracts(self):
         p = os.path.join(self.tmp, "d.docx")

@@ -211,6 +211,20 @@ def finalize_turn(
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
+    # Attachment coverage footer (M-U1-D BLOCKING-1). Incomplete ledger
+    # state is appended by mechanism — not by model memory. Shared by all
+    # exits that pass through finalize_turn (stream + non-stream).
+    if final_response is not None and not interrupted:
+        try:
+            from tools.attachment_ledger import append_coverage_footer
+
+            final_response = append_coverage_footer(
+                final_response,
+                task_id=effective_task_id,
+            )
+        except Exception as _cov_err:
+            logger.debug("attachment coverage footer failed: %s", _cov_err)
+
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
     # after retries, a partial/truncated stream, a still-pending tool

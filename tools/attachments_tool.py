@@ -57,9 +57,16 @@ def attachments_tool(task_id: str = "default") -> str:
         READ_WITH_UNSUPPORTED,
         UNREADABLE_REPORT_INSTRUCTION,
     )
+    from tools.attachment_ledger import (
+        OUTCOME_PARTIAL,
+        OUTCOME_PENDING,
+        OUTCOME_READ,
+        OUTCOME_UNREADABLE,
+        coverage_snapshot,
+        get_outcome,
+    )
 
     files = []
-    read_count = 0
     for handle, path in handles:
         memo = None
         if request_file_cache.is_active(task_id):
@@ -69,69 +76,81 @@ def attachments_tool(task_id: str = "default") -> str:
         entry = {
             "id": handle,
             "name": _display_name(path),
-            "read": memo is not None,
         }
         entry["read_with"], entry["read_instruction"] = _reader_guidance(
             handle,
             path,
         )
-        # Extension-level unreadable (no direct reader). Extraction-time
-        # failures are returned by read_file itself with the same report duty.
-        entry["readable"] = entry["read_with"] != READ_WITH_UNSUPPORTED
-        if not entry["readable"]:
-            entry["report_as"] = "unreadable"
-        if memo is not None:
-            read_count += 1
+        # reader_available = route exists; outcome = authoritative execution result.
+        entry["reader_available"] = entry["read_with"] != READ_WITH_UNSUPPORTED
+        outcome = get_outcome(path, task_id=task_id) or {}
+        status = outcome.get("status") or OUTCOME_PENDING
+        entry["status"] = status
+        entry["report_as"] = status
+        # Backward-compatible fields (honest): readable means FULL coverage only.
+        entry["readable"] = status == OUTCOME_READ
+        entry["read"] = status in {OUTCOME_READ, OUTCOME_PARTIAL}
+        if outcome.get("reason"):
+            entry["reason"] = outcome["reason"]
+        if outcome.get("gaps"):
+            entry["gaps"] = outcome["gaps"]
+        if memo is not None and status in {OUTCOME_READ, OUTCOME_PARTIAL}:
             entry["chars"] = memo.get("chars")
             entry["lines"] = memo.get("lines")
         files.append(entry)
 
-    unread = [entry["id"] for entry in files if not entry["read"] and entry["readable"]]
-    unreadable = [entry for entry in files if not entry["readable"]]
-    unreadable_ids = [entry["id"] for entry in unreadable]
+    snap = coverage_snapshot(handles, task_id=task_id)
+    unread_ids = [row["id"] for row in snap["pending"]]
+    unreadable_ids = [row["id"] for row in snap["unreadable"]]
+    partial_ids = [row["id"] for row in snap["partial"]]
     payload = {
         "success": True,
         "total": len(files),
-        "read": read_count,
-        "unread": len(unread),
-        "unread_ids": unread,
-        "unreadable": len(unreadable),
+        "read": len(snap["read"]),
+        "partial": len(snap["partial"]),
+        "partial_ids": partial_ids,
+        "unread": len(unread_ids),
+        "unread_ids": unread_ids,
+        "unreadable": len(unreadable_ids),
         "unreadable_ids": unreadable_ids,
         "files": files,
+        "complete": snap["complete"],
     }
     note_parts: list[str] = []
-    if unreadable:
+    if unreadable_ids:
         names = ", ".join(
-            f'{entry["id"]}({entry["name"]})' for entry in unreadable[:12]
-        )
-        more = (
-            f" (+{len(unreadable) - 12} more)"
-            if len(unreadable) > 12
-            else ""
-        )
+            f'{e["id"]}({e["name"]})'
+            for e in files
+            if e["id"] in unreadable_ids
+        )[:500]
         note_parts.append(
-            f"{len(unreadable)} of {len(files)} attached file(s) are unreadable "
-            f"with no direct reader: {names}{more}. "
-            f"{UNREADABLE_REPORT_INSTRUCTION}"
+            f"{len(unreadable_ids)} of {len(files)} attached file(s) are "
+            f"unreadable: {names}. {UNREADABLE_REPORT_INSTRUCTION}"
         )
-    if unread:
+    if partial_ids:
         note_parts.append(
-            f"{len(unread)} of {len(files)} attached files have not been read "
-            f"yet, starting with {unread[0]}. Follow each file's read_with and "
-            "read_instruction fields; do not send vision_analyze or unsupported "
-            "attachments to read_file first. Do not report on a file you have "
-            "not read, and do not claim full coverage while this list is "
-            "non-empty."
+            f"{len(partial_ids)} file(s) are only partially extracted "
+            f"({', '.join(partial_ids[:12])}). Name them as partial in any "
+            "final report; do not claim full coverage."
         )
-    elif not unreadable:
+    if unread_ids:
         note_parts.append(
-            "Every attached file has been read in this request. Repeating a "
-            "read returns a short memo instead of the text."
+            f"{len(unread_ids)} of {len(files)} attached files have not been "
+            f"read yet, starting with {unread_ids[0]}. Follow each file's "
+            "read_with and read_instruction fields; do not send vision_analyze "
+            "or unsupported attachments to read_file first. Do not report on a "
+            "file you have not read, and do not claim full coverage while this "
+            "list is non-empty."
         )
-    elif not unread:
+    elif snap["complete"]:
         note_parts.append(
-            "Every readable attached file has been read in this request. "
-            "Still name every unreadable attachment in the final report."
+            "Every attached file has full coverage in this request. Repeating "
+            "a read returns a short memo instead of the text."
+        )
+    elif not unread_ids:
+        note_parts.append(
+            "No pending unread files remain, but partial/unreadable entries "
+            "must still appear in the final report."
         )
     payload["note"] = " ".join(note_parts)
     return json.dumps(payload, ensure_ascii=False)

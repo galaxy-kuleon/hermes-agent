@@ -16,7 +16,13 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-__all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
+__all__ = [
+    "EXTRACTABLE_EXTENSIONS",
+    "ExtractionError",
+    "extract_document_text",
+    "is_extractable_document",
+    "take_last_eml_gaps",
+]
 
 # `.doc`/`.xls` are legacy binary formats with no stdlib reader. They are
 # converted to their OOXML equivalent through the shared soffice sidecar and
@@ -25,7 +31,7 @@ __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text",
 # an acceptable answer for a document.
 _LEGACY_EXTENSIONS = frozenset({".doc", ".xls"})
 EXTRACTABLE_EXTENSIONS = frozenset(
-    {".ipynb", ".docx", ".xlsx", ".pdf", ".msg"} | _LEGACY_EXTENSIONS
+    {".ipynb", ".docx", ".xlsx", ".pdf", ".msg", ".eml"} | _LEGACY_EXTENSIONS
 )
 MAX_XLSX_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
@@ -83,7 +89,80 @@ def extract_document_text(path: str) -> str:
             return extract_msg_text(path)
         except MsgExtractionError as exc:
             raise ExtractionError(str(exc)) from exc
+    if ext == ".eml":
+        return _extract_eml_body(path)
     raise ExtractionError(f"Unsupported document type: {path!r}")
+
+
+def _extract_eml_body(path: str) -> str:
+    """Extract plain/html body only; attachments are listed by name as gaps."""
+    import email
+    from email import policy
+
+    try:
+        raw = Path(path).read_bytes()
+        msg = email.message_from_bytes(raw, policy=policy.default)
+    except (OSError, ValueError, email.errors.MessageError) as exc:
+        raise ExtractionError(f"Not a valid EML: {exc}") from exc
+
+    subject = str(msg.get("subject") or "").strip()
+    bodies: list[str] = []
+    attachment_names: list[str] = []
+    for part in msg.walk():
+        disposition = str(part.get_content_disposition() or "").lower()
+        filename = part.get_filename()
+        if disposition == "attachment" or filename:
+            attachment_names.append(str(filename or part.get_content_type() or "attachment"))
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            try:
+                bodies.append(part.get_content())
+            except (LookupError, ValueError, AttributeError):
+                pass
+        elif ctype == "text/html" and not bodies:
+            try:
+                html = part.get_content()
+                # Minimal tag strip — honest body text only, no full HTML fidelity.
+                import re
+
+                bodies.append(re.sub(r"<[^>]+>", " ", str(html)))
+            except (LookupError, ValueError, AttributeError):
+                pass
+
+    text = "\n".join(b.strip() for b in bodies if b and str(b).strip()).strip()
+    header = f"Subject: {subject}\n" if subject else ""
+    if attachment_names:
+        header += (
+            "Attachments present but not extracted: "
+            + ", ".join(attachment_names[:20])
+            + (" …" if len(attachment_names) > 20 else "")
+            + "\n"
+        )
+    if not text and not header:
+        raise ExtractionError("EML contains no extractable text body")
+    # Stash gaps for the caller via module-level last-result (see file_tools).
+    _LAST_EML_GAPS.clear()
+    _LAST_EML_GAPS.extend(
+        [
+            "body_only_extraction",
+            *(
+                ["embedded_attachments_not_extracted"]
+                if attachment_names
+                else []
+            ),
+        ]
+    )
+    return (header + "\n" + text).rstrip() + "\n"
+
+
+_LAST_EML_GAPS: list[str] = []
+
+
+def take_last_eml_gaps() -> list[str]:
+    gaps = list(_LAST_EML_GAPS)
+    _LAST_EML_GAPS.clear()
+    return gaps
 
 
 def _source_text(source) -> str:
