@@ -1391,14 +1391,22 @@ def _vision_auto_read_image(*, target: str, task_id: str) -> dict | None:
 
     Returns a success dict from vision_analyze, or None when vision is
     unavailable / fails. Callers fall back to the explicit recovery instruction.
+
+    Handles (``F01``) must be resolved to a real path before calling
+    ``vision_analyze_tool``: that coroutine opens ``image_url`` directly and
+    does not re-run grant alias resolution (only the tool registry wrapper
+    does). Passing a bare handle is a silent no-op — vision fails and we
+    fall back to the recovery error (WWTP RELH 2026-08-02).
     """
     try:
         from model_tools import _run_async
+        from tools.file_grants import resolve_grant_alias
         from tools.vision_tools import vision_analyze_tool
 
+        image_url = resolve_grant_alias(str(target), task_id=task_id)
         vision_raw = _run_async(
             vision_analyze_tool(
-                image_url=str(target),
+                image_url=image_url,
                 user_prompt=(
                     "Describe this image in detail for document "
                     "and file analysis. Include any visible text."

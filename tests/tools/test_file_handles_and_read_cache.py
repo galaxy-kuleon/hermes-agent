@@ -265,24 +265,54 @@ class VisionReadRecoveryTests(unittest.TestCase):
         )
 
     def test_image_handle_auto_routes_to_vision_when_available(self):
-        """issue #50: mistaken read_file on an image should not waste a turn."""
+        """issue #50: mistaken read_file on an image should not waste a turn.
+
+        WWTP: vision_analyze_tool must see a resolved path, not bare ``F01``.
+        """
+        import sys
+        import types
         from unittest.mock import patch
 
         handles = make_file_handles([str(self.image)])
-        with file_grant_scope(
-            "vision-auto",
-            [str(self.image)],
-            handles=handles,
-        ), patch(
-            "tools.file_tools._vision_auto_read_image",
-            return_value={"success": True, "analysis": "diagram shows two boxes"},
-        ):
-            result = self._read("F01", "vision-auto")
+        seen = {}
+
+        async def fake_vision(image_url, user_prompt, model=None, task_id="default"):
+            seen["url"] = image_url
+            return json.dumps(
+                {"success": True, "analysis": "diagram shows two boxes"}
+            )
+
+        fake_mod = types.ModuleType("tools.vision_tools")
+        fake_mod.vision_analyze_tool = fake_vision
+
+        def fake_run_async(coro):
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        self._vision_patch.stop()
+        try:
+            with file_grant_scope(
+                "vision-auto",
+                [str(self.image)],
+                handles=handles,
+            ), patch.dict(sys.modules, {"tools.vision_tools": fake_mod}), patch(
+                "model_tools._run_async",
+                side_effect=fake_run_async,
+            ):
+                result = self._read("F01", "vision-auto")
+        finally:
+            self._vision_patch.start()
 
         self.assertTrue(result.get("success"), result)
         self.assertEqual(result.get("routed_from"), "read_file")
-        self.assertEqual(result.get("read_with"), "vision_analyze")
         self.assertIn("two boxes", result.get("content", ""))
+        self.assertNotEqual(seen.get("url"), "F01", seen)
+        self.assertTrue(str(seen.get("url", "")).endswith("diagram.png"), seen)
 
     def test_non_image_binary_keeps_the_generic_error(self):
         archive = self.root / "bundle.zip"
