@@ -5409,8 +5409,15 @@ def cmd_gui(args: argparse.Namespace):
     force_build = getattr(args, "force_build", False)
 
     packaged_executable = _desktop_packaged_executable(desktop_dir)
+    build_needed = False
+    if not skip_build:
+        build_needed = force_build or _desktop_build_needed(
+            desktop_dir, PROJECT_ROOT, source_mode=source_mode
+        )
 
-    if source_mode or not skip_build:
+    # Source mode needs npm to launch Electron. A packaged app only needs npm
+    # when its content stamp says a rebuild is actually required.
+    if source_mode or build_needed:
         npm = shutil.which("npm")
         if not npm:
             print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
@@ -5444,9 +5451,6 @@ def cmd_gui(args: argparse.Namespace):
         # If the source tree hasn't changed since the last successful build,
         # skip the npm install + build entirely (saves a ton of useless work).
         # --force-build overrides the stamp and always rebuilds.
-        build_needed = force_build or _desktop_build_needed(
-            desktop_dir, PROJECT_ROOT, source_mode=source_mode
-        )
         if not build_needed:
             build_label = "source build" if source_mode else "packaged app"
             print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
@@ -11099,7 +11103,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
-        "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
+        "model", "pairing", "platform-skills", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",

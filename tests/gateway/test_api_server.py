@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestServer
+
+from tests.gateway.api_server_test_client import (
+    ScopedTestClient as TestClient,
+    TEST_USER_ID,
+)
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
@@ -3123,7 +3128,9 @@ class TestConversationParameter:
                 data = await resp.json()
                 assert data["status"] == "completed"
                 # Conversation mapping should be set
-                assert adapter._response_store.get_conversation("my-chat") is not None
+                assert adapter._response_store.get_conversation(
+                    "my-chat", user_id=TEST_USER_ID
+                ) is not None
 
     @pytest.mark.asyncio
     async def test_conversation_chains_automatically(self, adapter):
@@ -3197,7 +3204,11 @@ class TestConversationParameter:
                 await cli.post("/v1/responses", json={"input": "conv-b msg", "conversation": "conv-b"})
 
                 # They should have different response IDs in the mapping
-                assert adapter._response_store.get_conversation("conv-a") != adapter._response_store.get_conversation("conv-b")
+                assert adapter._response_store.get_conversation(
+                    "conv-a", user_id=TEST_USER_ID
+                ) != adapter._response_store.get_conversation(
+                    "conv-b", user_id=TEST_USER_ID
+                )
 
     @pytest.mark.asyncio
     async def test_conversation_store_false_no_mapping(self, adapter):
@@ -3216,7 +3227,9 @@ class TestConversationParameter:
                 })
                 assert resp.status == 200
                 # Conversation mapping should NOT be set since store=false
-                assert adapter._response_store.get_conversation("ephemeral-chat") is None
+                assert adapter._response_store.get_conversation(
+                    "ephemeral-chat", user_id=TEST_USER_ID
+                ) is None
 
     @pytest.mark.asyncio
     async def test_conversation_reuse_after_eviction_no_404(self, adapter):
@@ -3244,7 +3257,9 @@ class TestConversationParameter:
                 await cli.post("/v1/responses", json={"input": "other"})
 
                 # Conversation mapping should have been cleaned by eviction
-                assert adapter._response_store.get_conversation("my-chat") is None
+                assert adapter._response_store.get_conversation(
+                    "my-chat", user_id=TEST_USER_ID
+                ) is None
 
                 # Reuse conversation name — should start fresh, not 404
                 mock_run.return_value = (
@@ -3301,9 +3316,10 @@ class TestSessionIdHeader:
                 )
 
             assert resp.status == 200
-            assert resp.headers.get("X-Hermes-Session-Id") == "my-session-123"
+            expected_session_id = f"my-session-123-user-{TEST_USER_ID}"
+            assert resp.headers.get("X-Hermes-Session-Id") == expected_session_id
             call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["session_id"] == "my-session-123"
+            assert call_kwargs["session_id"] == expected_session_id
 
     @pytest.mark.asyncio
     async def test_provided_session_id_loads_history_from_db(self, auth_adapter):
@@ -3362,7 +3378,7 @@ class TestSessionIdHeader:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
-            assert call_kwargs["session_id"] == "some-session"
+            assert call_kwargs["session_id"] == f"some-session-user-{TEST_USER_ID}"
 
 
 # ---------------------------------------------------------------------------
@@ -3421,10 +3437,11 @@ class TestSessionKeyHeader:
                 )
             assert resp.status == 200
             assert resp.headers.get("X-Hermes-Session-Key") == "channel-abc"
-            assert resp.headers.get("X-Hermes-Session-Id") == "transcript-xyz"
+            expected_session_id = f"transcript-xyz-user-{TEST_USER_ID}"
+            assert resp.headers.get("X-Hermes-Session-Id") == expected_session_id
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "channel-abc"
-            assert call_kwargs["session_id"] == "transcript-xyz"
+            assert call_kwargs["session_id"] == expected_session_id
 
     @pytest.mark.asyncio
     async def test_session_key_absent_yields_none(self, auth_adapter):

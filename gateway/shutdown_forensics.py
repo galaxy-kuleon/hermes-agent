@@ -200,7 +200,7 @@ def spawn_async_diagnostic(
     *,
     timeout_seconds: float = 5.0,
 ) -> Optional[int]:
-    """Fire-and-forget ``ps``-style snapshot written to ``log_path``.
+    """Fire-and-forget Linux ``ps``-style snapshot written to ``log_path``.
 
     Runs as a detached subprocess so it can't block the asyncio event loop
     or compete with platform teardown.  The subprocess uses its own
@@ -215,17 +215,19 @@ def spawn_async_diagnostic(
     of processes, ``ps aux`` can take >2s to walk /proc, during which the
     asyncio loop is frozen and adapter teardown can't begin.
     """
+    # The command below deliberately uses Linux-only process and kernel
+    # interfaces (GNU ps flags, /proc, dmesg, journalctl). Unsupported hosts
+    # skip explicitly instead of depending on whatever `ps` happens to expose.
+    if not sys.platform.startswith("linux"):
+        return None
+
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
 
-    # Inline shell so we don't have to ship a helper script.  bash -c is
-    # available on every POSIX target we support; on Windows we just skip
-    # the snapshot (the platform doesn't ship ps anyway).
-    if sys.platform == "win32":
-        return None
-
+    # Inline shell so we don't have to ship a helper script. bash -c is
+    # available on the Linux gateway targets this diagnostic supports.
     script = (
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "

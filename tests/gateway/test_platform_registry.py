@@ -739,11 +739,17 @@ class TestPluginEnablementGate:
         """
         from gateway.platform_registry import platform_registry as _reg
 
+        calls = []
+
+        def _would_install_dependencies():
+            calls.append("check_fn")
+            return True
+
         _reg.register(PlatformEntry(
             name="myunconfiguredplat",
             label="MyUnconfigured",
             adapter_factory=lambda cfg: None,
-            check_fn=lambda: True,             # SDK available
+            check_fn=_would_install_dependencies,
             is_connected=lambda cfg: False,    # but user hasn't set credentials
             source="plugin",
         ))
@@ -760,6 +766,10 @@ class TestPluginEnablementGate:
                 assert cfg.platforms[plat].enabled is False, (
                     "Plugin with is_connected=False must NOT be auto-enabled"
                 )
+            assert calls == [], (
+                "An unconfigured plugin must be rejected before check_fn; "
+                "some check_fn implementations lazy-install dependencies"
+            )
         finally:
             _reg.unregister("myunconfiguredplat")
 
@@ -769,11 +779,17 @@ class TestPluginEnablementGate:
         """check_fn=True + is_connected=True still enables the platform."""
         from gateway.platform_registry import platform_registry as _reg
 
+        calls = []
+
+        def _check_requirements():
+            calls.append("check_fn")
+            return True
+
         _reg.register(PlatformEntry(
             name="myconfiguredplat",
             label="MyConfigured",
             adapter_factory=lambda cfg: None,
-            check_fn=lambda: True,
+            check_fn=_check_requirements,
             is_connected=lambda cfg: True,
             source="plugin",
         ))
@@ -787,6 +803,7 @@ class TestPluginEnablementGate:
             plat = Platform("myconfiguredplat")
             assert plat in cfg.platforms
             assert cfg.platforms[plat].enabled is True
+            assert calls == ["check_fn"]
         finally:
             _reg.unregister("myconfiguredplat")
 

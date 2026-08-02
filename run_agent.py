@@ -5114,11 +5114,29 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        return compress_context(
+        result = compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
         )
+        # Compression may drop or summarise the very tool results the read memo
+        # points at, so every memo for this task is now potentially a lie. Drop
+        # them here, at the one choke point all compression passes go through.
+        try:
+            from tools.file_tools import forget_task_reads
+            from tools.request_file_cache import invalidate as _invalidate_read_memo
+
+            # Both layers suppress content on a repeat read, so both must be
+            # released or the model is still pointed at a result that is gone.
+            dropped = _invalidate_read_memo(task_id) + forget_task_reads(task_id)
+            if dropped:
+                logger.info(
+                    "read suppression cleared after compression: %d entr%s dropped",
+                    dropped, "y" if dropped == 1 else "ies",
+                )
+        except Exception:
+            logger.exception("read suppression clearing after compression failed")
+        return result
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""

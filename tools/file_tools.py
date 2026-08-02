@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -22,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+# Path B writes attachments as "<3-digit ordinal>-<8-hex nonce>-<name>"; only
+# the trailing part is meaningful when naming a file back to the model.
+_HANDOFF_NAME_PREFIX_RE = re.compile(r"^\d{3}-[0-9a-f]{8}-")
 
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
@@ -94,6 +99,27 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path:
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
+_WORKSPACE_USER_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_WORKSPACE_USER_ID_MAX_CHARS = 64
+_WORKSPACE_USER_DIR_NAME = "user"
+_PER_USER_WORKSPACE_UNAVAILABLE_ERROR = (
+    "Per-user workspace is unavailable; refusing relative path access."
+)
+_PER_USER_WORKSPACE_BOUNDARY_ERROR = (
+    "Per-user workspace boundary refused path access."
+)
+
+
+class _PerUserWorkspaceError(RuntimeError):
+    """A caller-safe denial while enforcing the per-user workspace boundary."""
+
+
+class _PerUserWorkspaceUnavailable(_PerUserWorkspaceError):
+    """The request requires user isolation but its safe base is unavailable."""
+
+
+class _PerUserWorkspaceBoundaryViolation(_PerUserWorkspaceError):
+    """A workspace path resolved outside the current user's isolated root."""
 
 
 def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
@@ -197,8 +223,143 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     return _configured_terminal_cwd()
 
 
-def _resolve_base_dir(task_id: str = "default") -> Path:
-    """Return the ABSOLUTE base directory for resolving relative paths.
+def _workspace_user_scope() -> str:
+    """Return a safe api_server user-id path segment, or ``""``.
+
+    Read the request ContextVar at call time: api_server binds it after some
+    agents have already been constructed, and concurrent requests must never
+    share a cached identity.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return ""
+        user_id = str(get_session_env("HERMES_SESSION_USER_ID", "") or "")
+    except Exception:
+        return ""
+    if (
+        not user_id
+        or len(user_id) > _WORKSPACE_USER_ID_MAX_CHARS
+        or user_id == "."
+        or ".." in user_id
+        or _WORKSPACE_USER_ID_RE.fullmatch(user_id) is None
+    ):
+        return ""
+    return user_id
+
+
+def _per_user_workspace_context(
+    base: Path,
+) -> tuple[Path, Path, Path] | None:
+    """Create and return the current api_server user's workspace context.
+
+    Scoping applies only while the legacy resolution base is still inside the
+    configured workspace. An explicit live cwd outside that workspace (for
+    example a git worktree) remains authoritative. Isolation setup failures
+    raise :class:`_PerUserWorkspaceUnavailable`; callers must reject the
+    relative path rather than fall back to the shared legacy base.
+
+    Returns ``(effective_base, workspace_root, user_root)``. ``effective_base``
+    preserves an explicit cwd already inside ``user_root``; otherwise it is the
+    user's root itself. The separate ``user_root`` is the security boundary:
+    ``effective_base`` may be a nested cwd and must not become the containment
+    boundary.
+    """
+    user_scope = _workspace_user_scope()
+    workspace_raw = _configured_terminal_cwd()
+    if not user_scope or not workspace_raw:
+        return None
+
+    try:
+        workspace = Path(workspace_raw).expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        logger.error(
+            "per_user_workspace_isolation_failed "
+            "reason=workspace_unavailable error_type=%s",
+            type(error).__name__,
+        )
+        raise _PerUserWorkspaceUnavailable(
+            _PER_USER_WORKSPACE_UNAVAILABLE_ERROR
+        ) from error
+    try:
+        base.relative_to(workspace)
+    except ValueError:
+        return None
+
+    candidate = workspace / _WORKSPACE_USER_DIR_NAME / user_scope
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        logger.error(
+            "per_user_workspace_isolation_failed "
+            "reason=mkdir_failed error_type=%s",
+            type(error).__name__,
+        )
+        raise _PerUserWorkspaceUnavailable(
+            _PER_USER_WORKSPACE_UNAVAILABLE_ERROR
+        ) from error
+    try:
+        scoped_base = candidate.resolve()
+        if scoped_base != candidate:
+            raise ValueError("user workspace path contains a symlink")
+        scoped_base.relative_to(workspace)
+    except (OSError, RuntimeError, ValueError) as error:
+        logger.error(
+            "per_user_workspace_isolation_failed "
+            "reason=invalid_scope error_type=%s",
+            type(error).__name__,
+        )
+        raise _PerUserWorkspaceUnavailable(
+            _PER_USER_WORKSPACE_UNAVAILABLE_ERROR
+        ) from error
+
+    # Preserve an explicit cwd already inside this user's scope. Any other cwd
+    # below the shared workspace is reset to the user's isolated root.
+    try:
+        base.relative_to(scoped_base)
+        effective_base = base
+    except ValueError:
+        effective_base = scoped_base
+    return effective_base, workspace, scoped_base
+
+
+def _per_user_workspace_base(base: Path) -> Path | None:
+    """Create and return the effective per-user base, when scoping applies."""
+    context = _per_user_workspace_context(base)
+    return context[0] if context is not None else None
+
+
+def _legacy_resolution_base(task_id: str = "default") -> Path:
+    """Return the pre-T-M4 absolute resolution base, without user scoping."""
+    root = _authoritative_workspace_root(task_id)
+    if root:
+        base = Path(root).expanduser()
+    else:
+        base = Path(os.getcwd())
+    if not base.is_absolute():
+        # Last-resort anchoring: a live cwd should already be absolute, but if a
+        # terminal backend ever reports a relative cwd, anchor it to the process
+        # cwd once, here, so the result no longer depends on cwd at resolve().
+        base = Path(os.getcwd()) / base
+    return base.resolve()
+
+
+def _resolve_base_dir_scope_context(
+    task_id: str = "default",
+) -> tuple[Path, Path | None, Path | None]:
+    """Return effective base plus configured workspace/user containment roots."""
+    base = _legacy_resolution_base(task_id)
+    context = _per_user_workspace_context(base)
+    if context is None:
+        return base, None, None
+    return context
+
+
+def _resolve_base_dir_with_scope(
+    task_id: str = "default",
+) -> tuple[Path, bool]:
+    """Return the absolute resolution base and whether user scoping applied.
 
     Resolution order:
       1. The task's live terminal cwd (the directory the agent is actually
@@ -220,17 +381,114 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
     outright (rather than anchoring them to the process cwd) and fall through to
     the process cwd only as a last resort, deterministically.
     """
-    root = _authoritative_workspace_root(task_id)
-    if root:
-        base = Path(root).expanduser()
-    else:
-        base = Path(os.getcwd())
-    if not base.is_absolute():
-        # Last-resort anchoring: a live cwd should already be absolute, but if a
-        # terminal backend ever reports a relative cwd, anchor it to the process
-        # cwd once, here, so the result no longer depends on cwd at resolve().
-        base = Path(os.getcwd()) / base
-    return base.resolve()
+    base, _workspace, user_root = _resolve_base_dir_scope_context(task_id)
+    return base, user_root is not None
+
+
+def _resolve_base_dir(task_id: str = "default") -> Path:
+    return _resolve_base_dir_with_scope(task_id)[0]
+
+
+def _resolve_path_for_task_with_scope(
+    filepath: str,
+    task_id: str = "default",
+) -> tuple[Path, bool]:
+    """Resolve a path and enforce the api_server user's workspace boundary.
+
+    Relative paths are contained by the current user's realpath root whenever
+    per-user scoping applies. Absolute paths outside the configured workspace
+    retain their pre-T-M4 behavior (for example handoff files under ``/tmp``).
+    Absolute paths *inside* the configured workspace may only address the
+    current user's root. Resolving the complete candidate neutralizes ``..``
+    and symlinks in any path component before the shell/file layer sees it.
+    """
+    p = Path(filepath).expanduser()
+    if p.is_absolute():
+        try:
+            resolved = p.resolve()
+        except (OSError, RuntimeError) as error:
+            # Absolute paths historically bypassed workspace scoping. Only
+            # replace their raw resolution error with a non-identifying denial
+            # when this request is otherwise eligible for per-user scoping.
+            try:
+                base = _legacy_resolution_base(task_id)
+                workspace_raw = _configured_terminal_cwd()
+                workspace = (
+                    Path(workspace_raw).expanduser().resolve()
+                    if _workspace_user_scope() and workspace_raw
+                    else None
+                )
+                if workspace is None:
+                    raise error
+                base.relative_to(workspace)
+            except ValueError:
+                raise error
+            except (OSError, RuntimeError):
+                raise error
+            logger.error(
+                "per_user_workspace_path_denied "
+                "reason=resolution_failed error_type=%s",
+                type(error).__name__,
+            )
+            raise _PerUserWorkspaceBoundaryViolation(
+                _PER_USER_WORKSPACE_BOUNDARY_ERROR
+            ) from error
+
+        # Preserve the established ability to read absolute handoff paths
+        # outside the configured workspace without creating/requiring a user
+        # directory. Only absolute targets inside an applicable shared
+        # workspace need the user boundary.
+        user_scope = _workspace_user_scope()
+        workspace_raw = _configured_terminal_cwd()
+        if not user_scope or not workspace_raw:
+            return resolved, False
+        try:
+            workspace = Path(workspace_raw).expanduser().resolve()
+            legacy_base = _legacy_resolution_base(task_id)
+            legacy_base.relative_to(workspace)
+            resolved.relative_to(workspace)
+        except (OSError, RuntimeError, ValueError):
+            return resolved, False
+
+        _base, _workspace, user_root = _resolve_base_dir_scope_context(task_id)
+        if user_root is None:
+            return resolved, False
+        try:
+            resolved.relative_to(user_root)
+        except ValueError as error:
+            logger.error(
+                "per_user_workspace_path_denied reason=outside_user_scope"
+            )
+            raise _PerUserWorkspaceBoundaryViolation(
+                _PER_USER_WORKSPACE_BOUNDARY_ERROR
+            ) from error
+        return resolved, True
+
+    base, _workspace, user_root = _resolve_base_dir_scope_context(task_id)
+    try:
+        resolved = (base / p).resolve()
+    except (OSError, RuntimeError) as error:
+        if user_root is None:
+            raise
+        logger.error(
+            "per_user_workspace_path_denied "
+            "reason=resolution_failed error_type=%s",
+            type(error).__name__,
+        )
+        raise _PerUserWorkspaceBoundaryViolation(
+            _PER_USER_WORKSPACE_BOUNDARY_ERROR
+        ) from error
+    if user_root is not None:
+        try:
+            resolved.relative_to(user_root)
+        except ValueError as error:
+            logger.error(
+                "per_user_workspace_path_denied reason=outside_user_scope"
+            )
+            raise _PerUserWorkspaceBoundaryViolation(
+                _PER_USER_WORKSPACE_BOUNDARY_ERROR
+            ) from error
+    return resolved, user_root is not None
 
 
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
@@ -239,10 +497,19 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
     paths are returned resolved-but-unanchored.
     """
-    p = Path(filepath).expanduser()
-    if p.is_absolute():
-        return p.resolve()
-    return (_resolve_base_dir(task_id) / p).resolve()
+    return _resolve_path_for_task_with_scope(filepath, task_id)[0]
+
+
+def _workspace_path_access_error(
+    filepath: str,
+    task_id: str = "default",
+) -> str | None:
+    """Return a caller-safe per-user setup or containment error."""
+    try:
+        _resolve_path_for_task_with_scope(filepath, task_id)
+    except _PerUserWorkspaceError as error:
+        return str(error)
+    return None
 
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
@@ -503,6 +770,28 @@ _file_ops_cache: dict = {}
 #                      by the same task don't trigger false warnings.
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
+
+
+def forget_task_reads(task_id: str = "default") -> int:
+    """Drop the per-task read dedup state, returning how many keys were cleared.
+
+    The dedup answers a repeated read with "refer to your earlier result".
+    After context compression that earlier result may no longer exist, so the
+    suppression has to be released together with the request-scoped memo —
+    otherwise the model is told to look at something that is gone and has no
+    way to ask for it again.
+    """
+    key = str(task_id or "default")
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(key)
+        if not task_data:
+            return 0
+        cleared = len(task_data.get("dedup") or {})
+        task_data["dedup"] = {}
+        task_data["dedup_hits"] = {}
+        task_data["last_key"] = None
+        task_data["consecutive"] = 0
+    return cleared
 
 # Track consecutive patch failures per (task_id, resolved_path).  Used to
 # escalate the hint when the model repeatedly fails to patch the same file
@@ -1098,11 +1387,67 @@ def _acl_filter_search_result(result, task_id: str = "default"):
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
-    """Read a file with pagination and line numbers."""
+    """Read a file with pagination and line numbers.
+
+    Repeated identical reads inside one request are answered from a memo
+    instead of re-reading the file and re-inserting its full text into the
+    prompt. See ``tools/request_file_cache.py`` for why advisory loop warnings
+    were not enough on their own.
+    """
+    from tools import request_file_cache
+    from tools.file_grants import resolve_grant_alias
+
+    resolved_arg = resolve_grant_alias(path, task_id=task_id)
+    handle = str(path).strip() if resolved_arg != str(path) else ""
+
+    if request_file_cache.is_active(task_id):
+        memo = request_file_cache.lookup(resolved_arg, offset, limit, task_id=task_id)
+        if memo is not None:
+            return json.dumps(
+                request_file_cache.repeat_notice(memo, handle=handle),
+                ensure_ascii=False,
+            )
+
+    result = _read_file_tool_impl(resolved_arg, offset, limit, task_id)
+
+    if request_file_cache.is_active(task_id):
+        try:
+            parsed = json.loads(result)
+        except (TypeError, ValueError):
+            parsed = None
+        # Memoise only a real content read. Errors, denials and binary guards
+        # must stay repeatable — the model may legitimately retry them after
+        # changing something.
+        if (
+            isinstance(parsed, dict)
+            and not parsed.get("error")
+            and isinstance(parsed.get("content"), str)
+        ):
+            request_file_cache.remember(
+                resolved_arg,
+                offset,
+                limit,
+                task_id=task_id,
+                content=parsed["content"],
+                display_name=_HANDOFF_NAME_PREFIX_RE.sub(
+                    "", str(resolved_arg).rsplit("/", 1)[-1], count=1
+                ),
+            )
+
+    return result
+
+
+def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> str:
+    """Uncached read. Every guard and return shape is unchanged."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
-        from tools.file_grants import file_grant_error
+        from tools.file_grants import file_grant_error, resolve_grant_alias
+
+        # Attached files may be addressed by short handle (`F07`) instead of
+        # their ~190-character signed path. Rewrite first so every check below,
+        # and the read itself, operate on the real path.
+        path = resolve_grant_alias(path, task_id=task_id)
 
         grant_err = file_grant_error(path, task_id=task_id, operation="read")
         if grant_err:
@@ -1124,7 +1469,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 ),
             })
 
-        _resolved = _resolve_path_for_task(path, task_id)
+        _resolved, _user_workspace_scoped = _resolve_path_for_task_with_scope(
+            path,
+            task_id,
+        )
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -1176,6 +1524,26 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
+            from tools.file_grants import file_handle_for_path
+            from tools.file_reader_routing import (
+                READ_WITH_VISION,
+                reader_call,
+                reader_route,
+            )
+
+            read_with = reader_route(str(_resolved))
+            if read_with == READ_WITH_VISION:
+                target = (
+                    file_handle_for_path(_resolved, task_id=task_id)
+                    or str(_resolved)
+                )
+                recovery_call = reader_call(read_with, target)
+                return json.dumps({
+                    "error": (
+                        f"Cannot read binary file '{path}' ({_ext}). "
+                        f"Call {recovery_call} instead."
+                    ),
+                })
             return json.dumps({
                 "error": (
                     f"Cannot read binary file '{path}' ({_ext}). "
@@ -1256,7 +1624,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        file_ops_path = str(_resolved) if _user_workspace_scoped else path
+        result = file_ops.read_file(file_ops_path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1515,13 +1884,19 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
-    sensitive_err = _check_sensitive_path(path, task_id)
-    if sensitive_err:
-        return tool_error(sensitive_err)
-    if not cross_profile:
-        cross_warning = _check_cross_profile_path(path, task_id)
-        if cross_warning:
-            return tool_error(cross_warning)
+    isolation_error = _workspace_path_access_error(path, task_id)
+    if isolation_error:
+        return tool_error(isolation_error)
+    try:
+        sensitive_err = _check_sensitive_path(path, task_id)
+        if sensitive_err:
+            return tool_error(sensitive_err)
+        if not cross_profile:
+            cross_warning = _check_cross_profile_path(path, task_id)
+            if cross_warning:
+                return tool_error(cross_warning)
+    except _PerUserWorkspaceError as error:
+        return tool_error(str(error))
     raw_write_err = _acl_raw_file_write_block()
     if raw_write_err:
         return tool_error(raw_write_err)
@@ -1540,6 +1915,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # check below still runs.
         try:
             _resolved = str(_resolve_path_for_task(path, task_id))
+        except _PerUserWorkspaceError as error:
+            return tool_error(str(error))
         except Exception:
             _resolved = None
 
@@ -1602,6 +1979,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     _acl_path_checks = []  # (path, required skill ACL permission or None for existence-based)
+    _v4a_operations = []
     if path:
         _paths_to_check.append(path)
         _acl_path_checks.append((path, "update"))
@@ -1609,7 +1987,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         from tools.path_security import has_traversal_component
         from tools.patch_parser import OperationType, parse_v4a_patch
 
-        operations, parse_error = parse_v4a_patch(patch)
+        _v4a_operations, parse_error = parse_v4a_patch(patch)
         if parse_error:
             return tool_error(f"Failed to parse patch: {parse_error}")
 
@@ -1620,6 +1998,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # in V4A headers: a legitimate multi-file patch from a single cwd
             # can always emit absolute paths or paths relative to the agent's
             # cwd without ``..``.
+            # Run per-user realpath containment first. This gives api_server
+            # callers the same non-identifying boundary denial as every other
+            # file entrypoint, while CLI/TUI retain the pre-existing explicit
+            # V4A traversal error below.
+            _resolve_path_for_task_with_scope(v4a_path, task_id)
             if has_traversal_component(v4a_path):
                 raise ValueError(
                     f"V4A patch header contains '..' traversal: {v4a_path!r}. "
@@ -1630,7 +2013,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             _acl_path_checks.append((v4a_path, permission))
 
         try:
-            for op in operations:
+            for op in _v4a_operations:
                 if op.operation == OperationType.UPDATE:
                     _add_v4a_path(op.file_path, "update")
                 elif op.operation == OperationType.ADD:
@@ -1645,16 +2028,24 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     _add_v4a_path(op.file_path, "delete")
                     if op.new_path:
                         _add_v4a_path(op.new_path, "create")
+        except _PerUserWorkspaceError as e:
+            return tool_error(str(e))
         except ValueError as e:
             return tool_error(str(e))
     for _p in _paths_to_check:
-        sensitive_err = _check_sensitive_path(_p, task_id)
-        if sensitive_err:
-            return tool_error(sensitive_err)
-        if not cross_profile:
-            cross_warning = _check_cross_profile_path(_p, task_id)
-            if cross_warning:
-                return tool_error(cross_warning)
+        isolation_error = _workspace_path_access_error(_p, task_id)
+        if isolation_error:
+            return tool_error(isolation_error)
+        try:
+            sensitive_err = _check_sensitive_path(_p, task_id)
+            if sensitive_err:
+                return tool_error(sensitive_err)
+            if not cross_profile:
+                cross_warning = _check_cross_profile_path(_p, task_id)
+                if cross_warning:
+                    return tool_error(cross_warning)
+        except _PerUserWorkspaceError as error:
+            return tool_error(str(error))
     raw_write_err = _acl_raw_file_write_block()
     if raw_write_err:
         return tool_error(raw_write_err)
@@ -1671,9 +2062,14 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # multi-file V4A patches.
         _resolved_paths: list[str] = []
         _seen: set[str] = set()
+        _per_user_patch_scope = False
         for _p in _paths_to_check:
             try:
-                _r = str(_resolve_path_for_task(_p, task_id))
+                _resolved, _scoped = _resolve_path_for_task_with_scope(_p, task_id)
+                _r = str(_resolved)
+                _per_user_patch_scope = _per_user_patch_scope or _scoped
+            except _PerUserWorkspaceError:
+                raise
             except Exception:
                 _r = None
             if _r and _r not in _seen:
@@ -1696,6 +2092,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _p in _paths_to_check:
                 try:
                     _r = str(_resolve_path_for_task(_p, task_id))
+                except _PerUserWorkspaceError:
+                    raise
                 except Exception:
                     _r = None
                 _path_to_resolved[_p] = _r
@@ -1725,7 +2123,22 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                if _per_user_patch_scope:
+                    from tools.patch_parser import apply_v4a_operations
+
+                    for operation in _v4a_operations:
+                        operation.file_path = (
+                            _path_to_resolved.get(operation.file_path)
+                            or operation.file_path
+                        )
+                        if operation.new_path:
+                            operation.new_path = (
+                                _path_to_resolved.get(operation.new_path)
+                                or operation.new_path
+                            )
+                    result = apply_v4a_operations(_v4a_operations, file_ops)
+                else:
+                    result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -1803,11 +2216,19 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
-        from tools.file_grants import file_grant_error
+        from tools.file_grants import file_grant_error, resolve_grant_alias
+
+        # Accept an attached-file handle here too, so a model that has only
+        # ever seen `F07` is not forced to invent a path to search in.
+        path = resolve_grant_alias(path, task_id=task_id)
 
         grant_err = file_grant_error(path, task_id=task_id, operation="search")
         if grant_err:
             return json.dumps({"error": grant_err, "success": False}, ensure_ascii=False)
+
+        _resolved_search_path, _user_workspace_scoped = (
+            _resolve_path_for_task_with_scope(path, task_id)
+        )
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
@@ -1844,8 +2265,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             }, ensure_ascii=False)
 
         file_ops = _get_file_ops(task_id)
+        file_ops_path = (
+            str(_resolved_search_path) if _user_workspace_scoped else path
+        )
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=file_ops_path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         if hasattr(result, 'matches'):
@@ -2046,3 +2470,11 @@ registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, han
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+
+# Attachment ledger. Registered in "file_read", not "file": it is read-only
+# introspection over the current request's own grants, and a role restricted to
+# read-only file access is precisely the one that uploads documents and needs to
+# know which of them it has actually read.
+from tools.attachments_tool import ATTACHMENTS_SCHEMA, _handle_attachments  # noqa: E402
+
+registry.register(name="attachments", toolset="file_read", schema=ATTACHMENTS_SCHEMA, handler=_handle_attachments, check_fn=_check_file_reqs, emoji="📎", max_result_size_chars=100_000)

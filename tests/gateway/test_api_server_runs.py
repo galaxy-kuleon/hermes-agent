@@ -14,7 +14,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestServer
+
+from tests.gateway.api_server_test_client import (
+    ScopedTestClient as TestClient,
+    TEST_USER_ID,
+)
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
@@ -252,8 +257,12 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
-                assert status["session_id"] == "space-session"
+                expected_session_id = f"space-session-user-{TEST_USER_ID}"
+                assert (
+                    mock_agent.run_conversation.call_args.kwargs["task_id"]
+                    == expected_session_id
+                )
+                assert status["session_id"] == expected_session_id
 
     @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):

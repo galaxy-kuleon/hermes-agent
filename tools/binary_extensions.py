@@ -1,12 +1,14 @@
-"""Binary file extensions to skip for text-based operations.
+"""Binary and image extension policy for file-reading operations.
 
 These files can't be meaningfully compared as text and are often large.
 Ported from free-code src/constants/files.ts.
 """
 
-BINARY_EXTENSIONS = frozenset({
-    # Images
+IMAGE_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff", ".tif",
+})
+
+BINARY_EXTENSIONS = IMAGE_EXTENSIONS | frozenset({
     # Videos
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v", ".mpeg", ".mpg",
     # Audio
@@ -40,3 +42,11 @@ def has_binary_extension(path: str) -> bool:
     if dot == -1:
         return False
     return path[dot:].lower() in BINARY_EXTENSIONS
+
+
+def has_image_extension(path: str) -> bool:
+    """Check if a file path is an image supported by the vision route."""
+    dot = path.rfind(".")
+    if dot == -1:
+        return False
+    return path[dot:].lower() in IMAGE_EXTENSIONS

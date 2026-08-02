@@ -1112,10 +1112,20 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
     try:
+        _tlg_cfg = ToolCallGuardrailConfig.from_mapping(
+            _agent_cfg.get("tool_loop_guardrails", {})
+        )
+
+        def _current_platform() -> str:
+            # Read at decision time: one api_server entry point constructs the
+            # agent before binding session contextvars, so anything resolved
+            # here and now would see an empty platform.
+            from gateway.session_context import get_session_env
+
+            return get_session_env("HERMES_SESSION_PLATFORM", "")
+
         agent._tool_guardrails = ToolCallGuardrailController(
-            ToolCallGuardrailConfig.from_mapping(
-                _agent_cfg.get("tool_loop_guardrails", {})
-            )
+            _tlg_cfg, platform_resolver=_current_platform
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)

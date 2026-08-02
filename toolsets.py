@@ -36,8 +36,11 @@ _HERMES_CORE_TOOLS = [
     # Read the desktop GUI's embedded terminal pane (gated on HERMES_DESKTOP
     # via check_fn in tools/read_terminal_tool.py — hidden outside the GUI).
     "read_terminal",
-    # File manipulation
-    "read_file", "write_file", "patch", "search_files",
+    # File manipulation. Keep this aligned with the backward-compatible
+    # ``file`` composite below so reverse-mapping a platform composite does
+    # not silently drop the whole file toolset when new read tools are added.
+    "attachments", "read_file", "write_file", "patch", "search_files",
+    "local_document_export",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -208,8 +211,12 @@ TOOLSETS = {
     # skill ACL (#13) can withhold write-capable file tools from unprivileged
     # api_server users while preserving read + document export.
     "file_read": {
-        "description": "Read files, search files, and export documents (read-only; no writes)",
-        "tools": ["read_file", "search_files", "local_document_export"],
+        "description": "Read files, search files, list attachments, and export documents (read-only; no writes)",
+        # `attachments` belongs here, not in file_write: it is read-only
+        # introspection over the current request's own grants, and the roles
+        # most likely to be restricted to file_read are exactly the ones that
+        # upload documents and need to know which of them they have read.
+        "tools": ["read_file", "search_files", "local_document_export", "attachments"],
         "includes": []
     },
 

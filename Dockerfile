@@ -1,7 +1,9 @@
-FROM ubuntu:26.04
+FROM ubuntu:24.04
 
-# Disable Python stdout buffering
+# Keep logs immediate and prevent imports from mutating the image's source
+# tree with __pycache__ files at runtime.
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── Locale setup ─────────────────────────────────────────────────────────────
@@ -40,7 +42,7 @@ RUN apt-get update && \
     vim \
     ffmpeg \
     openssh-client \
-    docker-cli \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Create hermes user ───────────────────────────────────────────────────────
@@ -60,7 +62,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Install a real, image-baked Chromium ─────────────────────────────────────
-# Ubuntu 26.04's `chromium` package is only a Snap launcher stub. Containers do
+# Ubuntu's `chromium` package is only a Snap launcher stub. Containers do
 # not run snapd, so the stub exists and passes executable-presence checks but
 # fails every launch. Use Playwright's pinned headless shell instead and expose
 # it through one stable path for both Hermes setup and agent-browser runtime.
@@ -78,13 +80,14 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 
 # ── Install OpenCode CLI system-wide ─────────────────────────────────────────
-# Use /usr/local as HOME so the official installer does not write under
-# /home/hermes, which is volume-mounted and would be hidden at runtime.
+# Fetch a versioned release asset directly and verify its platform checksum.
+# Do not pipe the mutable installer branch into the build: the image revision
+# must determine the exact CLI bytes for both gateway and writer.
+ARG TARGETARCH
+COPY scripts/install_opencode.sh /tmp/install_opencode.sh
 RUN set -eux; \
-    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; \
-    curl -fsSL https://opencode.ai/install | HOME=/usr/local bash -s -- --no-modify-path; \
-    ln -sf /usr/local/.opencode/bin/opencode /usr/local/bin/opencode; \
-    /usr/local/bin/opencode --version
+    bash /tmp/install_opencode.sh --targetarch "${TARGETARCH}"; \
+    rm -f /tmp/install_opencode.sh
 
 # ── Copy hermes-agent source ─────────────────────────────────────────────────
 WORKDIR /opt/hermes
@@ -100,16 +103,49 @@ ENV DOCKER_BUILD=true
 ENV UV_PYTHON_PREFERENCE=only-system
 RUN bash /opt/hermes/setup-hermes.sh
 
-# ── Create .venv symlink for entrypoint compatibility ────────────────────────
+# ── Seal the runtime install ──────────────────────────────────────────────────
 USER root
-RUN ln -sf /opt/hermes/venv /opt/hermes/.venv && \
-    chown -R hermes:hermes /opt/hermes
+RUN set -eux; \
+    test -f /opt/hermes/ui-tui/dist/entry.js; \
+    ln -sf /opt/hermes/venv /opt/hermes/.venv; \
+    printf 'docker\n' > /opt/hermes/.install_method; \
+    rm -rf /home/hermes/.cache /home/hermes/.npm; \
+    chown -R root:root /opt/hermes; \
+    chmod -R a+rX,a-w /opt/hermes; \
+    chown -R hermes:hermes /opt/hermes/venv; \
+    chmod -R u+w /opt/hermes/venv
 
 # ── Runtime config ───────────────────────────────────────────────────────────
 ENV HERMES_HOME=/home/hermes
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
-ENV PATH="/opt/hermes/venv/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
+ENV PATH="/opt/hermes/venv/bin:/usr/local/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
 
-VOLUME ["/home/hermes", "/opt/data"]
+# Source, bundled skills and frontend assets are root-owned and read-only.
+# The venv is the deliberate exception: opt-in platform backends use the
+# allowlisted lazy dependency installer, so only /opt/hermes/venv remains
+# writable by the unprivileged hermes runtime user.
+
+# No VOLUME instruction. Declaring one makes Docker create an anonymous
+# read-write volume at that path for any container that does not mount
+# something there itself, which had three consequences:
+#
+#   * `read_only: true` stopped meaning read-only. hermes-skill-admin declares
+#     read_only, cap_drop ALL, no-new-privileges and network_mode none, and
+#     still received two writable volumes, because volume paths are not part
+#     of the read-only rootfs.
+#   * Every such container stranded a volume. Creating one added two and
+#     `docker rm` without `-v` left both behind; four orphans accumulated on
+#     the deployment host, one holding 8,246 entries / 276 MB of abandoned
+#     Hermes state.
+#   * Each one copied the image layer in first — 7,916 files per container.
+#
+# Every service that needs persistence at these paths mounts it explicitly in
+# docker-compose.yml, so nothing loses data. A container that mounts nothing
+# now writes to its own layer and discards it on removal, which is the honest
+# behaviour for a path nobody asked to persist.
+#
+# Verified before removal: no container outside this Compose project uses this
+# image, and the repository contains no `docker run` invocation of it.
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh"]
 CMD ["hermes", "gateway", "run"]

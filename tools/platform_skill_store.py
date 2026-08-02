@@ -46,6 +46,10 @@ PLATFORM_TRANSACTIONS_DIRNAME = "platform-skill-transactions"
 TRANSACTION_RECEIPT_FILENAME = "receipt.json"
 PLATFORM_SNAPSHOT_FILENAME = "platform-before.tar.gz"
 STATE_SNAPSHOT_FILENAME = "state-before.tar.gz"
+POST_STATE_ARCHIVE_FILENAME = "governance-after.tar.gz"
+ROLLBACK_POST_STATE_ARCHIVE_FILENAME = "governance-rollback-after.tar.gz"
+ROLLBACK_PLATFORM_SNAPSHOT_FILENAME = "platform-before-rollback.tar.gz"
+ROLLBACK_STATE_SNAPSHOT_FILENAME = "state-before-rollback.tar.gz"
 TRANSACTION_LOCK_FILENAME = ".writer.lock"
 TRANSACTION_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 _OPERATOR_STATE_NAMES = frozenset(
@@ -638,6 +642,114 @@ def _safe_destination(destination: str) -> Path:
     return Path(*parts)
 
 
+def capture_transaction_post_state(
+    transaction_id: str,
+    destination: str,
+    *,
+    target_root: Optional[Path] = None,
+    transactions_dir: Optional[Path] = None,
+    archive_filename: str = POST_STATE_ARCHIVE_FILENAME,
+    accepted_receipt_statuses: tuple[str, ...] = ("applying",),
+    allow_existing_archive: bool = False,
+) -> Dict[str, Any]:
+    """Freeze one skill's exact post-state inside its transaction journal.
+
+    The journal volume is the immutable handoff boundary between the isolated
+    writer and a host-side governance reconciler.  Missing targets are explicit
+    tombstones.  Present targets are archived under their platform-relative
+    destination so a consumer never has to infer where the bytes belong.
+
+    This function is called while the platform writer lock is held.  Any
+    failure propagates to :func:`apply_transaction`, which restores the
+    platform snapshot instead of committing a mutation with no governance
+    evidence.
+    """
+
+    transaction_id = _validate_transaction_id(transaction_id)
+    root = Path(target_root or platform_skills_dir())
+    transactions = Path(transactions_dir or default_transactions_dir())
+    safe_destination = _safe_destination(destination)
+    transaction_dir = transactions / transaction_id
+    receipt_path = transaction_dir / TRANSACTION_RECEIPT_FILENAME
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlatformSkillStoreError(
+            f"transaction receipt not found: {transaction_id}"
+        ) from exc
+    if (
+        receipt.get("transaction_id") != transaction_id
+        or receipt.get("status") not in accepted_receipt_statuses
+    ):
+        raise PlatformSkillStoreError(
+            f"transaction {transaction_id} is not accepting post-state evidence"
+        )
+
+    target = root / safe_destination
+    metadata: Dict[str, Any] = {
+        "version": 1,
+        "destination": safe_destination.as_posix(),
+    }
+    if not target.exists():
+        metadata.update(
+            {
+                "state": "deleted",
+                "tree_hash": None,
+                "archive": None,
+                "archive_sha256": None,
+            }
+        )
+        return metadata
+    if target.is_symlink() or not target.is_dir():
+        raise PlatformSkillStoreError(
+            "governance post-state target is not a safe skill directory"
+        )
+    _validate_tree_safety(target)
+
+    archive = transaction_dir / archive_filename
+    if archive.exists() or archive.is_symlink():
+        if not allow_existing_archive or archive.is_symlink() or not archive.is_file():
+            raise PlatformSkillStoreError(
+                f"transaction post-state archive already exists: {archive_filename}"
+            )
+        metadata.update(
+            {
+                "state": "present",
+                "tree_hash": skill_tree_hash(target),
+                "archive": archive.name,
+                "archive_sha256": _sha256(archive),
+            }
+        )
+        return metadata
+    fd, temporary_name = tempfile.mkstemp(
+        dir=transaction_dir,
+        prefix=f".{archive_filename}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        with tarfile.open(temporary, "w:gz") as tar:
+            tar.add(
+                target,
+                arcname=safe_destination.as_posix(),
+                recursive=True,
+            )
+        os.replace(temporary, archive)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    metadata.update(
+        {
+            "state": "present",
+            "tree_hash": skill_tree_hash(target),
+            "archive": archive.name,
+            "archive_sha256": _sha256(archive),
+        }
+    )
+    return metadata
+
+
 def put_skill(
     source: Path,
     *,
@@ -826,26 +938,56 @@ def rollback_transaction(
             )
         platform_snapshot = transaction_dir / PLATFORM_SNAPSHOT_FILENAME
         state_snapshot = transaction_dir / STATE_SNAPSHOT_FILENAME
-        _restore_tree(root, platform_snapshot)
-        _restore_operator_state(state, state_snapshot)
-        migrate_legacy_generated_state(root, state, preserve_existing=True)
-        verified = verify_store(root)
-        if not verified["ok"]:
-            raise PlatformSkillStoreError(
-                "rollback validation failed: " + "; ".join(verified["errors"])
-            )
-        rollback_generation = current + 1
-        _write_generation(state, rollback_generation, f"rollback:{transaction_id}")
-        receipt.update(
-            {
-                "status": "rolled_back",
-                "rolled_back_at": datetime.now(timezone.utc).isoformat(),
-                "rollback_generation": rollback_generation,
-            }
+        rollback_platform_snapshot = (
+            transaction_dir / ROLLBACK_PLATFORM_SNAPSHOT_FILENAME
         )
-        if rollback_metadata:
-            receipt["rollback_request"] = json.loads(json.dumps(rollback_metadata))
-        atomic_json_write(receipt_path, receipt, indent=2, sort_keys=True)
+        rollback_state_snapshot = transaction_dir / ROLLBACK_STATE_SNAPSHOT_FILENAME
+        if not rollback_platform_snapshot.exists():
+            _snapshot_tree(root, rollback_platform_snapshot)
+        if not rollback_state_snapshot.exists():
+            _snapshot_operator_state(state, rollback_state_snapshot)
+        try:
+            _restore_tree(root, platform_snapshot)
+            _restore_operator_state(state, state_snapshot)
+            migrate_legacy_generated_state(root, state, preserve_existing=True)
+            verified = verify_store(root)
+            if not verified["ok"]:
+                raise PlatformSkillStoreError(
+                    "rollback validation failed: " + "; ".join(verified["errors"])
+                )
+            original_outbox = (receipt.get("result") or {}).get(
+                "governance_outbox"
+            )
+            if isinstance(original_outbox, dict) and original_outbox.get(
+                "destination"
+            ):
+                receipt["rollback_governance_outbox"] = (
+                    capture_transaction_post_state(
+                        transaction_id,
+                        str(original_outbox["destination"]),
+                        target_root=root,
+                        transactions_dir=transactions,
+                        archive_filename=ROLLBACK_POST_STATE_ARCHIVE_FILENAME,
+                        accepted_receipt_statuses=("committed",),
+                        allow_existing_archive=True,
+                    )
+                )
+            rollback_generation = current + 1
+            _write_generation(state, rollback_generation, f"rollback:{transaction_id}")
+            receipt.update(
+                {
+                    "status": "rolled_back",
+                    "rolled_back_at": datetime.now(timezone.utc).isoformat(),
+                    "rollback_generation": rollback_generation,
+                }
+            )
+            if rollback_metadata:
+                receipt["rollback_request"] = json.loads(json.dumps(rollback_metadata))
+            atomic_json_write(receipt_path, receipt, indent=2, sort_keys=True)
+        except Exception:
+            _restore_tree(root, rollback_platform_snapshot)
+            _restore_operator_state(state, rollback_state_snapshot)
+            raise
     return {
         "ok": True,
         "transaction_id": transaction_id,

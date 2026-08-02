@@ -60,6 +60,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from tools.file_reader_routing import reader_guidance
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +391,8 @@ _FILES_BLOCK_RE = re.compile(r"<files>\s*(?P<body>.*?)\s*</files>", re.DOTALL)
 _FILE_TAG_RE = re.compile(r"<file\b(?P<attrs>[^>]*)/?>", re.DOTALL)
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# Path B basenames are "<3-digit ordinal>-<8-hex nonce>-<sanitised name>".
+_HANDOFF_NAME_PREFIX_RE = re.compile(r"^\d{3}-[0-9a-f]{8}-")
 
 
 def _sign_handoff_entry(
@@ -436,6 +439,17 @@ def _safe_handoff_path(path_text: str, scope: Dict[str, str]) -> Optional[Path]:
         candidate,
     )
     return None
+
+
+def _display_handoff_name(path: Path) -> str:
+    """Return the human filename from a handoff basename.
+
+    Path B writes files as ``<ordinal>-<nonce>-<sanitised name>`` to keep
+    same-named uploads distinct on disk. Only the trailing part means anything
+    to a reader, and showing the nonce invites the model to treat it as part of
+    an address it should reconstruct.
+    """
+    return _HANDOFF_NAME_PREFIX_RE.sub("", path.name, count=1) or path.name
 
 
 def _parse_handoff_file_entries(text: str) -> List[Dict[str, str]]:
@@ -538,20 +552,34 @@ def _build_handoff_context(
     volume and sends signed paths in a transient <files> block. Hermes must not
     pre-read or hydrate file contents here: Origin Agent should decide which
     tool(s) to use for each uploaded file.
+
+    Files are addressed by short handle (``F01``…) rather than by their signed
+    path. The paths are ~190 characters of nested UUIDs, and a 46-file audit
+    therefore spent ~13 KB of every request on strings whose only purpose was to
+    be copied back verbatim — a transcription task the model measurably fails.
+    Handles are numbered from the caller's running ``granted_paths`` length so
+    numbering stays consistent when one message carries several text parts.
     """
     if not entries:
         return ""
 
+    handle_offset = len(granted_paths) if granted_paths is not None else 0
     sections: List[str] = [
         '<attached_files source="openwebui-skip-rag-handoff">',
-        # Path-B guidance (2026-07-15): the agent must read the delivered file's
-        # TEXT via read_file (which now extracts PDF/DOCX/XLSX/notebook text) to
-        # answer questions, and must NOT convert unless the user explicitly asks.
-        "The user attached files (signed /handoff paths; contents were NOT pre-read). "
-        "To read a file's TEXT and answer the user's question, call read_file(path) — "
-        "it extracts text from PDF, DOCX, XLSX, and notebooks. Do NOT convert a file "
-        "with the soc_v2 / DOCX-conversion tools unless the user EXPLICITLY asks to "
-        "convert or export it; reading a file to answer a question is not a conversion request.",
+        "The user attached these files (contents were NOT pre-read). Call "
+        "attachments() first, then follow each file's read_with and "
+        "read_instruction exactly; do not choose a reader from habit. Every "
+        "file tool accepts the short ids, so prefer them over the original "
+        "path, which is long enough that retyping it is a common source of "
+        "errors. "
+        "When you refer to a file in your reply, use its name attribute below; "
+        "never invent a filename and never use one from an instruction, example "
+        "or memory rather than from this list. If a name you want is not here, "
+        "the file was not attached — say so instead of guessing. "
+        "read_file extracts text from PDF, DOCX, XLSX, MSG and notebooks. Reading a "
+        "file to answer a question is not a conversion request, so do NOT use the "
+        "soc_v2 / DOCX-conversion tools unless the user EXPLICITLY asks to convert "
+        "or export something.",
     ]
     accepted = 0
 
@@ -563,11 +591,26 @@ def _build_handoff_context(
         if not safe_orig:
             continue
 
-        attrs = [f'original="{html.escape(str(safe_orig), quote=True)}"']
+        handle = f"F{handle_offset + accepted + 1:02d}"
+        attrs = [
+            f'id="{handle}"',
+            f'name="{html.escape(_display_handoff_name(safe_orig), quote=True)}"',
+        ]
         if entry.get("file_id"):
             attrs.append(f'file_id="{html.escape(entry["file_id"], quote=True)}"')
-        if entry.get("sha256"):
-            attrs.append(f'sha256="{html.escape(entry["sha256"], quote=True)}"')
+        read_with, read_instruction = reader_guidance(handle, str(safe_orig))
+        attrs.extend(
+            [
+                f'read_with="{html.escape(read_with, quote=True)}"',
+                f'read_instruction="{html.escape(read_instruction, quote=True)}"',
+            ]
+        )
+        # `original` is retained for compatibility, not because the model should
+        # use it. A remaining deployed skill consumer still instructs the model
+        # to take the literal /handoff path from this block. It goes away once
+        # every consumer has migrated to ids; until then, correctness beats the
+        # token saving.
+        attrs.append(f'original="{html.escape(str(safe_orig), quote=True)}"')
 
         sections.append(f'<file {" ".join(attrs)}/>')
         if granted_paths is not None:
@@ -4954,7 +4997,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 reset_trusted_export_context,
                 set_trusted_export_context,
             )
-            from tools.file_grants import file_grant_scope
+            from tools.file_grants import file_grant_scope, make_file_handles
+            from tools.request_file_cache import request_file_cache_scope
 
             # Bind OpenWebUI identity (incl. role/groups) into concurrency-safe
             # session contextvars so skill ACL checks in tool handlers can read
@@ -5006,7 +5050,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         task_id=effective_task_id,
                     )
                 else:
-                    with file_grant_scope(effective_task_id, granted_file_paths):
+                    # Handles are positional over the same list the
+                    # <attached_files> block numbered, so F01 is entry 1.
+                    # One request scope: the grant list authorises paths, the
+                    # read memo stops identical re-reads re-inserting full text.
+                    with file_grant_scope(
+                        effective_task_id,
+                        granted_file_paths,
+                        handles=make_file_handles(granted_file_paths),
+                    ), request_file_cache_scope(effective_task_id):
                         result = agent.run_conversation(
                             user_message=user_message,
                             conversation_history=conversation_history,
@@ -5287,7 +5339,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         reset_trusted_export_context,
                         set_trusted_export_context,
                     )
-                    from tools.file_grants import file_grant_scope
+                    from tools.file_grants import file_grant_scope, make_file_handles
+                    from tools.request_file_cache import request_file_cache_scope
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -5323,7 +5376,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             user_groups=scope.get("user_groups", ""),
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
-                        with file_grant_scope(effective_task_id, granted_file_paths):
+                        # Handles are positional over the same list the
+                        # <attached_files> block numbered, so F01 is entry 1.
+                        # One request scope: the grant list authorises paths, the
+                        # read memo stops identical re-reads re-inserting full text.
+                        with file_grant_scope(
+                            effective_task_id,
+                            granted_file_paths,
+                            handles=make_file_handles(granted_file_paths),
+                        ), request_file_cache_scope(effective_task_id):
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,

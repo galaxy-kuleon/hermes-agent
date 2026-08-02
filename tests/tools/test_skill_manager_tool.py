@@ -36,6 +36,18 @@ def _skill_dir(tmp_path):
         yield
 
 
+@contextmanager
+def _user_skill_dir(tmp_path):
+    """Patch an isolated user root for user-owned curator telemetry tests."""
+    from agent.skill_namespaces import SkillRoot
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), patch(
+        "agent.skill_utils.get_skill_roots",
+        return_value=[SkillRoot("user", tmp_path, owner_user_id="test-user")],
+    ):
+        yield
+
+
 VALID_SKILL_CONTENT = """\
 ---
 name: test-skill
@@ -572,7 +584,7 @@ class TestSkillManageDispatcher:
         from tools.skill_provenance import set_current_write_origin, BACKGROUND_REVIEW
         token = set_current_write_origin(BACKGROUND_REVIEW)
         try:
-            with _skill_dir(tmp_path):
+            with _user_skill_dir(tmp_path):
                 raw = skill_manage(
                     action="create", name="review-sediment", content=VALID_SKILL_CONTENT
                 )

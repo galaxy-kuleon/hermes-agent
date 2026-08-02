@@ -272,12 +272,20 @@ else
         if UV_PROJECT_ENVIRONMENT="$SCRIPT_DIR/venv" $UV_CMD sync --extra all --locked; then
             echo -e "${GREEN}✓${NC} Dependencies installed (hash-verified via uv.lock)"
         else
+            if [ "${DOCKER_BUILD:-}" = "true" ]; then
+                echo -e "${RED}✗${NC} Docker build requires a successful uv sync --locked; refusing an unlocked fallback."
+                exit 1
+            fi
             echo -e "${YELLOW}⚠${NC} Lockfile sync failed (see uv output above)."
             echo -e "${YELLOW}⚠${NC} Falling back to PyPI resolve — transitives will NOT be hash-verified."
             _try_install
             echo -e "${GREEN}✓${NC} Dependencies installed (transitives re-resolved, not hash-verified)"
         fi
     else
+        if [ "${DOCKER_BUILD:-}" = "true" ]; then
+            echo -e "${RED}✗${NC} Docker build requires uv.lock; refusing an unlocked install."
+            exit 1
+        fi
         echo -e "${YELLOW}⚠${NC} uv.lock not found — installing without hash verification of transitives."
         _try_install
         echo -e "${GREEN}✓${NC} Dependencies installed (transitives re-resolved, not hash-verified)"
