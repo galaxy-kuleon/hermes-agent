@@ -80,13 +80,14 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 
 # ── Install OpenCode CLI system-wide ─────────────────────────────────────────
-# Use /usr/local as HOME so the official installer does not write under
-# /home/hermes, which is volume-mounted and would be hidden at runtime.
+# Fetch a versioned release asset directly and verify its platform checksum.
+# Do not pipe the mutable installer branch into the build: the image revision
+# must determine the exact CLI bytes for both gateway and writer.
+ARG TARGETARCH
+COPY scripts/install_opencode.sh /tmp/install_opencode.sh
 RUN set -eux; \
-    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; \
-    curl -fsSL https://opencode.ai/install | HOME=/usr/local bash -s -- --no-modify-path; \
-    ln -sf /usr/local/.opencode/bin/opencode /usr/local/bin/opencode; \
-    /usr/local/bin/opencode --version
+    bash /tmp/install_opencode.sh --targetarch "${TARGETARCH}"; \
+    rm -f /tmp/install_opencode.sh
 
 # ── Copy hermes-agent source ─────────────────────────────────────────────────
 WORKDIR /opt/hermes
@@ -118,7 +119,7 @@ RUN set -eux; \
 ENV HERMES_HOME=/home/hermes
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
-ENV PATH="/opt/hermes/venv/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
+ENV PATH="/opt/hermes/venv/bin:/usr/local/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
 
 # Source, bundled skills and frontend assets are root-owned and read-only.
 # The venv is the deliberate exception: opt-in platform backends use the
