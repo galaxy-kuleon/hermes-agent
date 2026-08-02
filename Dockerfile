@@ -83,23 +83,11 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 # Fetch a versioned release asset directly and verify its platform checksum.
 # Do not pipe the mutable installer branch into the build: the image revision
 # must determine the exact CLI bytes for both gateway and writer.
-ARG OPENCODE_VERSION=1.18.10
 ARG TARGETARCH
-ARG OPENCODE_LINUX_AMD64_SHA256=6b1113da704253fb4da12b41e4236acecb9f2b62949c945f6eeacaa15111b976
-ARG OPENCODE_LINUX_ARM64_SHA256=41ae3041e91b894e4c0dc06a73a9a2796254bf390ffb99626a43af5e2912d170
+COPY scripts/install_opencode.sh /tmp/install_opencode.sh
 RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) asset_arch=x64; expected_sha256="${OPENCODE_LINUX_AMD64_SHA256}" ;; \
-      arm64) asset_arch=arm64; expected_sha256="${OPENCODE_LINUX_ARM64_SHA256}" ;; \
-      *) echo "unsupported OpenCode target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    archive=/tmp/opencode.tar.gz; \
-    curl -fL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${asset_arch}.tar.gz" -o "${archive}"; \
-    echo "${expected_sha256}  ${archive}" | sha256sum -c -; \
-    tar -xzf "${archive}" -C /usr/local/bin opencode; \
-    chmod 0755 /usr/local/bin/opencode; \
-    rm -f "${archive}"; \
-    test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}"
+    bash /tmp/install_opencode.sh --targetarch "${TARGETARCH}"; \
+    rm -f /tmp/install_opencode.sh
 
 # ── Copy hermes-agent source ─────────────────────────────────────────────────
 WORKDIR /opt/hermes
