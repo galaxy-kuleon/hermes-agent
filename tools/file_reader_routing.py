@@ -12,6 +12,14 @@ READ_WITH_FILE = "read_file"
 READ_WITH_VISION = "vision_analyze"
 READ_WITH_UNSUPPORTED = "unsupported"
 
+# Shared with read_file extraction failures and the attachments ledger so the
+# model always sees the same obligation: name unreadable materials in the
+# final report instead of inventing content (MSG/PDF false-success disease).
+UNREADABLE_REPORT_INSTRUCTION = (
+    "Treat it as unreadable. Name it under unreadable materials in any "
+    "final report; do not invent its content."
+)
+
 
 def reader_route(path: str) -> str:
     """Return the reader route that mirrors ``read_file`` extension gates."""
@@ -43,7 +51,8 @@ def reader_guidance(target: str, path: str) -> tuple[str, str]:
         return read_with, f"Call {call}."
     return (
         read_with,
-        "No direct reader is available for this binary attachment.",
+        "No direct reader is available for this binary attachment. "
+        + UNREADABLE_REPORT_INSTRUCTION,
     )
 
 
@@ -51,6 +60,7 @@ __all__ = [
     "READ_WITH_FILE",
     "READ_WITH_UNSUPPORTED",
     "READ_WITH_VISION",
+    "UNREADABLE_REPORT_INSTRUCTION",
     "reader_call",
     "reader_guidance",
     "reader_route",

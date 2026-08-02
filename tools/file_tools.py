@@ -1511,15 +1511,45 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
         )
 
         # ── Structured-document extraction ────────────────────────────
-        # Try before the binary-extension guard so .docx/.xlsx can render as text.
-        # Malformed documents fall through to the normal path/binary guard.
+        # Try before the binary-extension guard so .docx/.xlsx/.msg/.pdf can
+        # render as text. Extraction failure must NOT fall through to a raw
+        # text open: that returns binary garbage as "content", the request
+        # memo marks the file read, and the model reports a complete audit
+        # that never actually read the document (MSG/PDF false-success disease).
         from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
+        from tools.file_reader_routing import UNREADABLE_REPORT_INSTRUCTION
 
         if is_extractable_document(str(_resolved)):
             try:
                 extracted_text = extract_document_text(str(_resolved))
-            except ExtractionError:
-                logger.debug("document extraction failed for %s", path, exc_info=True)
+            except ExtractionError as exc:
+                logger.warning(
+                    "document extraction failed for %s: %s",
+                    path,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                display = _HANDOFF_NAME_PREFIX_RE.sub(
+                    "", Path(str(_resolved)).name, count=1
+                ) or Path(str(_resolved)).name
+                ext = Path(str(_resolved)).suffix.lower() or "document"
+                reason = str(exc).strip() or type(exc).__name__
+                return json.dumps(
+                    {
+                        "error": (
+                            f"Cannot extract readable text from '{display}' "
+                            f"({ext}): {reason}. "
+                            f"{UNREADABLE_REPORT_INSTRUCTION}"
+                        ),
+                        "path": path,
+                        "readable": False,
+                        "extraction_failed": True,
+                        "failure_kind": type(exc).__name__,
+                        "report_as": "unreadable",
+                        "name": display,
+                    },
+                    ensure_ascii=False,
+                )
             else:
                 file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
@@ -1532,6 +1562,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     "file_size": os.path.getsize(_resolved),
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
+                    "readable": True,
                 }
                 if result_dict["truncated"]:
                     result_dict["hint"] = (

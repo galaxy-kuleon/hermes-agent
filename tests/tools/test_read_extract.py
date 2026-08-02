@@ -333,7 +333,13 @@ class TestPdfExtraction(unittest.TestCase):
             )
         extract_pdf_text.assert_called_once_with(self.path)
 
-    def test_pdf_error_propagates_then_read_file_falls_back_to_normal_read(self):
+    def test_pdf_error_propagates_as_honest_unreadable_not_binary_garbage(self):
+        """Extraction failure must not fall through to raw-bytes-as-text.
+
+        Before M-U1-D, a failed PDF/MSG extract returned binary garbage as
+        ``content`` (and the request memo marked the file read). The model then
+        produced a complete-looking audit that never actually read the file.
+        """
         with patch(
             "tools.pdf_extract.extract_pdf_text",
             side_effect=ExtractionError("synthetic extractor failure"),
@@ -347,7 +353,13 @@ class TestPdfExtraction(unittest.TestCase):
             result = json.loads(read_file_tool(self.path))
 
         self.assertNotIn("extracted_document", result)
-        self.assertIn("%PDF-1.4", result["content"])
+        self.assertNotIn("content", result)
+        self.assertTrue(result.get("extraction_failed"))
+        self.assertIs(result.get("readable"), False)
+        self.assertEqual(result.get("report_as"), "unreadable")
+        self.assertIn("synthetic extractor failure", result["error"])
+        self.assertIn("unreadable materials", result["error"])
+        self.assertNotIn("%PDF-1.4", result.get("error", ""))
 
 
 class TestMsgExtraction(unittest.TestCase):

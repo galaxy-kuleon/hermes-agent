@@ -123,10 +123,13 @@ class AttachmentsLedgerTests(unittest.TestCase):
         )
         entry = ledger["files"][0]
         self.assertEqual(entry["read_with"], "unsupported")
-        self.assertEqual(
-            entry["read_instruction"],
-            "No direct reader is available for this binary attachment.",
-        )
+        self.assertIs(entry["readable"], False)
+        self.assertEqual(entry["report_as"], "unreadable")
+        self.assertIn("No direct reader is available", entry["read_instruction"])
+        self.assertIn("unreadable materials", entry["read_instruction"])
+        self.assertEqual(ledger["unreadable"], 1)
+        self.assertEqual(ledger["unreadable_ids"], [entry["id"]])
+        self.assertIn("unreadable materials", ledger["note"])
 
     def test_incomplete_coverage_says_so_in_actionable_terms(self):
         # The single fact chat f248f12e never surfaced: 28 files untouched.

@@ -19,8 +19,14 @@ BINARY_EXTENSIONS = IMAGE_EXTENSIONS | frozenset({
     ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".obj", ".lib",
     ".app", ".msi", ".deb", ".rpm",
     # Documents (exclude .pdf — text-based, agents may want to inspect)
+    # .doc/.docx/.xls/.xlsx are still extractable via read_extract before the
+    # binary guard; listing them here only blocks non-extractable fallthrough.
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".odt", ".ods", ".odp",
+    # Mail stores / shortcuts with no Path-B direct reader (.msg is extractable
+    # and deliberately NOT listed; .eml is plain MIME text and stays readable).
+    ".pst", ".ost", ".oab",
+    ".lnk",
     # Fonts
     ".ttf", ".otf", ".woff", ".woff2", ".eot",
     # Bytecode / VM artifacts

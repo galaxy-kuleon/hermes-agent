@@ -53,6 +53,11 @@ def attachments_tool(task_id: str = "default") -> str:
             ensure_ascii=False,
         )
 
+    from tools.file_reader_routing import (
+        READ_WITH_UNSUPPORTED,
+        UNREADABLE_REPORT_INSTRUCTION,
+    )
+
     files = []
     read_count = 0
     for handle, path in handles:
@@ -70,23 +75,47 @@ def attachments_tool(task_id: str = "default") -> str:
             handle,
             path,
         )
+        # Extension-level unreadable (no direct reader). Extraction-time
+        # failures are returned by read_file itself with the same report duty.
+        entry["readable"] = entry["read_with"] != READ_WITH_UNSUPPORTED
+        if not entry["readable"]:
+            entry["report_as"] = "unreadable"
         if memo is not None:
             read_count += 1
             entry["chars"] = memo.get("chars")
             entry["lines"] = memo.get("lines")
         files.append(entry)
 
-    unread = [entry["id"] for entry in files if not entry["read"]]
+    unread = [entry["id"] for entry in files if not entry["read"] and entry["readable"]]
+    unreadable = [entry for entry in files if not entry["readable"]]
+    unreadable_ids = [entry["id"] for entry in unreadable]
     payload = {
         "success": True,
         "total": len(files),
         "read": read_count,
         "unread": len(unread),
         "unread_ids": unread,
+        "unreadable": len(unreadable),
+        "unreadable_ids": unreadable_ids,
         "files": files,
     }
+    note_parts: list[str] = []
+    if unreadable:
+        names = ", ".join(
+            f'{entry["id"]}({entry["name"]})' for entry in unreadable[:12]
+        )
+        more = (
+            f" (+{len(unreadable) - 12} more)"
+            if len(unreadable) > 12
+            else ""
+        )
+        note_parts.append(
+            f"{len(unreadable)} of {len(files)} attached file(s) are unreadable "
+            f"with no direct reader: {names}{more}. "
+            f"{UNREADABLE_REPORT_INSTRUCTION}"
+        )
     if unread:
-        payload["note"] = (
+        note_parts.append(
             f"{len(unread)} of {len(files)} attached files have not been read "
             f"yet, starting with {unread[0]}. Follow each file's read_with and "
             "read_instruction fields; do not send vision_analyze or unsupported "
@@ -94,11 +123,17 @@ def attachments_tool(task_id: str = "default") -> str:
             "not read, and do not claim full coverage while this list is "
             "non-empty."
         )
-    else:
-        payload["note"] = (
+    elif not unreadable:
+        note_parts.append(
             "Every attached file has been read in this request. Repeating a "
             "read returns a short memo instead of the text."
         )
+    elif not unread:
+        note_parts.append(
+            "Every readable attached file has been read in this request. "
+            "Still name every unreadable attachment in the final report."
+        )
+    payload["note"] = " ".join(note_parts)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -107,11 +142,14 @@ ATTACHMENTS_SCHEMA = {
     "description": (
         "List the files attached to the current request and which of them you "
         "have already read. Each file says whether to use read_file, "
-        "vision_analyze, or no direct reader, including an exact instruction. "
-        "Returns each file's short id and name, plus the ids still unread. Call "
-        "this before claiming an audit or summary is complete, and whenever "
-        "you are unsure which files you were given — it is authoritative, "
-        "unlike your recollection of earlier turns. Takes no arguments."
+        "vision_analyze, or no direct reader (readable=false / unreadable), "
+        "including an exact instruction. Unreadable attachments must be named "
+        "as unreadable in any final report — never invent their content. "
+        "Returns each file's short id and name, plus unread_ids and "
+        "unreadable_ids. Call this before claiming an audit or summary is "
+        "complete, and whenever you are unsure which files you were given — "
+        "it is authoritative, unlike your recollection of earlier turns. "
+        "Takes no arguments."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }

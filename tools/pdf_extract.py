@@ -6,7 +6,7 @@ docling service — the same service OpenWebUI RAG already uses
 (``DOCLING_SERVER_URL``, default ``http://docling:5001``). Text-based PDFs return
 their text; scanned PDFs go through docling's OCR. Any failure (service down,
 timeout, oversized, no extractable text) raises :class:`ExtractionError` so
-``read_file`` falls back to its normal binary-file guard.
+``read_file`` returns an honest unreadable error (no raw-bytes fallthrough).
 
 This closes the Path-B P0 (2026-07-15): a user uploads a PDF and asks a question,
 the file is delivered to hermes via skip-rag handoff, but the agent had no
