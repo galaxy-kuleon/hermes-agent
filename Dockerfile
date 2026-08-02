@@ -80,13 +80,25 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 
 # ── Install OpenCode CLI system-wide ─────────────────────────────────────────
-# Use /usr/local as HOME so the official installer does not write under
-# /home/hermes, which is volume-mounted and would be hidden at runtime.
+# Fetch a versioned release asset directly and verify its platform checksum.
+# Do not pipe the mutable installer branch into the build: the image revision
+# must determine the exact CLI bytes for both gateway and writer.
 ARG OPENCODE_VERSION=1.18.10
+ARG TARGETARCH
+ARG OPENCODE_LINUX_AMD64_SHA256=6b1113da704253fb4da12b41e4236acecb9f2b62949c945f6eeacaa15111b976
+ARG OPENCODE_LINUX_ARM64_SHA256=41ae3041e91b894e4c0dc06a73a9a2796254bf390ffb99626a43af5e2912d170
 RUN set -eux; \
-    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; \
-    curl -fsSL https://opencode.ai/install | HOME=/usr/local bash -s -- --no-modify-path --version "${OPENCODE_VERSION}"; \
-    ln -sf /usr/local/.opencode/bin/opencode /usr/local/bin/opencode; \
+    case "${TARGETARCH}" in \
+      amd64) asset_arch=x64; expected_sha256="${OPENCODE_LINUX_AMD64_SHA256}" ;; \
+      arm64) asset_arch=arm64; expected_sha256="${OPENCODE_LINUX_ARM64_SHA256}" ;; \
+      *) echo "unsupported OpenCode target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    archive=/tmp/opencode.tar.gz; \
+    curl -fL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${asset_arch}.tar.gz" -o "${archive}"; \
+    echo "${expected_sha256}  ${archive}" | sha256sum -c -; \
+    tar -xzf "${archive}" -C /usr/local/bin opencode; \
+    chmod 0755 /usr/local/bin/opencode; \
+    rm -f "${archive}"; \
     test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}"
 
 # ── Copy hermes-agent source ─────────────────────────────────────────────────
@@ -119,7 +131,7 @@ RUN set -eux; \
 ENV HERMES_HOME=/home/hermes
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
-ENV PATH="/opt/hermes/venv/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
+ENV PATH="/opt/hermes/venv/bin:/usr/local/bin:/home/hermes/.npm-global/bin:/home/hermes/.local/bin:$PATH"
 
 # Source, bundled skills and frontend assets are root-owned and read-only.
 # The venv is the deliberate exception: opt-in platform backends use the
