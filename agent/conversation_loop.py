@@ -3906,24 +3906,30 @@ def run_conversation(
                 # answer and calls memory/skill tools as a side-effect in the same
                 # turn. If the follow-up turn after tools is empty, we use this.
                 turn_content = assistant_message.content or ""
+                from agent.tool_turn_narration import (
+                    should_suppress_tool_turn_narration,
+                    tool_names_from_tool_calls,
+                )
+
+                _tc_names = tool_names_from_tool_calls(
+                    assistant_message.tool_calls
+                )
+                _suppress_narration = should_suppress_tool_turn_narration(
+                    _tc_names
+                )
                 if turn_content and agent._has_content_after_think_block(turn_content):
                     agent._last_content_with_tools = turn_content
-                    # Only mute subsequent output when EVERY tool call in
-                    # this turn is post-response housekeeping (memory, todo,
-                    # skill_manage, etc.).  If any substantive tool is present
-                    # (search_files, read_file, write_file, terminal, ...),
-                    # keep output visible so the user sees progress.
-                    _HOUSEKEEPING_TOOLS = frozenset({
-                        "memory", "todo", "skill_manage", "session_search",
-                    })
-                    _all_housekeeping = all(
-                        tc.function.name in _HOUSEKEEPING_TOOLS
-                        for tc in assistant_message.tool_calls
-                    )
+                    # Housekeeping-only: mute post-response chatter after answer.
+                    # Substantive tools (read_file, …): do NOT surface mid-turn
+                    # prose — progress is tool_progress, not chat narration (M-U4).
+                    _all_housekeeping = not _suppress_narration
                     agent._last_content_tools_all_housekeeping = _all_housekeeping
                     if _all_housekeeping and agent._has_stream_consumers():
                         agent._mute_post_response = True
-                    elif agent._should_emit_quiet_tool_messages():
+                    elif (
+                        not _suppress_narration
+                        and agent._should_emit_quiet_tool_messages()
+                    ):
                         clean = agent._strip_think_blocks(turn_content).strip()
                         if clean:
                             agent._vprint(f"  ┊ 💬 {clean}")
@@ -3955,7 +3961,10 @@ def run_conversation(
                 agent._post_tool_empty_retried = False
 
                 messages.append(assistant_msg)
-                agent._emit_interim_assistant_message(assistant_msg)
+                # M-U4: interim assistant prose on substantive tool rounds is
+                # noise ("continue reading…"); progress stays on tool_progress.
+                if not _suppress_narration:
+                    agent._emit_interim_assistant_message(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may

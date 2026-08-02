@@ -141,7 +141,15 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "sms":             _TIER_MINIMAL,
     "webhook":         _TIER_MINIMAL,
     "homeassistant":   _TIER_MINIMAL,
-    "api_server":      {**_TIER_HIGH, "tool_preview_length": 0},
+    # OpenWebUI / chat-completions: keep tool_progress (progress evidence) but
+    # default off interim assistant prose — audit batches otherwise spam
+    # "continue reading…" into the chat (M-U4). Final answers still stream.
+    "api_server":      {
+        **_TIER_HIGH,
+        "tool_preview_length": 0,
+        "interim_assistant_messages": False,
+        "tool_progress": "all",
+    },
 }
 
 # Canonical set of per-platform overrideable keys (for validation).

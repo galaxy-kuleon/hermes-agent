@@ -1857,6 +1857,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        # M-U4: buffer assistant content until the completion is fully known.
+        # Speculative early flush leaks "continue reading…" before tool_calls
+        # arrive. At end: flush only if not a substantive-tool round.
+        _narration_buffer: list[str] = []
         for chunk in stream:
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
@@ -1901,30 +1905,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
-            # Accumulate text content — fire callback only when no tool calls
+            # Accumulate text content. M-U4: buffer only — never speculative
+            # stream. Flush policy applied after the stream ends.
             if delta and delta.content:
                 content_parts.append(delta.content)
-                if not tool_calls_acc:
-                    _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
-                    deltas_were_sent["yes"] = True
-                # Tool calls suppress regular content streaming (avoids
-                # displaying chatty "I'll use the tool..." text alongside
-                # tool calls).  But reasoning tags embedded in suppressed
-                # content should still reach the display — otherwise the
-                # reasoning box only appears as a post-response fallback,
-                # rendering it confusingly after the already-streamed
-                # response.  Route suppressed content through the stream
-                # delta callback so its tag extraction can fire the
-                # reasoning display.  Non-reasoning text is harmlessly
-                # suppressed by the CLI's _stream_delta when the stream
-                # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
-                    except Exception:
-                        pass
+                _narration_buffer.append(delta.content)
 
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:
@@ -1998,6 +1983,30 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
+
+        # M-U4 flush policy (subtraction of interim tool-round narration):
+        # * no tools → final answer → flush buffer to UI
+        # * housekeeping-only tools → answer-first pattern → flush
+        # * any substantive tool (read_file, …) → drop buffer (progress via
+        #   tool_progress channel, not chat prose)
+        if _narration_buffer:
+            from agent.tool_turn_narration import should_suppress_tool_turn_narration
+
+            _pending_names: list[str] = []
+            if tool_calls_acc:
+                for _idx in sorted(tool_calls_acc):
+                    _n = (tool_calls_acc[_idx].get("function") or {}).get("name") or ""
+                    if _n:
+                        _pending_names.append(_n)
+            if should_suppress_tool_turn_narration(_pending_names):
+                _narration_buffer.clear()
+            else:
+                _flush_text = "".join(_narration_buffer)
+                _narration_buffer.clear()
+                if _flush_text:
+                    _fire_first_delta()
+                    agent._fire_stream_delta(_flush_text)
+                    deltas_were_sent["yes"] = True
 
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
