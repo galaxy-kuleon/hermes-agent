@@ -211,20 +211,6 @@ def finalize_turn(
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
-    # Attachment coverage footer (M-U1-D BLOCKING-1). Incomplete ledger
-    # state is appended by mechanism — not by model memory. Shared by all
-    # exits that pass through finalize_turn (stream + non-stream).
-    if final_response is not None and not interrupted:
-        try:
-            from tools.attachment_ledger import append_coverage_footer
-
-            final_response = append_coverage_footer(
-                final_response,
-                task_id=effective_task_id,
-            )
-        except Exception as _cov_err:
-            logger.debug("attachment coverage footer failed: %s", _cov_err)
-
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
     # after retries, a partial/truncated stream, a still-pending tool
@@ -319,6 +305,48 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
+    # Attachment coverage — LAST content mutation before result assembly
+    # (M-U1-D round 2 BLOCKING-1/3). Must run AFTER transform_llm_output so
+    # plugins cannot strip the footer. Fail-closed when ledger is active but
+    # coverage cannot be determined. Streaming adapters also read
+    # result["coverage_footer"] and emit it before stop/[DONE].
+    _coverage_footer = ""
+    _coverage_snapshot = None
+    _coverage_status = "skipped"
+    try:
+        from tools.attachment_ledger import finalize_attachment_coverage
+
+        final_response, _cov_meta = finalize_attachment_coverage(
+            final_response,
+            task_id=effective_task_id,
+            interrupted=bool(interrupted),
+            fail_closed=True,
+        )
+        _coverage_footer = (_cov_meta or {}).get("footer") or ""
+        _coverage_snapshot = (_cov_meta or {}).get("snapshot")
+        _coverage_status = (_cov_meta or {}).get("status") or "skipped"
+    except Exception as _cov_err:
+        # Fail closed when we can detect an active ledger: surface unavailable.
+        logger.warning("attachment coverage finalizer failed: %s", _cov_err)
+        try:
+            from tools.attachment_ledger import (
+                COVERAGE_UNAVAILABLE_TEXT,
+                is_active as _cov_is_active,
+            )
+
+            if _cov_is_active(effective_task_id) and not interrupted:
+                _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
+                text = final_response or ""
+                if "hermes-attachment-coverage" not in text:
+                    final_response = (
+                        (text.rstrip() + "\n" + _coverage_footer)
+                        if text
+                        else _coverage_footer
+                    )
+                _coverage_status = "unavailable"
+        except Exception:
+            pass
+
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
     # earlier is from a prior turn and must not leak into the reasoning
@@ -365,6 +393,11 @@ def finalize_turn(
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
+        # Structured coverage for stream + non-stream delivery adapters
+        # (must not rely solely on final_response prose — BLOCKING-1).
+        "coverage_footer": _coverage_footer,
+        "attachment_coverage": _coverage_snapshot,
+        "coverage_status": _coverage_status,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

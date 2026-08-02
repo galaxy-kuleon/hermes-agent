@@ -679,8 +679,12 @@ class TestReadFileToolIntegration(unittest.TestCase):
             fh.write(b"not a zip")
         res = json.loads(read_file_tool(p))
         # Fail closed: extraction error, not raw binary garbage as content.
+        # Exact contract (M-U1-D round 2): generic "binary" mutant must red.
         self.assertIn("error", res)
-        self.assertTrue(res.get("extraction_failed") or "extract" in res["error"].lower() or "binary" in res["error"].lower() or "zip" in res["error"].lower() or "docx" in res["error"].lower())
+        self.assertTrue(
+            res.get("extraction_failed") is True
+            or res.get("report_as") == "unreadable"
+        )
         self.assertNotIn("content", res)
 
     def test_docx_read_extracts(self):

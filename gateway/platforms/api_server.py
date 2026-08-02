@@ -3474,11 +3474,50 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+
+            # M-U1-D BLOCKING-1: model deltas already left the wire; coverage
+            # footer lives on result.coverage_footer / final_response suffix.
+            # Emit it as a content delta BEFORE stop/[DONE] so stream=true
+            # clients (Open WebUI 8083) receive authoritative coverage.
+            try:
+                from tools.attachment_ledger import terminal_coverage_suffix
+
+                suffix = terminal_coverage_suffix("", result if isinstance(result, dict) else None)
+                # Prefer structured footer; if empty, try full final_response
+                # when nothing was streamed as content (tool-only turns).
+                if not suffix and isinstance(result, dict):
+                    footer = result.get("coverage_footer") or ""
+                    if footer:
+                        suffix = footer if footer.startswith("\n") else "\n" + footer
+                if suffix:
+                    cov_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": suffix},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await response.write(
+                        f"data: {json.dumps(cov_chunk)}\n\n".encode()
+                    )
+            except Exception as _cov_emit_err:
+                logger.warning(
+                    "coverage suffix emit failed for %s: %s",
+                    completion_id,
+                    _cov_emit_err,
+                )
 
             # Finish chunk
             finish_chunk = {
@@ -3946,10 +3985,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
+                    final_text_parts.append(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = result["error"]
+                # M-U1-D BLOCKING-1: emit structured coverage after model text.
+                try:
+                    from tools.attachment_ledger import terminal_coverage_suffix
+
+                    streamed_so_far = "".join(final_text_parts) or final_response_text or ""
+                    cov_suffix = terminal_coverage_suffix(
+                        streamed_so_far,
+                        result if isinstance(result, dict) else None,
+                    )
+                    if cov_suffix:
+                        await _emit_text_delta(cov_suffix)
+                        final_text_parts.append(cov_suffix)
+                except Exception as _cov_err:
+                    logger.warning("responses stream coverage emit failed: %s", _cov_err)
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = str(e)

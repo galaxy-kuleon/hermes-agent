@@ -21,7 +21,7 @@ __all__ = [
     "ExtractionError",
     "extract_document_text",
     "is_extractable_document",
-    "take_last_eml_gaps",
+    "take_last_eml_gaps",  # deprecated alias — prefer gaps_out=
 ]
 
 # `.doc`/`.xls` are legacy binary formats with no stdlib reader. They are
@@ -56,7 +56,13 @@ def is_extractable_document(path: str) -> bool:
     return bool(_extension(path))
 
 
-def extract_document_text(path: str) -> str:
+def extract_document_text(path: str, *, gaps_out: list[str] | None = None) -> str:
+    """Extract document text.
+
+    *gaps_out*: optional caller-owned list. For EML, capability gaps are
+    appended here (request-scoped handoff). Do **not** use the process-global
+    last-result stash for concurrent correctness.
+    """
     ext = _extension(path)
     if ext in _LEGACY_EXTENSIONS:
         import os as _os
@@ -65,7 +71,7 @@ def extract_document_text(path: str) -> str:
 
         converted, _target = convert_to_ooxml(path)
         try:
-            return extract_document_text(converted)
+            return extract_document_text(converted, gaps_out=gaps_out)
         finally:
             try:
                 _os.unlink(converted)
@@ -90,12 +96,15 @@ def extract_document_text(path: str) -> str:
         except MsgExtractionError as exc:
             raise ExtractionError(str(exc)) from exc
     if ext == ".eml":
-        return _extract_eml_body(path)
+        text, gaps = _extract_eml_body(path)
+        if gaps_out is not None:
+            gaps_out.extend(gaps)
+        return text
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 
-def _extract_eml_body(path: str) -> str:
-    """Extract plain/html body only; attachments are listed by name as gaps."""
+def _extract_eml_body(path: str) -> tuple[str, list[str]]:
+    """Extract plain/html body only; return ``(text, gaps)`` request-local."""
     import email
     from email import policy
 
@@ -141,28 +150,15 @@ def _extract_eml_body(path: str) -> str:
         )
     if not text and not header:
         raise ExtractionError("EML contains no extractable text body")
-    # Stash gaps for the caller via module-level last-result (see file_tools).
-    _LAST_EML_GAPS.clear()
-    _LAST_EML_GAPS.extend(
-        [
-            "body_only_extraction",
-            *(
-                ["embedded_attachments_not_extracted"]
-                if attachment_names
-                else []
-            ),
-        ]
-    )
-    return (header + "\n" + text).rstrip() + "\n"
-
-
-_LAST_EML_GAPS: list[str] = []
+    gaps = ["body_only_extraction"]
+    if attachment_names:
+        gaps.append("embedded_attachments_not_extracted")
+    return (header + "\n" + text).rstrip() + "\n", gaps
 
 
 def take_last_eml_gaps() -> list[str]:
-    gaps = list(_LAST_EML_GAPS)
-    _LAST_EML_GAPS.clear()
-    return gaps
+    """Deprecated no-op. Prefer ``extract_document_text(..., gaps_out=)``."""
+    return []
 
 
 def _source_text(source) -> str:

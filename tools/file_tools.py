@@ -1474,42 +1474,85 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
     # Authoritative ledger for plain-text success / binary-guard failure when
     # the extract branch did not already settle the outcome.
+    # BLOCKING-2: truncated/paginated text reads are partial with extent.
     try:
         from tools.attachment_ledger import (
-            OUTCOME_READ,
             OUTCOME_UNREADABLE,
             get_outcome,
             record_outcome,
+            record_read_extent,
         )
 
         display = _HANDOFF_NAME_PREFIX_RE.sub(
             "", str(resolved_arg).rsplit("/", 1)[-1], count=1
         )
         existing = get_outcome(resolved_arg, task_id=task_id)
-        if isinstance(parsed, dict) and not existing:
+        if isinstance(parsed, dict):
+            already_settled = bool(
+                existing
+                and existing.get("status")
+                in {"partial", "read", "unreadable"}
+                and parsed.get("extracted_document")
+            )
             if (
-                not parsed.get("error")
+                not already_settled
+                and not parsed.get("error")
                 and isinstance(parsed.get("content"), str)
-                and parsed.get("report_as") not in {"partial", "unreadable"}
+                and parsed.get("report_as") not in {"unreadable"}
             ):
-                record_outcome(
+                total_lines = parsed.get("total_lines")
+                try:
+                    total_i = int(total_lines) if total_lines is not None else None
+                except (TypeError, ValueError):
+                    total_i = None
+                start = int(offset) if offset else 1
+                # end line = min(start+limit-1, total) when total known
+                try:
+                    lim = int(limit) if limit else 500
+                except (TypeError, ValueError):
+                    lim = 500
+                end = start + lim - 1
+                if total_i is not None:
+                    end = min(end, total_i)
+                format_gaps = list(parsed.get("gaps") or [])
+                if parsed.get("report_as") == "partial" and not format_gaps:
+                    format_gaps = ["partial_read"]
+                settled = record_read_extent(
                     resolved_arg,
                     task_id=task_id,
-                    status=OUTCOME_READ,
-                    reason="text_read",
+                    start=start,
+                    end=end,
+                    total=total_i,
+                    format_gaps=format_gaps or None,
+                    reason=str(parsed.get("report_as") or "text_read"),
                     display_name=display,
+                    handle=handle if handle else "",
+                    reader="read_file",
                 )
+                # Reflect settled status back onto the tool result for the model.
+                if isinstance(parsed, dict) and settled == "partial":
+                    if parsed.get("report_as") != "partial":
+                        try:
+                            parsed["report_as"] = "partial"
+                            parsed["coverage"] = "partial"
+                            if not parsed.get("gaps"):
+                                out = get_outcome(resolved_arg, task_id=task_id) or {}
+                                parsed["gaps"] = list(out.get("gaps") or ["extent_incomplete"])
+                            result = json.dumps(parsed, ensure_ascii=False)
+                        except Exception:
+                            pass
             elif parsed.get("error") and (
                 "binary" in str(parsed.get("error", "")).lower()
                 or parsed.get("report_as") == "unreadable"
             ):
-                record_outcome(
-                    resolved_arg,
-                    task_id=task_id,
-                    status=OUTCOME_UNREADABLE,
-                    reason=str(parsed.get("error") or "unreadable")[:200],
-                    display_name=display,
-                )
+                if not existing or existing.get("status") != "unreadable":
+                    record_outcome(
+                        resolved_arg,
+                        task_id=task_id,
+                        status=OUTCOME_UNREADABLE,
+                        reason=str(parsed.get("error") or "unreadable")[:200],
+                        display_name=display,
+                    )
     except Exception:
         logger.debug("attachment ledger update skipped", exc_info=True)
 
@@ -1563,7 +1606,6 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             ExtractionError,
             extract_document_text,
             is_extractable_document,
-            take_last_eml_gaps,
         )
         from tools.file_reader_routing import UNREADABLE_REPORT_INSTRUCTION
         from tools.attachment_ledger import (
@@ -1571,6 +1613,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             OUTCOME_READ,
             OUTCOME_UNREADABLE,
             record_outcome,
+            record_read_extent,
         )
         from tools.file_magic import magic_conflicts_with_suffix, sniff_kind
 
@@ -1684,8 +1727,11 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             )
 
         if is_extractable_document(str(_resolved)):
+            eml_gaps: list[str] = []
             try:
-                extracted_text = extract_document_text(str(_resolved))
+                extracted_text = extract_document_text(
+                    str(_resolved), gaps_out=eml_gaps
+                )
             except ExtractionError as exc:
                 logger.warning(
                     "document extraction failed kind=%s ext=%s",
@@ -1711,47 +1757,73 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                 )
             else:
                 gaps: list[str] = []
-                report_as = "read"
                 if ext == ".msg":
                     from tools.msg_extract import inspect_msg_capability_gaps
 
                     gaps = inspect_msg_capability_gaps(str(_resolved))
-                    report_as = "partial"
                 elif ext == ".eml":
-                    gaps = take_last_eml_gaps() or ["body_only_extraction"]
-                    report_as = "partial" if gaps else "read"
-
-                if report_as == "partial":
-                    _ledger(
-                        OUTCOME_PARTIAL,
-                        reason="extraction incomplete for this format",
-                        gaps=gaps,
-                    )
-                else:
-                    _ledger(OUTCOME_READ, reason="extracted")
+                    gaps = list(eml_gaps) or ["body_only_extraction"]
 
                 file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
+                page_end = min(end_line, total_lines) if total_lines else end_line
                 page_text = "\n".join(lines[offset - 1:end_line])
+                # BLOCKING-2: ledger records consumed extent; truncated → partial.
+                settled = record_read_extent(
+                    str(_resolved),
+                    task_id=task_id,
+                    start=offset,
+                    end=page_end if total_lines else end_line,
+                    total=total_lines if total_lines else None,
+                    format_gaps=gaps or None,
+                    reason=(
+                        "extraction incomplete for this format"
+                        if gaps
+                        else "extracted"
+                    ),
+                    display_name=display,
+                    handle=handle_for_ledger,
+                    reader="read_file",
+                )
+                report_as = settled if settled in {"read", "partial"} else (
+                    "partial" if gaps else "read"
+                )
+                if gaps and report_as == "read":
+                    report_as = "partial"
                 result_dict = {
                     "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
                     "file_size": os.path.getsize(_resolved),
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
-                    # reader_available ≠ full coverage: partial MSG/EML stay honest
+                    # reader_available ≠ full coverage: partial MSG/EML/truncated stay honest
                     "readable": report_as == "read",
                     "report_as": report_as,
                     "coverage": report_as,
                     "name": display,
+                    "consumed": {
+                        "unit": "lines",
+                        "start": offset,
+                        "end": page_end if total_lines else end_line,
+                        "total": total_lines,
+                    },
                 }
-                if gaps:
-                    result_dict["gaps"] = gaps
+                if gaps or report_as == "partial":
+                    out_gaps = list(gaps)
+                    if result_dict["truncated"] and not any(
+                        str(g).startswith("uncovered_lines=") for g in out_gaps
+                    ):
+                        out_gaps.append(
+                            f"uncovered_lines={page_end + 1}-{total_lines}"
+                            if total_lines > page_end
+                            else "extent_incomplete"
+                        )
+                    result_dict["gaps"] = out_gaps
                     result_dict["coverage_note"] = (
                         "Partial extraction only. Gaps: "
-                        + ", ".join(gaps)
+                        + ", ".join(out_gaps)
                         + ". Do not claim full coverage of this attachment."
                     )
                 if result_dict["truncated"]:
@@ -1762,6 +1834,12 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                 content_len = len(result_dict["content"])
                 max_chars = _get_max_read_chars()
                 if content_len > max_chars:
+                    # Oversize rejection is not a complete read.
+                    _ledger(
+                        OUTCOME_PARTIAL,
+                        reason="read_exceeded_char_limit",
+                        gaps=["oversize_rejected"],
+                    )
                     return json.dumps({
                         "error": (
                             f"Read produced {content_len:,} characters which exceeds "
@@ -1772,6 +1850,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         "path": path,
                         "total_lines": total_lines,
                         "file_size": result_dict["file_size"],
+                        "report_as": "partial",
                     }, ensure_ascii=False)
                 if result_dict["content"]:
                     result_dict["content"] = redact_sensitive_text(result_dict["content"], code_file=True)
