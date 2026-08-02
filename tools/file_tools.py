@@ -1386,6 +1386,34 @@ def _acl_filter_search_result(result, task_id: str = "default"):
     return result
 
 
+def _vision_auto_read_image(*, target: str, task_id: str) -> dict | None:
+    """Best-effort vision analysis when ``read_file`` is pointed at an image.
+
+    Returns a success dict from vision_analyze, or None when vision is
+    unavailable / fails. Callers fall back to the explicit recovery instruction.
+    """
+    try:
+        from model_tools import _run_async
+        from tools.vision_tools import vision_analyze_tool
+
+        vision_raw = _run_async(
+            vision_analyze_tool(
+                image_url=str(target),
+                user_prompt=(
+                    "Describe this image in detail for document "
+                    "and file analysis. Include any visible text."
+                ),
+                task_id=task_id,
+            )
+        )
+        vision_parsed = json.loads(vision_raw) if isinstance(vision_raw, str) else vision_raw
+        if isinstance(vision_parsed, dict) and vision_parsed.get("success"):
+            return vision_parsed
+    except Exception:
+        return None
+    return None
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers.
 
@@ -1522,6 +1550,8 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
+        # Images: auto-route to vision_analyze so a mistaken read_file does not
+        # burn a failed turn (issue #50). Non-image binaries still error.
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
             from tools.file_grants import file_handle_for_path
@@ -1538,6 +1568,29 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     or str(_resolved)
                 )
                 recovery_call = reader_call(read_with, target)
+                # Prefer delivering vision content in-process (issue #50).
+                vision_parsed = _vision_auto_read_image(
+                    target=str(target), task_id=task_id
+                )
+                if vision_parsed is not None:
+                    analysis = vision_parsed.get("analysis") or ""
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "routed_from": "read_file",
+                            "read_with": READ_WITH_VISION,
+                            "path": path,
+                            "target": target,
+                            "content": analysis,
+                            "note": (
+                                "Image bytes cannot be decoded as text; "
+                                "vision_analyze ran automatically so this "
+                                "turn is not wasted. Prefer calling "
+                                f"{recovery_call} directly next time."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
                 return json.dumps({
                     "error": (
                         f"Cannot read binary file '{path}' ({_ext}). "

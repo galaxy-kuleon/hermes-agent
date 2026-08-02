@@ -206,12 +206,20 @@ class VisionReadRecoveryTests(unittest.TestCase):
     def setUp(self):
         import tempfile
         from pathlib import Path
+        from unittest.mock import patch
 
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.image = self.root / "001-da36574d-diagram.png"
         self.image.write_bytes(b"fixture")
         self.addCleanup(self._tmp.cleanup)
+        # Default: auto-vision returns None so legacy recovery errors still fire.
+        self._vision_patch = patch(
+            "tools.file_tools._vision_auto_read_image",
+            return_value=None,
+        )
+        self._vision_patch.start()
+        self.addCleanup(self._vision_patch.stop)
 
     def _read(self, path, task_id):
         from tools.file_tools import read_file_tool
@@ -255,6 +263,26 @@ class VisionReadRecoveryTests(unittest.TestCase):
             f'Call vision_analyze(image_url="{self.image.resolve()}") instead.',
             result["error"],
         )
+
+    def test_image_handle_auto_routes_to_vision_when_available(self):
+        """issue #50: mistaken read_file on an image should not waste a turn."""
+        from unittest.mock import patch
+
+        handles = make_file_handles([str(self.image)])
+        with file_grant_scope(
+            "vision-auto",
+            [str(self.image)],
+            handles=handles,
+        ), patch(
+            "tools.file_tools._vision_auto_read_image",
+            return_value={"success": True, "analysis": "diagram shows two boxes"},
+        ):
+            result = self._read("F01", "vision-auto")
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(result.get("routed_from"), "read_file")
+        self.assertEqual(result.get("read_with"), "vision_analyze")
+        self.assertIn("two boxes", result.get("content", ""))
 
     def test_non_image_binary_keeps_the_generic_error(self):
         archive = self.root / "bundle.zip"
