@@ -673,14 +673,27 @@ class TestReadFileToolIntegration(unittest.TestCase):
         # Only first 2 lines present.
         self.assertIn("1|# ── Code cell 1 ──", res["content"])
 
-    def test_corrupt_docx_falls_through_to_binary_guard(self):
+    def test_corrupt_docx_reports_honest_unreadable_not_binary_garbage(self):
+        """A corrupt DOCX must surface as unreadable, not as raw-bytes content.
+
+        Before M-U1-D this fell through to the binary-extension guard, whose
+        message merely said "binary". That still let the request memo mark the
+        file read, so the model could write a complete-looking audit over a file
+        it never read. The DOCX path now carries the same contract as the PDF
+        path in ``test_pdf_error_propagates_as_honest_unreadable_not_binary_garbage``.
+        """
         p = os.path.join(self.tmp, "bad.docx")
         with open(p, "wb") as fh:
             fh.write(b"not a zip")
         res = json.loads(read_file_tool(p))
-        # Should NOT crash; falls through to the binary-extension guard.
-        self.assertIn("error", res)
-        self.assertIn("binary", res["error"].lower())
+        # Should NOT crash, and must not hand back any readable-looking payload.
+        self.assertNotIn("extracted_document", res)
+        self.assertNotIn("content", res)
+        self.assertTrue(res.get("extraction_failed"))
+        self.assertIs(res.get("readable"), False)
+        self.assertEqual(res.get("report_as"), "unreadable")
+        self.assertIn("Not a valid DOCX", res["error"])
+        self.assertIn("unreadable materials", res["error"])
 
     def test_docx_read_extracts(self):
         p = os.path.join(self.tmp, "d.docx")
