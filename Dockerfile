@@ -82,11 +82,12 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/playwright-chromium
 # ── Install OpenCode CLI system-wide ─────────────────────────────────────────
 # Use /usr/local as HOME so the official installer does not write under
 # /home/hermes, which is volume-mounted and would be hidden at runtime.
+ARG OPENCODE_VERSION=1.18.10
 RUN set -eux; \
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; \
-    curl -fsSL https://opencode.ai/install | HOME=/usr/local bash -s -- --no-modify-path; \
+    curl -fsSL https://opencode.ai/install | HOME=/usr/local bash -s -- --no-modify-path --version "${OPENCODE_VERSION}"; \
     ln -sf /usr/local/.opencode/bin/opencode /usr/local/bin/opencode; \
-    /usr/local/bin/opencode --version
+    test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}"
 
 # ── Copy hermes-agent source ─────────────────────────────────────────────────
 WORKDIR /opt/hermes
