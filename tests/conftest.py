@@ -32,6 +32,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── macOS temp root ────────────────────────────────────────────────────────
+#
+# pytest builds tmp_path under $TMPDIR, which on macOS is inside
+# /private/var/folders/... . That prefix is in the product's own
+# _SENSITIVE_PATH_PREFIXES, so write_file refuses every path a test hands it
+# and the file/profile-guard tests fail for a reason that has nothing to do
+# with the code under test (13 tests, observed 2026-08-03). Move the base
+# temp root somewhere the guard treats as ordinary. Must happen at import
+# time: pytest resolves the root before the first fixture runs.
+# It must also stay OUTSIDE the repo: tests that walk directories or track
+# sibling writes pick up the working tree if the temp root lives inside it
+# (test_approval, test_search_hidden_dirs -- observed while writing this).
+if sys.platform == "darwin" and not os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+    _mac_temproot = Path("/private/tmp/hermes-agent-pytest")
+    _mac_temproot.mkdir(parents=True, exist_ok=True)
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(_mac_temproot)
+
+
 # ── Per-file process isolation ──────────────────────────────────────────────
 # Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
 # ``python -m pytest <file>`` subprocess per test file. Cross-file state
@@ -379,6 +397,26 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # should never perform that implicit network/bootstrap path; Tirith-specific
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
+
+    # 4c. Strip HTTP proxy env vars. On a developer machine that exports
+    #     HTTP_PROXY/ALL_PROXY, every request a test makes to its own
+    #     ephemeral loopback server is handed to a real proxy that cannot
+    #     reach it. httpx/urllib then raise a transport error, and code
+    #     under test takes its "unreachable, let the caller try" branch --
+    #     so the test reports the guard as broken when the environment
+    #     simply never let the guard see a response.
+    #
+    #     Observed 2026-08-03: this alone accounted for all 7 failures in
+    #     test_mcp_preflight_content_type.py, which pass with the vars
+    #     cleared. A signal that fires on a proxy setting cannot tell
+    #     "this guard regressed" from "this laptop has a proxy".
+    for _proxy_var in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
+    ):
+        monkeypatch.delenv(_proxy_var, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
