@@ -3121,9 +3121,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     def _handler(args: dict, **kwargs) -> str:
         capability_request = None
+        # These soc_v2 tools carry no owui user header on this channel, so the
+        # server derives whose data is in play from a capability-signed path.
+        # list_conversions is read-only and joins the two mutations here for the
+        # same reason: without a minted capability its answer for an Origin Agent
+        # user is always a refusal, and "which of my conversions finished?"
+        # becomes answerable only by a job_id nobody was told to keep.
         if server_name == "soc_v2" and tool_name in {
             "submit_conversion",
             "resubmit_conversion",
+            "list_conversions",
         }:
             from tools.file_grants import (
                 _CAPABILITY_META_KEY,
@@ -3132,11 +3139,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
             task_id = kwargs.get("task_id") or "default"
             path = str(args.get("path") or "")
-            canonical_path, grant_denial = resolve_file_grant(
-                path,
-                task_id=task_id,
-                operation=f"soc_v2.{tool_name}",
-            )
+            # For the two mutations a path is mandatory and its absence is a real
+            # denial. For list_conversions it is the optional proof of whose jobs
+            # to list, so an empty one must reach the server and be answered with
+            # instructions -- not a file-grant denial about a path the model was
+            # never told it needed.
+            if not path and tool_name == "list_conversions":
+                canonical_path, grant_denial = "", None
+            else:
+                canonical_path, grant_denial = resolve_file_grant(
+                    path,
+                    task_id=task_id,
+                    operation=f"soc_v2.{tool_name}",
+                )
             if grant_denial:
                 return json.dumps(
                     {"error": grant_denial, "success": False},
@@ -3146,8 +3161,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             args = dict(args)
             args.pop(_CAPABILITY_META_KEY, None)
             args.pop("_meta", None)
-            args["path"] = canonical_path
-            capability_request = (canonical_path, f"soc_v2.{tool_name}")
+            if canonical_path:
+                args["path"] = canonical_path
+                capability_request = (canonical_path, f"soc_v2.{tool_name}")
+            else:
+                # No path resolved (list_conversions without proof): send no path
+                # and mint no capability. A capability over "" would authorize a
+                # path that names no user, which is the one thing the signature
+                # exists to prevent.
+                args.pop("path", None)
 
         # Skill ACL (#13 code-exec extension): block a locally-launched code-exec
         # MCP server (e.g. opencode_runner) from operating under a protected
