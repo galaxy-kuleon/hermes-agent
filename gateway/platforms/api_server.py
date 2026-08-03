@@ -65,6 +65,36 @@ from tools.file_reader_routing import reader_guidance
 logger = logging.getLogger(__name__)
 
 
+def emit_chat_completion_coverage_suffix(result: dict | None) -> str:
+    """Production adapter: coverage text for chat-completions SSE terminal.
+
+    Mutation target (U1D all-exit gate): tests must call this function; replacing
+    its body with ``return ""`` must red application-boundary harness.
+    """
+    from tools.attachment_ledger import terminal_coverage_suffix
+
+    if not isinstance(result, dict):
+        return ""
+    suffix = terminal_coverage_suffix("", result)
+    if not suffix:
+        footer = result.get("coverage_footer") or ""
+        if footer:
+            suffix = footer if str(footer).startswith("\n") else "\n" + str(footer)
+    return suffix or ""
+
+
+def emit_responses_coverage_suffix(streamed_so_far: str, result: dict | None) -> str:
+    """Production adapter: coverage text for Responses SSE terminal.
+
+    Mutation target: same as emit_chat_completion_coverage_suffix.
+    """
+    from tools.attachment_ledger import terminal_coverage_suffix
+
+    if not isinstance(result, dict):
+        return ""
+    return terminal_coverage_suffix(streamed_so_far or "", result) or ""
+
+
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
 
@@ -3481,20 +3511,12 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
 
-            # M-U1-D BLOCKING-1: model deltas already left the wire; coverage
-            # footer lives on result.coverage_footer / final_response suffix.
-            # Emit it as a content delta BEFORE stop/[DONE] so stream=true
-            # clients (Open WebUI 8083) receive authoritative coverage.
+            # M-U1-D all-exit A-channel: coverage suffix BEFORE stop/[DONE].
+            # Production adapter (mutation target): emit_chat_completion_coverage_suffix
             try:
-                from tools.attachment_ledger import terminal_coverage_suffix
-
-                suffix = terminal_coverage_suffix("", result if isinstance(result, dict) else None)
-                # Prefer structured footer; if empty, try full final_response
-                # when nothing was streamed as content (tool-only turns).
-                if not suffix and isinstance(result, dict):
-                    footer = result.get("coverage_footer") or ""
-                    if footer:
-                        suffix = footer if footer.startswith("\n") else "\n" + footer
+                suffix = emit_chat_completion_coverage_suffix(
+                    result if isinstance(result, dict) else None
+                )
                 if suffix:
                     cov_chunk = {
                         "id": completion_id,
@@ -3990,12 +4012,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = result["error"]
-                # M-U1-D BLOCKING-1: emit structured coverage after model text.
+                # M-U1-D all-exit A-channel: coverage after model text.
                 try:
-                    from tools.attachment_ledger import terminal_coverage_suffix
-
                     streamed_so_far = "".join(final_text_parts) or final_response_text or ""
-                    cov_suffix = terminal_coverage_suffix(
+                    cov_suffix = emit_responses_coverage_suffix(
                         streamed_so_far,
                         result if isinstance(result, dict) else None,
                     )

@@ -262,10 +262,8 @@ class StreamSuffixTests(unittest.TestCase):
 
     def test_terminal_suffix_emits_structured_footer(self):
         footer = (
-            f"\n{COVERAGE_FOOTER_BEGIN}\n"
-            f"{COVERAGE_FOOTER_TITLE}\n"
+            f"\n{COVERAGE_FOOTER_TITLE}\n"
             f"- `F01`: **partial**\n"
-            f"<!-- /hermes-attachment-coverage -->\n"
         )
         result = {
             "final_response": "MODEL ANSWER" + footer,
@@ -276,7 +274,7 @@ class StreamSuffixTests(unittest.TestCase):
         self.assertNotIn("MODEL ANSWER", suffix.replace(COVERAGE_FOOTER_BEGIN, ""))
 
     def test_terminal_suffix_empty_when_already_streamed(self):
-        footer = f"\n{COVERAGE_FOOTER_BEGIN}\nx\n<!-- /hermes-attachment-coverage -->\n"
+        footer = f"\n{COVERAGE_FOOTER_TITLE}\nx\n"
         streamed = "MODEL" + footer
         result = {"coverage_footer": footer, "final_response": streamed}
         self.assertEqual(terminal_coverage_suffix(streamed, result), "")
@@ -286,9 +284,8 @@ class StreamSuffixTests(unittest.TestCase):
             "gateway/platforms/api_server.py"
         )
         text = src.read_text(encoding="utf-8")
-        self.assertIn("terminal_coverage_suffix", text)
-        # chat-completions SSE path
-        idx_suffix = text.find("terminal_coverage_suffix")
+        self.assertIn("emit_chat_completion_coverage_suffix", text)
+        idx_suffix = text.find("emit_chat_completion_coverage_suffix(")
         idx_done = text.find('b"data: [DONE]\\n\\n"', idx_suffix)
         self.assertGreater(idx_suffix, 0)
         self.assertGreater(idx_done, idx_suffix)
@@ -303,11 +300,10 @@ class FinalizerWiringMutationTests(unittest.TestCase):
             / "agent"
             / "turn_finalizer.py"
         ).read_text(encoding="utf-8")
-        self.assertIn(FINALIZE_COVERAGE_FN, src)
+        self.assertIn("deliver_coverage_to_persistent_body", src)
         idx_plugin = src.find("transform_llm_output")
-        idx_cov = src.find("finalize_attachment_coverage")
+        idx_cov = src.find("deliver_coverage_to_persistent_body")
         self.assertGreater(idx_cov, idx_plugin)
-        # coverage must be after post_llm_call too
         idx_post = src.find("post_llm_call")
         self.assertGreater(idx_cov, idx_post)
 
@@ -318,7 +314,7 @@ class FinalizerWiringMutationTests(unittest.TestCase):
             / "turn_finalizer.py"
         )
         src = path.read_text(encoding="utf-8")
-        call = "finalize_attachment_coverage"
+        call = "deliver_coverage_to_persistent_body"
         self.assertIn(call, src)
         mutated = src.replace(call, "IDENTITY_COVERAGE_BYPASS")
         self.assertNotIn(call, mutated)

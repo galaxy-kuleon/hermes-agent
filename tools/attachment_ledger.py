@@ -42,22 +42,27 @@ _OUTCOMES: ContextVar[dict[str, dict[str, dict[str, Any]]] | None] = ContextVar(
 
 _HANDOFF_NAME_PREFIX = re.compile(r"^\d{3}-[0-9a-f]{8}-")
 
-# Footer markers for mutation tests — must appear when coverage is incomplete.
-COVERAGE_FOOTER_BEGIN = "<!-- hermes-attachment-coverage -->"
-COVERAGE_FOOTER_END = "<!-- /hermes-attachment-coverage -->"
+# A-channel (Kimi delivery-channels §4): VISIBLE markdown in assistant body.
+# Do NOT wrap in HTML comments — comments do not render in OWUI.
 COVERAGE_FOOTER_TITLE = "## Attachment coverage (authoritative)"
-COVERAGE_UNAVAILABLE_BEGIN = "<!-- hermes-attachment-coverage-unavailable -->"
-COVERAGE_UNAVAILABLE_END = "<!-- /hermes-attachment-coverage-unavailable -->"
+COVERAGE_FOOTER_BEGIN = COVERAGE_FOOTER_TITLE
+COVERAGE_FOOTER_END = ""
+COVERAGE_UNAVAILABLE_TITLE = "## Attachment coverage unavailable"
+COVERAGE_UNAVAILABLE_BEGIN = COVERAGE_UNAVAILABLE_TITLE
+COVERAGE_UNAVAILABLE_END = ""
 COVERAGE_UNAVAILABLE_TEXT = (
-    f"{COVERAGE_UNAVAILABLE_BEGIN}\n"
-    "## Attachment coverage unavailable\n\n"
+    f"{COVERAGE_UNAVAILABLE_TITLE}\n\n"
     "Coverage could not be verified for this turn. "
     "Do not treat the answer as complete coverage of attachments.\n"
-    f"{COVERAGE_UNAVAILABLE_END}\n"
+)
+# Shown when the turn was interrupted but ledger still has facts to leave.
+COVERAGE_INTERRUPTED_NOTE = (
+    "- note: turn **interrupted** — coverage reflects progress at stop time, not a full audit.\n"
 )
 
-# Mutation-sensitive token — production finalizer must call this by name.
+# Mutation-sensitive tokens — production adapters must call these by name.
 FINALIZE_COVERAGE_FN = "finalize_attachment_coverage"
+DELIVER_COVERAGE_FN = "deliver_coverage_to_persistent_body"
 
 
 def _task_key(task_id: str) -> str:
@@ -393,25 +398,24 @@ def build_coverage_footer(
     handles: list[tuple[str, str]],
     *,
     task_id: str,
+    interrupted: bool = False,
 ) -> str:
-    """Return a deterministic footer when coverage is incomplete; else empty.
-
-    Mutation target: removing this function call from the finalizer, or
-    dropping an incomplete entry, must make tests red.
-    """
+    """Return a deterministic visible markdown footer when incomplete; else empty."""
     snap = coverage_snapshot(handles, task_id=task_id)
     if snap["complete"] or snap["total"] == 0:
         return ""
 
     lines = [
         "",
-        COVERAGE_FOOTER_BEGIN,
         COVERAGE_FOOTER_TITLE,
         "",
         "The following attachments were **not fully included** in this answer.",
         "Do not treat this report as complete coverage of those materials.",
         "",
     ]
+    if interrupted:
+        lines.append(COVERAGE_INTERRUPTED_NOTE.rstrip())
+        lines.append("")
     for row in snap["incomplete"]:
         bits = [f"- `{row['id']}` ({row['name']}): **{row['status']}**"]
         if row.get("reason"):
@@ -427,7 +431,6 @@ def build_coverage_footer(
             f"Summary: read={len(snap['read'])} partial={len(snap['partial'])} "
             f"unreadable={len(snap['unreadable'])} unread={len(snap['pending'])} "
             f"total={snap['total']}.",
-            COVERAGE_FOOTER_END,
             "",
         ]
     )
@@ -463,18 +466,17 @@ def finalize_attachment_coverage(
 ) -> tuple[str | None, dict[str, Any]]:
     """Last-step coverage gate (must run after plugins / explainers).
 
-    Returns ``(response_text, meta)`` where meta includes::
-        footer: str  (coverage or unavailable block actually appended)
-        snapshot: dict | None
-        status: ok|complete|skipped|unavailable
+    **Interrupted turns still get coverage** (U1D batch-1): interrupt is when
+    the user most needs to know what was / was not read — not a reason to omit.
+
+    Returns ``(response_text, meta)`` with footer / snapshot / status.
     """
     meta: dict[str, Any] = {
         "footer": "",
         "snapshot": None,
         "status": "skipped",
+        "interrupted": bool(interrupted),
     }
-    if interrupted:
-        return final_response, meta
     if not is_active(task_id):
         return final_response, meta
 
@@ -486,6 +488,8 @@ def finalize_attachment_coverage(
     except Exception:
         if fail_closed:
             footer = COVERAGE_UNAVAILABLE_TEXT
+            if interrupted:
+                footer = footer.rstrip() + "\n" + COVERAGE_INTERRUPTED_NOTE
             if COVERAGE_UNAVAILABLE_BEGIN not in text and COVERAGE_FOOTER_BEGIN not in text:
                 text = (text.rstrip() + "\n" + footer) if text else footer
             meta.update(footer=footer, status="unavailable")
@@ -499,10 +503,14 @@ def finalize_attachment_coverage(
     try:
         snap = coverage_snapshot(handles, task_id=task_id)
         meta["snapshot"] = snap
-        footer = build_coverage_footer(handles, task_id=task_id)
+        footer = build_coverage_footer(
+            handles, task_id=task_id, interrupted=bool(interrupted)
+        )
     except Exception:
         if fail_closed:
             footer = COVERAGE_UNAVAILABLE_TEXT
+            if interrupted:
+                footer = footer.rstrip() + "\n" + COVERAGE_INTERRUPTED_NOTE
             if COVERAGE_UNAVAILABLE_BEGIN not in text and COVERAGE_FOOTER_BEGIN not in text:
                 text = (text.rstrip() + "\n" + footer) if text else footer
             meta.update(footer=footer, status="unavailable")
@@ -536,13 +544,11 @@ def terminal_coverage_suffix(
     streamed = streamed_text or ""
     footer = result.get("coverage_footer") or ""
     if isinstance(footer, str) and footer.strip():
-        # Already on the wire (e.g. non-stream path doubled) — skip.
         if COVERAGE_FOOTER_BEGIN in streamed or COVERAGE_UNAVAILABLE_BEGIN in streamed:
             if footer.strip() in streamed or COVERAGE_FOOTER_BEGIN in streamed:
                 return ""
         return footer if footer.startswith("\n") else "\n" + footer.lstrip("\n")
 
-    # Fallback: scrape markers out of final_response if structured field empty.
     final = result.get("final_response") or ""
     if not isinstance(final, str) or not final:
         return ""
@@ -553,13 +559,70 @@ def terminal_coverage_suffix(
     return ""
 
 
+def deliver_coverage_to_persistent_body(
+    *,
+    final_response: str | None,
+    task_id: str,
+    streamed_text: str = "",
+    stream: bool = True,
+    interrupted: bool = False,
+    failed: bool = False,
+    fail_closed: bool = True,
+) -> dict[str, Any]:
+    """Single production adapter: finalize coverage → persistent assistant body.
+
+    Used by:
+      * turn_finalizer (always, including interrupted)
+      * chat-completions streaming terminal (before stop/[DONE])
+      * Responses streaming terminal
+      * non-stream JSON responses (body = final_response)
+
+    Returns dict with final_response, coverage_footer, coverage_status,
+    stream_suffix, persistent_assistant_body (A-channel truth for DB/reload).
+
+    Mutation target: production must call this by name (DELIVER_COVERAGE_FN);
+    replacing it with identity that omits footer must red boundary tests.
+    """
+    text, meta = finalize_attachment_coverage(
+        final_response,
+        task_id=task_id,
+        interrupted=bool(interrupted),
+        fail_closed=fail_closed,
+    )
+    footer = (meta or {}).get("footer") or ""
+    status = (meta or {}).get("status") or "skipped"
+    result = {
+        "final_response": text,
+        "coverage_footer": footer,
+        "attachment_coverage": (meta or {}).get("snapshot"),
+        "coverage_status": status,
+        "interrupted": bool(interrupted),
+        "failed": bool(failed),
+    }
+    if stream:
+        suffix = terminal_coverage_suffix(streamed_text or "", result)
+        result["stream_suffix"] = suffix
+        # Persistent body: prefer full final_response (includes footer);
+        # if model streamed partial text without footer, body is still final_response.
+        persistent = text if text is not None else ""
+        if not persistent and suffix:
+            persistent = (streamed_text or "") + suffix
+        result["persistent_assistant_body"] = persistent
+    else:
+        result["stream_suffix"] = ""
+        result["persistent_assistant_body"] = text if text is not None else ""
+    return result
+
+
 __all__ = [
     "COVERAGE_FOOTER_BEGIN",
     "COVERAGE_FOOTER_END",
     "COVERAGE_FOOTER_TITLE",
+    "COVERAGE_INTERRUPTED_NOTE",
     "COVERAGE_UNAVAILABLE_BEGIN",
     "COVERAGE_UNAVAILABLE_END",
     "COVERAGE_UNAVAILABLE_TEXT",
+    "DELIVER_COVERAGE_FN",
     "FINALIZE_COVERAGE_FN",
     "OUTCOME_PARTIAL",
     "OUTCOME_PENDING",
@@ -569,6 +632,7 @@ __all__ = [
     "attachment_ledger_scope",
     "build_coverage_footer",
     "coverage_snapshot",
+    "deliver_coverage_to_persistent_body",
     "finalize_attachment_coverage",
     "get_outcome",
     "is_active",

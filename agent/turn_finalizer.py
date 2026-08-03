@@ -305,28 +305,33 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
-    # Attachment coverage — LAST content mutation before result assembly
-    # (M-U1-D round 2 BLOCKING-1/3). Must run AFTER transform_llm_output so
-    # plugins cannot strip the footer. Fail-closed when ledger is active but
-    # coverage cannot be determined. Streaming adapters also read
-    # result["coverage_footer"] and emit it before stop/[DONE].
+    # Attachment coverage — LAST content mutation before result assembly.
+    # A-channel: always run including interrupted (U1D batch-1 all-exit gate).
+    # Interrupt is when the user most needs to know what was / was not read.
     _coverage_footer = ""
     _coverage_snapshot = None
     _coverage_status = "skipped"
+    _persistent_body = final_response
     try:
-        from tools.attachment_ledger import finalize_attachment_coverage
+        from tools.attachment_ledger import deliver_coverage_to_persistent_body
 
-        final_response, _cov_meta = finalize_attachment_coverage(
-            final_response,
+        _delivered = deliver_coverage_to_persistent_body(
+            final_response=final_response,
             task_id=effective_task_id,
+            streamed_text="",
+            stream=False,
             interrupted=bool(interrupted),
+            failed=bool(failed),
             fail_closed=True,
         )
-        _coverage_footer = (_cov_meta or {}).get("footer") or ""
-        _coverage_snapshot = (_cov_meta or {}).get("snapshot")
-        _coverage_status = (_cov_meta or {}).get("status") or "skipped"
+        final_response = _delivered.get("final_response")
+        _coverage_footer = _delivered.get("coverage_footer") or ""
+        _coverage_snapshot = _delivered.get("attachment_coverage")
+        _coverage_status = _delivered.get("coverage_status") or "skipped"
+        _persistent_body = _delivered.get("persistent_assistant_body")
+        if _persistent_body is None:
+            _persistent_body = final_response
     except Exception as _cov_err:
-        # Fail closed when we can detect an active ledger: surface unavailable.
         logger.warning("attachment coverage finalizer failed: %s", _cov_err)
         try:
             from tools.attachment_ledger import (
@@ -334,16 +339,18 @@ def finalize_turn(
                 is_active as _cov_is_active,
             )
 
-            if _cov_is_active(effective_task_id) and not interrupted:
+            # Fail closed for ANY terminal path including interrupted.
+            if _cov_is_active(effective_task_id):
                 _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
                 text = final_response or ""
-                if "hermes-attachment-coverage" not in text:
+                if "## Attachment coverage" not in text:
                     final_response = (
                         (text.rstrip() + "\n" + _coverage_footer)
                         if text
                         else _coverage_footer
                     )
                 _coverage_status = "unavailable"
+                _persistent_body = final_response
         except Exception:
             pass
 
@@ -398,6 +405,11 @@ def finalize_turn(
         "coverage_footer": _coverage_footer,
         "attachment_coverage": _coverage_snapshot,
         "coverage_status": _coverage_status,
+        # A-channel body for persistence/reload (same text as final_response
+        # after mechanism append; adapters must not drop this).
+        "persistent_assistant_body": _persistent_body
+        if _persistent_body is not None
+        else final_response,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
