@@ -1305,7 +1305,16 @@ def _record_vision_ledger(
         logger.debug("vision ledger update skipped", exc_info=True)
 
 
-async def _handle_vision_analyze_async(args: Dict[str, Any], **kw: Any) -> Any:
+def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+    """Dispatch vision_analyze and return the tool coroutine (eager call).
+
+    Ledger updates live inside ``_vision_analyze_native`` / ``vision_analyze_tool``
+    (MAJOR-4). Do not wrap this in an outer async that only runs after await —
+    that defers the ``vision_analyze_tool(...)`` call until the handler is
+    awaited and breaks the established unit-test contract that inspects
+    call_args on the returned awaitable without awaiting it. Production
+    (``is_async=True``) still awaits the returned coroutine via the registry.
+    """
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     task_id = kw.get("task_id") or "default"
@@ -1327,21 +1336,7 @@ async def _handle_vision_analyze_async(args: Dict[str, Any], **kw: Any) -> Any:
     # information loss, no extra latency.
     if _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
-        result = await _vision_analyze_native(image_url, question, task_id=task_id)
-        success = not (
-            isinstance(result, str)
-            and ("error" in result[:80].lower() or '"success": false' in result.lower())
-        )
-        # Native envelope is a dict on success.
-        if isinstance(result, dict):
-            success = True
-        _record_vision_ledger(
-            image_url,
-            task_id=task_id,
-            success=success,
-            reason="vision_native_ok" if success else "vision_native_failed",
-        )
-        return result
+        return _vision_analyze_native(image_url, question, task_id=task_id)
 
     # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
@@ -1349,24 +1344,7 @@ async def _handle_vision_analyze_async(args: Dict[str, Any], **kw: Any) -> Any:
         f"following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    raw = await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id)
-    success = False
-    try:
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-        success = bool(isinstance(parsed, dict) and parsed.get("success"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        success = False
-    _record_vision_ledger(
-        image_url,
-        task_id=task_id,
-        success=success,
-        reason="vision_analyze_ok" if success else "vision_analyze_failed",
-    )
-    return raw
-
-
-def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
-    return _handle_vision_analyze_async(args, **kw)
+    return vision_analyze_tool(image_url, full_prompt, model, task_id=task_id)
 
 
 registry.register(
