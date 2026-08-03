@@ -65,6 +65,36 @@ from tools.file_reader_routing import reader_guidance
 logger = logging.getLogger(__name__)
 
 
+def emit_chat_completion_coverage_suffix(result: dict | None) -> str:
+    """Production adapter: coverage text for chat-completions SSE terminal.
+
+    Mutation target (U1D all-exit gate): tests must call this function; replacing
+    its body with ``return ""`` must red application-boundary harness.
+    """
+    from tools.attachment_ledger import terminal_coverage_suffix
+
+    if not isinstance(result, dict):
+        return ""
+    suffix = terminal_coverage_suffix("", result)
+    if not suffix:
+        footer = result.get("coverage_footer") or ""
+        if footer:
+            suffix = footer if str(footer).startswith("\n") else "\n" + str(footer)
+    return suffix or ""
+
+
+def emit_responses_coverage_suffix(streamed_so_far: str, result: dict | None) -> str:
+    """Production adapter: coverage text for Responses SSE terminal.
+
+    Mutation target: same as emit_chat_completion_coverage_suffix.
+    """
+    from tools.attachment_ledger import terminal_coverage_suffix
+
+    if not isinstance(result, dict):
+        return ""
+    return terminal_coverage_suffix(streamed_so_far or "", result) or ""
+
+
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
 
@@ -3474,11 +3504,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = None
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+
+            # M-U1-D all-exit A-channel: coverage suffix BEFORE stop/[DONE].
+            # Production adapter (mutation target): emit_chat_completion_coverage_suffix
+            try:
+                suffix = emit_chat_completion_coverage_suffix(
+                    result if isinstance(result, dict) else None
+                )
+                if suffix:
+                    cov_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": suffix},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await response.write(
+                        f"data: {json.dumps(cov_chunk)}\n\n".encode()
+                    )
+            except Exception as _cov_emit_err:
+                logger.warning(
+                    "coverage suffix emit failed for %s: %s",
+                    completion_id,
+                    _cov_emit_err,
+                )
 
             # Finish chunk
             finish_chunk = {
@@ -3946,10 +4007,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
+                    final_text_parts.append(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = result["error"]
+                # M-U1-D all-exit A-channel: coverage after model text.
+                try:
+                    streamed_so_far = "".join(final_text_parts) or final_response_text or ""
+                    cov_suffix = emit_responses_coverage_suffix(
+                        streamed_so_far,
+                        result if isinstance(result, dict) else None,
+                    )
+                    if cov_suffix:
+                        await _emit_text_delta(cov_suffix)
+                        final_text_parts.append(cov_suffix)
+                except Exception as _cov_err:
+                    logger.warning("responses stream coverage emit failed: %s", _cov_err)
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = str(e)

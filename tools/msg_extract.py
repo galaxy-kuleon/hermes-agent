@@ -304,4 +304,60 @@ def extract_msg_text(path: str) -> str:
     return text.rstrip("\r\n") + "\n"
 
 
-__all__ = ["MsgExtractionError", "extract_msg_text"]
+# Directory-name prefixes that indicate MAPI attachment storage / props.
+# Used only for capability honesty (body-only extraction), never for content.
+_ATTACH_NAME_MARKERS = (
+    "__attach",
+    "__substg1.0_3701",  # PR_ATTACH_DATA
+    "__substg1.0_3703",
+    "__substg1.0_3704",
+    "__substg1.0_3707",
+    "__substg1.0_370e",
+    "__substg1.0_3712",
+)
+_SUBJECT_STREAM = "__substg1.0_0037001F"
+
+
+def inspect_msg_capability_gaps(path: str) -> list[str]:
+    """Return known coverage gaps after a successful body extraction.
+
+    The extractor only returns the Unicode plain-text body. Live corpus
+    samples show subject streams and attachment storage on almost every MSG;
+    treating body success as full email coverage is a false audit claim.
+    """
+    gaps = [
+        "body_only_extraction",
+        "metadata_not_extracted",  # subject/from/to/date not returned
+    ]
+    try:
+        compound = _CompoundFile(Path(path).read_bytes())
+        entries = compound._directory_entries()
+    except (OSError, MsgExtractionError, ValueError, struct.error):
+        gaps.append("structure_uninspected")
+        return gaps
+
+    names: list[str] = []
+    for entry in entries:
+        if entry is None:
+            continue
+        name = str(entry.get("name") or "")
+        if name:
+            names.append(name)
+
+    lower_names = [n.lower() for n in names]
+    if any(
+        any(n.startswith(marker) or marker in n for marker in _ATTACH_NAME_MARKERS)
+        for n in lower_names
+    ):
+        gaps.append("embedded_attachments_not_extracted")
+    if any(n == _SUBJECT_STREAM or n.lower().startswith("__substg1.0_0037") for n in names):
+        # subject exists but is not returned — already covered by metadata_not_extracted
+        pass
+    return gaps
+
+
+__all__ = [
+    "MsgExtractionError",
+    "extract_msg_text",
+    "inspect_msg_capability_gaps",
+]

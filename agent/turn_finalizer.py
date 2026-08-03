@@ -305,6 +305,55 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
 
+    # Attachment coverage — LAST content mutation before result assembly.
+    # A-channel: always run including interrupted (U1D batch-1 all-exit gate).
+    # Interrupt is when the user most needs to know what was / was not read.
+    _coverage_footer = ""
+    _coverage_snapshot = None
+    _coverage_status = "skipped"
+    _persistent_body = final_response
+    try:
+        from tools.attachment_ledger import deliver_coverage_to_persistent_body
+
+        _delivered = deliver_coverage_to_persistent_body(
+            final_response=final_response,
+            task_id=effective_task_id,
+            streamed_text="",
+            stream=False,
+            interrupted=bool(interrupted),
+            failed=bool(failed),
+            fail_closed=True,
+        )
+        final_response = _delivered.get("final_response")
+        _coverage_footer = _delivered.get("coverage_footer") or ""
+        _coverage_snapshot = _delivered.get("attachment_coverage")
+        _coverage_status = _delivered.get("coverage_status") or "skipped"
+        _persistent_body = _delivered.get("persistent_assistant_body")
+        if _persistent_body is None:
+            _persistent_body = final_response
+    except Exception as _cov_err:
+        logger.warning("attachment coverage finalizer failed: %s", _cov_err)
+        try:
+            from tools.attachment_ledger import (
+                COVERAGE_UNAVAILABLE_TEXT,
+                is_active as _cov_is_active,
+            )
+
+            # Fail closed for ANY terminal path including interrupted.
+            if _cov_is_active(effective_task_id):
+                _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
+                text = final_response or ""
+                if "## Attachment coverage" not in text:
+                    final_response = (
+                        (text.rstrip() + "\n" + _coverage_footer)
+                        if text
+                        else _coverage_footer
+                    )
+                _coverage_status = "unavailable"
+                _persistent_body = final_response
+        except Exception:
+            pass
+
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
     # earlier is from a prior turn and must not leak into the reasoning
@@ -351,6 +400,16 @@ def finalize_turn(
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
+        # Structured coverage for stream + non-stream delivery adapters
+        # (must not rely solely on final_response prose — BLOCKING-1).
+        "coverage_footer": _coverage_footer,
+        "attachment_coverage": _coverage_snapshot,
+        "coverage_status": _coverage_status,
+        # A-channel body for persistence/reload (same text as final_response
+        # after mechanism append; adapters must not drop this).
+        "persistent_assistant_body": _persistent_body
+        if _persistent_body is not None
+        else final_response,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

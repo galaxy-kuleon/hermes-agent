@@ -833,15 +833,22 @@ async def _vision_analyze_native(
                     success=False,
                 )
 
-        return _build_native_vision_tool_result(
+        out = _build_native_vision_tool_result(
             image_url=image_url,
             question=question,
             image_data_url=image_data_url,
             image_size_bytes=image_size_bytes,
         )
+        _record_vision_ledger(
+            image_url, task_id=task_id, success=True, reason="vision_native_ok"
+        )
+        return out
 
     except Exception as exc:
         logger.warning("Native vision fast path failed: %s", exc)
+        _record_vision_ledger(
+            image_url, task_id=task_id, success=False, reason="vision_native_failed"
+        )
         return tool_error(f"Native vision failed: {exc}", success=False)
     finally:
         # Only delete temp files we created — never user-provided paths.
@@ -1076,7 +1083,10 @@ async def vision_analyze_tool(
         # Log debug information
         _debug.log_call("vision_analyze_tool", debug_call_data)
         _debug.save()
-        
+
+        _record_vision_ledger(
+            image_url, task_id=task_id, success=True, reason="vision_analyze_ok"
+        )
         return json.dumps(result, indent=2, ensure_ascii=False)
         
     except Exception as e:
@@ -1125,7 +1135,10 @@ async def vision_analyze_tool(
         debug_call_data["error"] = error_msg
         _debug.log_call("vision_analyze_tool", debug_call_data)
         _debug.save()
-        
+
+        _record_vision_ledger(
+            image_url, task_id=task_id, success=False, reason="vision_analyze_failed"
+        )
         return json.dumps(result, indent=2, ensure_ascii=False)
     
     finally:
@@ -1253,7 +1266,46 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
-def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+def _record_vision_ledger(
+    image_url: str,
+    *,
+    task_id: str,
+    success: bool,
+    reason: str = "",
+) -> None:
+    """MAJOR-4: vision_analyze must update the same attachment ledger as read_file."""
+    try:
+        from tools.attachment_ledger import (
+            OUTCOME_READ,
+            OUTCOME_UNREADABLE,
+            record_outcome,
+        )
+        from tools.file_grants import file_handle_for_path
+
+        path = str(image_url or "")
+        if path.startswith("file://"):
+            path = path[len("file://") :]
+        # Remote URLs are not attachment handles — skip ledger.
+        if path.startswith("http://") or path.startswith("https://") or path.startswith("data:"):
+            return
+        handle = ""
+        try:
+            handle = file_handle_for_path(path, task_id=task_id) or ""
+        except Exception:
+            handle = ""
+        record_outcome(
+            path,
+            task_id=task_id,
+            status=OUTCOME_READ if success else OUTCOME_UNREADABLE,
+            reason=reason or ("vision_analyze_ok" if success else "vision_analyze_failed"),
+            handle=handle if handle else "",
+            reader="vision_analyze",
+        )
+    except Exception:
+        logger.debug("vision ledger update skipped", exc_info=True)
+
+
+async def _handle_vision_analyze_async(args: Dict[str, Any], **kw: Any) -> Any:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     task_id = kw.get("task_id") or "default"
@@ -1275,7 +1327,21 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     # information loss, no extra latency.
     if _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
-        return _vision_analyze_native(image_url, question, task_id=task_id)
+        result = await _vision_analyze_native(image_url, question, task_id=task_id)
+        success = not (
+            isinstance(result, str)
+            and ("error" in result[:80].lower() or '"success": false' in result.lower())
+        )
+        # Native envelope is a dict on success.
+        if isinstance(result, dict):
+            success = True
+        _record_vision_ledger(
+            image_url,
+            task_id=task_id,
+            success=success,
+            reason="vision_native_ok" if success else "vision_native_failed",
+        )
+        return result
 
     # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
@@ -1283,7 +1349,24 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         f"following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model, task_id=task_id)
+    raw = await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id)
+    success = False
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        success = bool(isinstance(parsed, dict) and parsed.get("success"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        success = False
+    _record_vision_ledger(
+        image_url,
+        task_id=task_id,
+        success=success,
+        reason="vision_analyze_ok" if success else "vision_analyze_failed",
+    )
+    return raw
+
+
+def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+    return _handle_vision_analyze_async(args, **kw)
 
 
 registry.register(

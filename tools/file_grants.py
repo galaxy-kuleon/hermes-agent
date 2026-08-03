@@ -72,13 +72,29 @@ def file_grant_scope(
 
     current_aliases = _ALIASES.get() or {}
     updated_aliases = dict(current_aliases)
-    updated_aliases[task_key] = {
+    handle_map = {
         str(name).upper(): _canonical_path(target)
         for name, target in (handles or {}).items()
     }
+    updated_aliases[task_key] = handle_map
     alias_token = _ALIASES.set(updated_aliases)
+    path_to_handle = {path: name for name, path in handle_map.items()}
+    from tools.attachment_ledger import (
+        attachment_ledger_scope,
+        seed_extension_unreadable,
+    )
+    from tools.file_reader_routing import READ_WITH_UNSUPPORTED, reader_route
+
     try:
-        yield
+        with attachment_ledger_scope(task_key):
+            for path in updated[task_key]:
+                if reader_route(path) == READ_WITH_UNSUPPORTED:
+                    seed_extension_unreadable(
+                        path,
+                        task_id=task_key,
+                        handle=path_to_handle.get(path, ""),
+                    )
+            yield
     finally:
         _ALIASES.reset(alias_token)
         _GRANTS.reset(grants_token)

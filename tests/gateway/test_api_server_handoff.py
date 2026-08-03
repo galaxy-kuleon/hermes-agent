@@ -108,10 +108,8 @@ def test_handoff_context_routes_each_attachment_from_shared_reader_policy(
     assert 'read_with="read_file"' in out
     assert 'read_instruction="Call read_file(&quot;F02&quot;)."' in out
     assert 'read_with="unsupported"' in out
-    assert (
-        'read_instruction="No direct reader is available for this binary '
-        'attachment."' in out
-    )
+    assert "No direct reader is available for this binary attachment" in out
+    assert "unreadable materials" in out
     assert 'call read_file("F01")' not in out
 
 
