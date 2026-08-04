@@ -29,7 +29,7 @@ __all__ = [
 # then handed to the extractor that already exists for that type — see
 # tools/legacy_office.py for why the previous binary-guard rejection was not
 # an acceptable answer for a document.
-_LEGACY_EXTENSIONS = frozenset({".doc", ".xls"})
+_LEGACY_EXTENSIONS = frozenset({".doc", ".xls", ".rtf"})
 EXTRACTABLE_EXTENSIONS = frozenset(
     {".ipynb", ".docx", ".xlsx", ".pdf", ".msg", ".eml"} | _LEGACY_EXTENSIONS
 )

@@ -42,6 +42,14 @@ DEFAULT_MAX_LEGACY_BYTES = 50 * 1024 * 1024
 LEGACY_EXT_TO_TARGET = {
     ".doc": "docx",
     ".xls": "xlsx",
+    # RTF was missing here, so read_file fell through to plain text and handed
+    # the model raw \pard\plain\f0\fs24 control words. 2026-08-04, chat
+    # ce9195e0: a user asked for a 1000-word summary of an RTF judgment, and
+    # the model reported "much of that was RTF formatting code rather than
+    # readable text" -- the user had to ask "have you read the judgment in
+    # full?" to find out it had not. soffice converts RTF cleanly (verified
+    # against the live service 2026-08-05).
+    ".rtf": "docx",
 }
 
 

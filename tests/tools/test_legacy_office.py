@@ -42,6 +42,21 @@ class LegacyRecognitionTests(unittest.TestCase):
         self.assertTrue(is_extractable_document("legacy-power-of-attorney.doc"))
         self.assertTrue(is_extractable_document("ledger.XLS"))
 
+    def test_rtf_is_converted_not_read_as_markup(self):
+        """RTF must not fall through to plain-text reading.
+
+        2026-08-04, chat ce9195e0: a user attached an RTF judgment and asked
+        for a 1000-word summary. read_file handed back raw RTF, and the model
+        reported that "much of that was RTF formatting code rather than
+        readable text". The user had to ask "have you read the judgment in
+        full?" to discover it had not. soffice converts RTF cleanly -- verified
+        against the live service on 2026-08-05.
+        """
+        self.assertIn(".rtf", EXTRACTABLE_EXTENSIONS)
+        self.assertTrue(is_extractable_document("HFC Bank plc v HSBC Bank plc.rtf"))
+        self.assertTrue(is_extractable_document("JUDGMENT.RTF"))
+        self.assertEqual(legacy_office.legacy_target_extension("a.rtf"), "docx")
+
     def test_ppt_is_deliberately_not_claimed(self):
         # There is no PPTX extractor, so converting .ppt would swap one
         # unreadable file for another and lose the honest error.
