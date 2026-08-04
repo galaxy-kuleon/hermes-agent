@@ -171,19 +171,33 @@ class TestCharacterCountGuard(unittest.TestCase):
 
     @patch("tools.file_tools._get_file_ops")
     @patch("tools.file_tools._get_max_read_chars", return_value=_DEFAULT_MAX_READ_CHARS)
-    def test_oversized_read_rejected(self, _mock_limit, mock_ops):
-        """A read that returns >max chars is rejected."""
-        big_content = "x" * (_DEFAULT_MAX_READ_CHARS + 1)
+    def test_oversized_read_is_truncated_not_rejected(self, _mock_limit, mock_ops):
+        """An oversize read returns the budget's worth, not nothing.
+
+        Contract changed 2026-08-05. It used to return only an error telling the
+        model to "use offset and limit". On 2026-08-04 a user attached a
+        245-line judgment that rendered to 102,688 characters -- 2.7% over --
+        and the model made exactly one read_file call, got the error, and never
+        made the second one. The user's turn ended with no answer. An error the
+        model demonstrably does not act on is worse than a partial read it can.
+        """
+        line = "x" * 99 + "\n"
+        big_content = line * ((_DEFAULT_MAX_READ_CHARS // len(line)) + 5)
         mock_ops.return_value = _make_fake_ops(
             content=big_content,
             total_lines=5000,
-            file_size=len(big_content) + 100,  # bigger than content
+            file_size=len(big_content) + 100,
         )
         result = json.loads(read_file_tool("/tmp/huge.txt", task_id="big"))
-        self.assertIn("error", result)
-        self.assertIn("safety limit", result["error"])
-        self.assertIn("offset and limit", result["error"])
+        self.assertNotIn("error", result)
+        self.assertTrue(result.get("content"), "the caller must get readable content")
+        self.assertLessEqual(len(result["content"]), _DEFAULT_MAX_READ_CHARS)
+        self.assertTrue(result.get("truncated"))
+        self.assertEqual(result.get("truncated_reason"), "char_limit")
         self.assertIn("total_lines", result)
+        # And it must say exactly where to resume, with no gap and no repeat.
+        self.assertEqual(result["next_offset"], 1 + len(result["content"].splitlines()))
+        self.assertIn(f"offset={result['next_offset']}", result["hint"])
 
     @patch("tools.file_tools._get_file_ops")
     def test_small_read_not_rejected(self, mock_ops):
@@ -646,12 +660,13 @@ class TestConfigOverride(unittest.TestCase):
     @patch("tools.file_tools._get_file_ops")
     @patch("hermes_cli.config.load_config", return_value={"file_read_max_chars": 50})
     def test_custom_config_lowers_limit(self, _mock_cfg, mock_ops):
-        """A config value of 50 should reject reads over 50 chars."""
+        """A config value of 50 caps the read at 50 chars, still returning them."""
         mock_ops.return_value = _make_fake_ops(content="x" * 60, file_size=60)
         result = json.loads(read_file_tool("/tmp/cfgtest.txt", task_id="cfg1"))
-        self.assertIn("error", result)
-        self.assertIn("safety limit", result["error"])
-        self.assertIn("50", result["error"])  # should show the configured limit
+        self.assertNotIn("error", result)
+        self.assertTrue(result.get("truncated"))
+        self.assertLessEqual(len(result["content"]), 50)
+        self.assertIn("50", result["hint"])  # the configured limit is still named
 
     @patch("tools.file_tools._get_file_ops")
     @patch("hermes_cli.config.load_config", return_value={"file_read_max_chars": 500_000})

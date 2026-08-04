@@ -63,6 +63,37 @@ def _get_max_read_chars() -> int:
     _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
     return _max_read_chars_cached
 
+
+def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int]:
+    """Cut line-numbered content to the budget at a line boundary.
+
+    Returns ``(kept_text, kept_line_count)``.
+
+    Refusing an oversize read outright returns nothing at all, which is strictly
+    worse than returning the budget's worth: on 2026-08-04 a user attached a
+    245-line judgment that rendered to 102,688 characters -- 2.7% over -- was
+    told to "use offset and limit", and got no answer, because the model never
+    made the second call. The budget is what may enter context, and content cut
+    to exactly that is within it by construction.
+    """
+    if len(content) <= max_chars:
+        # splitlines(), not count("\n") + 1: a trailing newline would otherwise
+        # claim one line more than there is, and next_offset is derived from
+        # this, so the model would skip a line of the user's document.
+        return content, len(content.splitlines())
+    kept: list[str] = []
+    used = 0
+    for line in content.splitlines(keepends=True):
+        if used + len(line) > max_chars:
+            break
+        kept.append(line)
+        used += len(line)
+    if not kept:
+        # One line longer than the whole budget: hand back a prefix rather than
+        # nothing, so a single enormous line is still partially readable.
+        return content[:max_chars], 1
+    return "".join(kept), len(kept)
+
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
 _LARGE_FILE_HINT_BYTES = 512_000  # 512 KB
@@ -1834,24 +1865,34 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                 content_len = len(result_dict["content"])
                 max_chars = _get_max_read_chars()
                 if content_len > max_chars:
-                    # Oversize rejection is not a complete read.
+                    # Truncated, not rejected: a partial read the model can act
+                    # on beats an error it demonstrably does not retry.
+                    kept, kept_lines = _truncate_to_char_budget(
+                        result_dict["content"], max_chars
+                    )
+                    next_offset = offset + kept_lines
                     _ledger(
                         OUTCOME_PARTIAL,
-                        reason="read_exceeded_char_limit",
-                        gaps=["oversize_rejected"],
+                        reason="read_truncated_to_char_limit",
+                        gaps=["oversize_truncated"],
                     )
-                    return json.dumps({
-                        "error": (
-                            f"Read produced {content_len:,} characters which exceeds "
-                            f"the safety limit ({max_chars:,} chars). "
-                            "Use offset and limit to read a smaller range. "
-                            f"The document has {total_lines} lines of extracted text."
-                        ),
-                        "path": path,
-                        "total_lines": total_lines,
-                        "file_size": result_dict["file_size"],
-                        "report_as": "partial",
-                    }, ensure_ascii=False)
+                    result_dict["content"] = kept
+                    result_dict["truncated"] = True
+                    result_dict["truncated_reason"] = "char_limit"
+                    result_dict["report_as"] = "partial"
+                    result_dict["next_offset"] = next_offset
+                    result_dict["hint"] = (
+                        f"Extracted text is {content_len:,} characters, over the "
+                        f"{max_chars:,}-char budget. Showing lines "
+                        f"{offset}-{next_offset - 1} of {total_lines}. "
+                        f"Call read_file with offset={next_offset} to continue. "
+                        "Do not claim full coverage of this document until you have."
+                    )
+                    if result_dict["content"]:
+                        result_dict["content"] = redact_sensitive_text(
+                            result_dict["content"], code_file=True
+                        )
+                    return json.dumps(result_dict, ensure_ascii=False)
                 if result_dict["content"]:
                     result_dict["content"] = redact_sensitive_text(result_dict["content"], code_file=True)
                 return json.dumps(result_dict, ensure_ascii=False)
@@ -2001,17 +2042,19 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
         max_chars = _get_max_read_chars()
         if content_len > max_chars:
             total_lines = result_dict.get("total_lines", "unknown")
-            return json.dumps({
-                "error": (
-                    f"Read produced {content_len:,} characters which exceeds "
-                    f"the safety limit ({max_chars:,} chars). "
-                    "Use offset and limit to read a smaller range. "
-                    f"The file has {total_lines} lines total."
-                ),
-                "path": path,
-                "total_lines": total_lines,
-                "file_size": file_size,
-            }, ensure_ascii=False)
+            kept, kept_lines = _truncate_to_char_budget(result.content or "", max_chars)
+            next_offset = offset + kept_lines
+            result.content = kept
+            result_dict["content"] = kept
+            result_dict["truncated"] = True
+            result_dict["truncated_reason"] = "char_limit"
+            result_dict["next_offset"] = next_offset
+            result_dict["hint"] = (
+                f"Read produced {content_len:,} characters, over the "
+                f"{max_chars:,}-char budget. Showing lines "
+                f"{offset}-{next_offset - 1} of {total_lines}. "
+                f"Call read_file with offset={next_offset} to continue."
+            )
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
