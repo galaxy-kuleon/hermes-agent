@@ -118,6 +118,27 @@ def _normalize_range(start: int, end: int) -> tuple[int, int] | None:
     return s, e
 
 
+# Gap markers that describe HOW MUCH was read rather than what the format cost
+# us. The covered ranges already answer them, so once those cover the total the
+# marker is resolved and must not keep the attachment partial forever.
+#
+# `oversize_truncated` used to be classified as a format gap. Observed
+# 2026-08-05: a 443-line judgment was read in full across two calls (1-334 then
+# 335-443) and the coverage report still said "not fully included ... extent:
+# ranges=[[1, 443]] total=443 -- gaps: oversize_truncated". The ledger knew the
+# whole document had been read and told the reader otherwise, which is the
+# honesty defect inverted -- and it lands exactly when the model did the right
+# thing and continued.
+_EXTENT_GAP_PREFIXES = ("uncovered_lines=",)
+_EXTENT_GAP_MARKERS = frozenset({"unknown_total", "oversize_truncated"})
+
+
+def is_extent_gap(gap: object) -> bool:
+    """True for gaps the covered ranges can resolve on their own."""
+    s = str(gap)
+    return s in _EXTENT_GAP_MARKERS or s.startswith(_EXTENT_GAP_PREFIXES)
+
+
 def merge_ranges(ranges: list[list[int] | tuple[int, int]]) -> list[list[int]]:
     """Merge inclusive 1-based ranges into a sorted disjoint list."""
     norm: list[tuple[int, int]] = []
@@ -241,26 +262,23 @@ def record_outcome(
 
     # partial wins over a bare success read if gaps remain.
     if prev.get("status") == OUTCOME_PARTIAL and status == OUTCOME_READ:
-        if total is not None and ranges_cover_total(ranges, total) and not (
-            gaps or prev.get("gaps")
-        ):
-            pass  # allow upgrade when ranges now cover and no format gaps
+        merged_gaps = list(dict.fromkeys([*(prev.get("gaps") or []), *(gaps or [])]))
+        if total is not None and ranges_cover_total(ranges, total):
+            # This block answers one question only: did we end up reading it
+            # all? If so, extent gaps are settled. Whether any FORMAT gap still
+            # makes it partial is the next block's job -- deciding it twice is
+            # how the two ended up disagreeing.
+            gaps = [g for g in merged_gaps if not is_extent_gap(g)]
         else:
             status = OUTCOME_PARTIAL
-            gaps = list(dict.fromkeys([*(prev.get("gaps") or []), *(gaps or [])]))
+            gaps = merged_gaps
 
     # Format gaps always keep partial even if lines cover.
     if gaps or (prev.get("gaps") and status == OUTCOME_READ):
         # only force partial when format gaps are still present
         fmt_gaps = list(dict.fromkeys([*(prev.get("gaps") or []), *(gaps or [])]))
         # strip pure extent gap notes when fully covered and no format gaps remain
-        format_only = [
-            g
-            for g in fmt_gaps
-            if g
-            and not str(g).startswith("uncovered_lines=")
-            and g != "unknown_total"
-        ]
+        format_only = [g for g in fmt_gaps if g and not is_extent_gap(g)]
         if format_only and status == OUTCOME_READ:
             status = OUTCOME_PARTIAL
             gaps = format_only
