@@ -21,6 +21,22 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
     {
         "read_file",
         "search_files",
+        # Read-only lookups that return the same answer for the same arguments,
+        # so repeating one unchanged is by definition no progress.
+        #
+        # `attachments` was missing here and a brand-new user paid for it on
+        # 2026-08-07 (chat 6090080e): their second message produced roughly
+        # eighty-five identical `attachments({})` calls -- each correctly
+        # answering "no files are attached" -- and then an EMPTY reply. The
+        # guardrail below already hard-stops this exact shape on api_server;
+        # it simply never saw the tool.
+        "attachments",
+        "skills_list",
+        "skill_view",
+        "viking_search",
+        "viking_browse",
+        "mcp_soc_v2_list_conversions",
+        "mcp_soc_v2_conversion_status",
         "web_search",
         "web_extract",
         "session_search",

@@ -3,6 +3,7 @@
 import json
 
 from agent.tool_guardrails import (
+    IDEMPOTENT_TOOL_NAMES,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
@@ -389,3 +390,42 @@ def test_explicit_hard_stop_enabled_does_not_need_a_resolver():
             break
         controller.after_call("read_file", args, '{"content": "x"}', failed=False)
     assert blocked
+
+
+def test_repeated_attachments_on_api_server_is_stopped():
+    """The 2026-08-07 empty-reply loop (chat 6090080e).
+
+    A brand-new user's second message produced roughly eighty-five identical
+    `attachments({})` calls -- each SUCCEEDING with "no files are attached" --
+    and then an empty reply. Nothing stopped it because `attachments` was not
+    in IDEMPOTENT_TOOL_NAMES, so the no-progress guard never saw the tool.
+
+    A succeeding call that returns the same answer forever is still no
+    progress, and on api_server there is no human to press Stop.
+    """
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    args = {}
+    same_result = '{"success": true, "total": 0, "files": []}'
+
+    actions = []
+    for _ in range(12):
+        before = controller.before_call("attachments", args)
+        actions.append(before.action)
+        if before.action == "block":
+            break
+        controller.after_call("attachments", args, same_result, failed=False)
+
+    assert "block" in actions, (
+        "an unchanging idempotent call must be stopped on api_server, "
+        f"got {actions}"
+    )
+    assert actions.index("block") <= 8, (
+        f"stopped far too late: {actions.index('block')} calls were allowed"
+    )
+
+
+def test_attachments_is_registered_as_idempotent():
+    """Pinned separately: the guard above is only reachable via this set."""
+    assert "attachments" in IDEMPOTENT_TOOL_NAMES
