@@ -23,6 +23,7 @@ new failure mode.
 from __future__ import annotations
 
 import os
+import time
 import tempfile
 from pathlib import Path
 
@@ -34,6 +35,12 @@ DEFAULT_SOFFICE_TIMEOUT_SECONDS = 120
 # A legacy document large enough to exceed this is not something a chat turn can
 # usefully consume, and the conversion would dominate the turn's latency.
 MAX_LEGACY_BYTES_ENV = "HERMES_SOFFICE_MAX_BYTES"
+# A busy sidecar is not a broken document. 503 is the shed-load signal the
+# soffice sidecar emits when every conversion slot is taken; 502/504 are the
+# same class from anything in front of it.
+RETRYABLE_STATUS = frozenset({502, 503, 504})
+RETRY_ATTEMPTS = int(os.environ.get("HERMES_SOFFICE_RETRY_ATTEMPTS", "3"))
+RETRY_BACKOFF_SECONDS = float(os.environ.get("HERMES_SOFFICE_RETRY_BACKOFF_SECONDS", "2"))
 DEFAULT_MAX_LEGACY_BYTES = 50 * 1024 * 1024
 
 # Only formats whose converted target already has an extractor. `.ppt` is absent
@@ -107,20 +114,52 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
     except ImportError as exc:  # pragma: no cover - requests ships with hermes
         raise ExtractionError("requests is unavailable for soffice conversion") from exc
 
-    try:
-        with source.open("rb") as handle:
-            response = requests.post(
-                f"{_soffice_url()}/convert",
-                params={"to": target},
-                files={"file": (source.name, handle)},
-                timeout=_timeout_seconds(),
-            )
-        response.raise_for_status()
-        payload = response.content
-    except Exception as exc:
+    # A 503 from the sidecar means "busy", not "this document is broken", and
+    # the two must not read the same to the caller: on 2026-08-05 a real user
+    # attached an eleven-document legal bundle, the sidecar shed nine of them
+    # instantly, and the model reported nine case authorities as UNREADABLE.
+    # The sidecar now queues, so this retry is the second line of defence for a
+    # genuine overload rather than the primary fix.
+    payload = None
+    last_detail = ""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            with source.open("rb") as handle:
+                response = requests.post(
+                    f"{_soffice_url()}/convert",
+                    params={"to": target},
+                    files={"file": (source.name, handle)},
+                    timeout=_timeout_seconds(),
+                )
+            # getattr, not attribute access: a response without a status_code
+            # simply has no retry signal and falls through to raise_for_status.
+            # Requiring the attribute made this crash on every caller whose
+            # response object did not carry one.
+            status_code = getattr(response, "status_code", None)
+            if status_code in RETRYABLE_STATUS and attempt < RETRY_ATTEMPTS:
+                last_detail = f"HTTP {status_code} (busy)"
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            response.raise_for_status()
+            payload = response.content
+            break
+        except Exception as exc:
+            # Keep the status code. "HTTPError" alone cannot tell a busy
+            # sidecar from a crashed one, which is exactly the ambiguity that
+            # made the 2026-08-05 failures unreadable in the transcript.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            last_detail = f"{type(exc).__name__}{f' HTTP {status}' if status else ''}"
+            if status in RETRYABLE_STATUS and attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            raise ExtractionError(
+                f"soffice conversion failed for {source.name}: {last_detail}"
+            ) from exc
+    if payload is None:
         raise ExtractionError(
-            f"soffice conversion failed for {source.name}: {type(exc).__name__}"
-        ) from exc
+            f"soffice conversion failed for {source.name}: {last_detail} "
+            f"after {RETRY_ATTEMPTS} attempts"
+        )
 
     if not payload:
         raise ExtractionError(f"soffice returned no content for {source.name}")

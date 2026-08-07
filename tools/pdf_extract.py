@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -60,6 +61,24 @@ _MULTIPART_FIELD = "files"  # docling /v1/convert/file expects field name "files
 # (image_000000_<sha>.png) that resolve nowhere from here, so the agent would
 # get 50 dead links; read_file wants text, so placeholder is the honest mode.
 _DOCLING_IMAGE_EXPORT_MODE = os.environ.get("HERMES_DOCLING_IMAGE_EXPORT_MODE", "placeholder")
+# docling serves a bounded number of conversions at once; anything beyond that
+# waits inside the service, and a client timeout measured across the wait fails
+# work that was never going to be slow.
+#
+# Measured 2026-08-08 on a 3.2 MB scanned judgment: 44.2s alone, and with four
+# concurrent requests 50.2s / 50.2s / 96.3s / 96.3s. The last two would blow a
+# 66s budget while doing the same 44s of work. That is what turned two of a
+# real user's case authorities into "unreadable" on 2026-08-05 -- they attached
+# eleven documents at once, which is how this user works.
+#
+# So the waiting happens HERE, outside the request, and the timeout measures
+# only the conversion. The queue wait is bounded so a wedged docling sheds work
+# instead of hanging a turn forever.
+_DOCLING_MAX_INFLIGHT = int(os.environ.get("HERMES_DOCLING_MAX_INFLIGHT", "2"))
+_DOCLING_QUEUE_WAIT_SECONDS = float(
+    os.environ.get("HERMES_DOCLING_QUEUE_WAIT_SECONDS", "600")
+)
+_docling_slots = threading.Semaphore(_DOCLING_MAX_INFLIGHT)
 
 
 def _timeout_for(size_bytes: int) -> int:
@@ -121,11 +140,18 @@ def extract_pdf_text(path) -> str:
         headers={"Content-Type": f"multipart/form-data; boundary={_MULTIPART_BOUNDARY}"},
         method="POST",
     )
+    if not _docling_slots.acquire(timeout=_DOCLING_QUEUE_WAIT_SECONDS):
+        raise ExtractionError(
+            "docling is busy: no conversion slot within "
+            f"{int(_DOCLING_QUEUE_WAIT_SECONDS)}s"
+        )
     try:
         with urllib.request.urlopen(req, timeout=_timeout_for(size)) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as exc:  # URLError, timeout, JSON error — all fail closed to fallback
         raise ExtractionError(f"docling PDF extraction failed: {exc}") from exc
+    finally:
+        _docling_slots.release()
 
     if payload.get("status") != "success":
         raise ExtractionError(f"docling did not succeed: {payload.get('errors')!r}")
