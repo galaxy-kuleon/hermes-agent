@@ -429,3 +429,30 @@ def test_repeated_attachments_on_api_server_is_stopped():
 def test_attachments_is_registered_as_idempotent():
     """Pinned separately: the guard above is only reachable via this set."""
     assert "attachments" in IDEMPOTENT_TOOL_NAMES
+
+
+def test_block_message_tells_the_model_to_answer_not_to_report():
+    """A control that halts a loop must not become the answer.
+
+    Observed live 2026-08-08 (chat 9f5a792b): the guardrail correctly stopped a
+    repeated skill_view, and the model then gave the user 257 characters naming
+    `idempotent_no_progress_block` instead of the trademark advice they asked
+    for. The halt worked; the wording invited a report.
+    """
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    args = {"name": "tw-tmc"}
+    same = '{"success": true, "content": "..."}'
+    decision = None
+    for _ in range(12):
+        before = controller.before_call("skill_view", args)
+        if before.action == "block":
+            decision = before
+            break
+        controller.after_call("skill_view", args, same, failed=False)
+
+    assert decision is not None, "the loop was never blocked"
+    msg = decision.message.lower()
+    assert "answer the user" in msg, f"must direct the model onward: {decision.message}"
+    assert "do not mention it" in msg, f"must forbid surfacing it: {decision.message}"

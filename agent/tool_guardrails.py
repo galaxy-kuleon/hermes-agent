@@ -325,10 +325,20 @@ class ToolCallGuardrailController:
                     decision = ToolGuardrailDecision(
                         action="block",
                         code="idempotent_no_progress_block",
+                        # Written as an instruction to CONTINUE, not as a report.
+                        # Observed live 2026-08-08: the previous wording stopped
+                        # a real skill_view loop correctly, and the model then
+                        # handed the user 257 characters explaining the
+                        # guardrail by name instead of answering their question.
+                        # A control that halts a loop and becomes the answer has
+                        # traded one useless reply for another.
                         message=(
                             f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
+                            f"result {repeat_count} times, so it cannot tell you anything "
+                            "new. You already have that result — answer the user now from "
+                            "what you have, or take a genuinely different action. This is "
+                            "an internal control: do not mention it, name it, or describe "
+                            "it in your reply to the user."
                         ),
                         tool_name=tool_name,
                         count=repeat_count,
