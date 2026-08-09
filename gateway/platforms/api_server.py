@@ -1309,6 +1309,18 @@ def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
     user_role = _sanitize_owui_role(request.headers.get("X-OpenWebUI-User-Role", ""))
     raw_user_groups = request.headers.get("X-OpenWebUI-User-Groups")
     user_groups = _sanitize_owui_groups(raw_user_groups or "")
+    # M2 correlation. aiohttp's access log records the path and status but not
+    # who or which conversation, so every cross-service question so far has been
+    # answered by hand-joining timestamps. owui already sends the correlator --
+    # X-OpenWebUI-Chat-Id -- so nothing new needs minting; it only needs saying
+    # out loud once per request, where it is already parsed and sanitised.
+    # Ids only: no header values, no paths, no content.
+    logger.info(
+        "journey uid=%s chat=%s method=%s path=%s",
+        user_id or "-", chat_id or "-",
+        getattr(request, "method", "-"),
+        getattr(getattr(request, "rel_url", None), "path", "-"),
+    )
     if user_id and raw_user_groups is None:
         logger.warning("owui_acl_group_context_missing user_id=%s", user_id)
     elif user_id and raw_user_groups and not user_groups:
