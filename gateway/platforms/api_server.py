@@ -5547,7 +5547,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                # /v1/runs launched its agent bare too, so a structured run
+                # recorded every failure with no journey at all. Round 13 proved
+                # the deployed worker still observed ('', '') -- my round-12 edit
+                # never applied and I claimed it had without checking.
+                _runs_ctx = contextvars.copy_context()
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: _runs_ctx.run(_run_sync))
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
