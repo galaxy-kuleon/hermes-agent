@@ -84,6 +84,21 @@ _DOCLING_QUEUE_WAIT_SECONDS = float(
 _docling_slots = threading.Semaphore(_DOCLING_MAX_INFLIGHT)
 
 
+
+def _safe_log(emit, fmt: str, *args) -> None:
+    """Record a failure without letting the logger change the outcome.
+
+    An unguarded warning both suppressed the record AND replaced the caller's
+    ExtractionError with a RuntimeError; callers catch ExtractionError only, so
+    a logging fault became an unhandled crash. Observability must never change
+    what the user gets. Proved by adversarial review round 3, 2026-08-10.
+    """
+    try:
+        emit(fmt, *args)
+    except Exception:
+        pass
+
+
 def _timeout_for(size_bytes: int) -> int:
     """Seconds to allow docling for a file of this size (bounded)."""
     scaled = _DOCLING_TIMEOUT_BASE_SECONDS + int(
@@ -145,8 +160,8 @@ def extract_pdf_text(path) -> str:
     )
     _waited = time.monotonic()
     if not _docling_slots.acquire(timeout=_DOCLING_QUEUE_WAIT_SECONDS):
-        _log.warning("sidecar_busy service=docling waited=%.1fs outcome=shed",
-                     time.monotonic() - _waited)
+        _safe_log(_log.warning, "sidecar_busy service=docling waited=%.1fs outcome=shed",
+                  time.monotonic() - _waited)
         raise ExtractionError(
             "docling is busy: no conversion slot within "
             f"{int(_DOCLING_QUEUE_WAIT_SECONDS)}s"
@@ -163,7 +178,8 @@ def extract_pdf_text(path) -> str:
                 # A queue wait this long used to be spent inside the request
                 # timeout, so work that was never slow failed for having been
                 # queued (measured 2026-08-08: 44.2s of work, 96.3s elapsed).
-                _log.info("sidecar_queued service=docling waited=%.1fs bytes=%d",
+                _safe_log(_log.info,
+                          "sidecar_queued service=docling waited=%.1fs bytes=%d",
                           _queued, size)
         except Exception:  # observability must not cost the user their document
             pass
@@ -174,21 +190,46 @@ def extract_pdf_text(path) -> str:
             # Every failure leaves a record where it happens, not just the
             # busy one: "which layer, with what status" is the question, and
             # a timeout answers it as much as a 503 does.
-            _log.warning("sidecar_failed service=docling outcome=error kind=%s bytes=%d",
-                         type(exc).__name__, size)
+            _safe_log(_log.warning,
+                      "sidecar_failed service=docling outcome=error kind=%s bytes=%d",
+                      type(exc).__name__, size)
             raise ExtractionError(f"docling PDF extraction failed: {exc}") from exc
     finally:
         _docling_slots.release()
 
+    # Valid JSON of the WRONG SHAPE used to raise AttributeError here -- after
+    # the slot was released, so no leak, but read_file's caller catches
+    # ExtractionError only, so the raw AttributeError bypassed the intended
+    # "unreadable document" result and became an unhandled crash. Proved by
+    # adversarial review round 3, 2026-08-10 (json_list, document_string).
+    if not isinstance(payload, dict):
+        _safe_log(_log.warning,
+                  "sidecar_failed service=docling outcome=bad_shape kind=%s bytes=%d",
+                  type(payload).__name__, size)
+        raise ExtractionError(
+            f"docling returned {type(payload).__name__}, not an object")
     if payload.get("status") != "success":
-        _log.warning("sidecar_failed service=docling outcome=not_success bytes=%d", size)
+        _safe_log(_log.warning,
+                  "sidecar_failed service=docling outcome=not_success bytes=%d", size)
         raise ExtractionError(f"docling did not succeed: {payload.get('errors')!r}")
     doc = payload.get("document") or {}
+    if not isinstance(doc, dict):
+        _safe_log(_log.warning,
+                  "sidecar_failed service=docling outcome=bad_document kind=%s bytes=%d",
+                  type(doc).__name__, size)
+        raise ExtractionError(
+            f"docling returned a {type(doc).__name__} document, not an object")
     text = doc.get("md_content") or doc.get("text_content") or ""
+    if not isinstance(text, str):
+        _safe_log(_log.warning,
+                  "sidecar_failed service=docling outcome=bad_text kind=%s bytes=%d",
+                  type(text).__name__, size)
+        raise ExtractionError(f"docling returned {type(text).__name__} content")
     if not text.strip():
         # The user sees "unreadable" for a scan with no OCR text. That is a
         # different failure from a busy sidecar and must not read the same.
-        _log.warning("sidecar_failed service=docling outcome=no_text bytes=%d", size)
+        _safe_log(_log.warning,
+                  "sidecar_failed service=docling outcome=no_text bytes=%d", size)
         raise ExtractionError(
             "PDF produced no extractable text (image-only scan without OCR text?)"
         )

@@ -95,6 +95,31 @@ class SofficeBusyIsNotBrokenTests(unittest.TestCase):
         self.assertNotIn(os.path.basename(self.path), text,
                          "a client filename must never reach the log")
 
+    def test_an_empty_200_is_a_recorded_failure(self):
+        """A 200 with an empty body is terminal, and used to log nothing.
+
+        `outcome=exhausted` could not cover it: the payload is b'', not None.
+        Proved by adversarial review round 3, 2026-08-10.
+        """
+        with patch("requests.post", return_value=_Resp(200, content=b"")):
+            with self.assertLogs(legacy_office._log, level="WARNING") as caught:
+                with self.assertRaises(ExtractionError):
+                    legacy_office.convert_to_ooxml(self.path)
+        self.assertIn("outcome=empty_payload", "\n".join(caught.output))
+
+    def test_a_broken_log_handler_cannot_change_what_the_user_gets(self):
+        """Observability must never turn ExtractionError into RuntimeError.
+
+        Callers catch ExtractionError only, so an unguarded warning turned a
+        logging fault into an unhandled crash.
+        """
+        with patch.object(legacy_office, "RETRY_BACKOFF_SECONDS", 0):
+            with patch("requests.post", return_value=_Resp(503)):
+                with patch.object(legacy_office._log, "warning",
+                                  side_effect=RuntimeError("handler blew up")):
+                    with self.assertRaises(ExtractionError):
+                        legacy_office.convert_to_ooxml(self.path)
+
     def test_a_400_is_not_retried(self):
         """A rejected document is a real answer; retrying it wastes the turn."""
         calls = []
@@ -181,6 +206,36 @@ class DoclingQueuesOutsideTheTimeoutTests(unittest.TestCase):
                         pdf_extract.extract_pdf_text(self.path)
         self.assertTrue(pdf_extract._docling_slots.acquire(timeout=1),
                         "slots were leaked by the failure path")
+        pdf_extract._docling_slots.release()
+
+    def test_valid_json_of_the_wrong_shape_stays_an_ExtractionError(self):
+        """read_file's caller catches ExtractionError ONLY.
+
+        A list payload, or a string `document`, raised AttributeError straight
+        past that contract and became an unhandled crash instead of an honest
+        unreadable-document answer. Proved by adversarial review round 3.
+        """
+        class _R:
+            def __init__(self, body):
+                self._b = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return self._b
+
+        for body in (b'[]', b'{"status":"success","document":"oops"}',
+                     b'{"status":"success","document":{"md_content":42}}'):
+            with self.subTest(body=body):
+                with patch("urllib.request.urlopen", return_value=_R(body)):
+                    with self.assertRaises(ExtractionError):
+                        pdf_extract.extract_pdf_text(self.path)
+        self.assertTrue(pdf_extract._docling_slots.acquire(timeout=1),
+                        "a wrong-shape payload leaked the slot")
         pdf_extract._docling_slots.release()
 
     def test_a_slot_is_released_when_the_LOGGER_fails(self):

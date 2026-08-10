@@ -62,6 +62,21 @@ LEGACY_EXT_TO_TARGET = {
 }
 
 
+def _safe_warn(fmt: str, *args) -> None:
+    """Emit a failure record without letting the logger change the outcome.
+
+    The terminal warnings were unguarded, so a broken logging handler both
+    suppressed the record AND replaced the caller's ExtractionError with a
+    RuntimeError -- callers catch ExtractionError only, so a logging fault
+    became an unhandled crash. Observability must never change what the user
+    gets. Proved by adversarial review round 3, 2026-08-10.
+    """
+    try:
+        _log.warning(fmt, *args)
+    except Exception:
+        pass
+
+
 def _soffice_url() -> str:
     return (os.environ.get(SOFFICE_URL_ENV) or DEFAULT_SOFFICE_URL).rstrip("/")
 
@@ -145,7 +160,7 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
                 # trace was "unreadable" in the answer; the incident had to be
                 # reproduced by hand to be seen at all. Name is a filename, so
                 # only its extension is logged.
-                _log.warning(
+                _safe_warn(
                     "sidecar_busy service=soffice status=%s attempt=%d/%d ext=%s "
                     "outcome=retry",
                     status_code, attempt, RETRY_ATTEMPTS, source.suffix.lower())
@@ -161,7 +176,7 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             last_detail = f"{type(exc).__name__}{f' HTTP {status}' if status else ''}"
             if status in RETRYABLE_STATUS and attempt < RETRY_ATTEMPTS:
-                _log.warning(
+                _safe_warn(
                     "sidecar_busy service=soffice status=%s attempt=%d/%d ext=%s "
                     "outcome=retry", status, attempt, RETRY_ATTEMPTS,
                     source.suffix.lower())
@@ -171,7 +186,7 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
             # document -- emitted nothing at all, because the only log sat
             # behind `attempt < RETRY_ATTEMPTS`. The last 503 is precisely the
             # one worth a record. Proved by adversarial review 2026-08-10.
-            _log.warning(
+            _safe_warn(
                 "sidecar_failed service=soffice status=%s attempts=%d ext=%s "
                 "outcome=gave_up kind=%s", status, attempt, source.suffix.lower(),
                 type(exc).__name__)
@@ -179,7 +194,7 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
                 f"soffice conversion failed for {source.name}: {last_detail}"
             ) from exc
     if payload is None:
-        _log.warning(
+        _safe_warn(
             "sidecar_failed service=soffice attempts=%d ext=%s outcome=exhausted",
             RETRY_ATTEMPTS, source.suffix.lower())
         raise ExtractionError(
@@ -188,6 +203,12 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
         )
 
     if not payload:
+        # A 200 carrying an empty body is a terminal sidecar failure and used
+        # to take the one unlogged branch left: `exhausted` cannot cover it
+        # because the payload is b'', not None. Proved by adversarial review
+        # round 3, 2026-08-10.
+        _safe_warn("sidecar_failed service=soffice status=200 ext=%s "
+                   "outcome=empty_payload", source.suffix.lower())
         raise ExtractionError(f"soffice returned no content for {source.name}")
 
     handle_fd, temp_path = tempfile.mkstemp(suffix=f".{target}", prefix="hermes-legacy-")
