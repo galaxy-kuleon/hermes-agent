@@ -247,7 +247,10 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        executor.submit(_worker)
+        # Background delegation crosses a persistent executor; without this the
+        # root journey is empty for the whole background run.
+        from tools.thread_context import propagate_context_to_thread
+        executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)

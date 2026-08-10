@@ -2347,11 +2347,16 @@ def delegate_task(
         completed_count = 0
         spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
+        from tools.thread_context import propagate_context_to_thread
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
             for i, t, child in children:
+                # Batch fan-out crosses an OUTER executor before the inner
+                # wrapper runs, so the inner copy_context captured an already
+                # empty root and every batched child was anonymous. Proved on
+                # the deployed image, round 12.
                 future = executor.submit(
-                    _run_single_child,
+                    propagate_context_to_thread(_run_single_child),
                     task_index=i,
                     goal=t["goal"],
                     child=child,
