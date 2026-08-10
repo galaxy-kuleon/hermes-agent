@@ -62,6 +62,22 @@ LEGACY_EXT_TO_TARGET = {
 }
 
 
+def _journey_suffix() -> str:
+    """` session=<id>` for the request this tool is serving, or "".
+
+    The id is `api-<hash>-user-<uuid>-chat-<id>`, which the journey ledger
+    already knows how to split into a correlator. Without it a sidecar failure
+    names the layer but not the journey, and nobody can answer at 03:00 which
+    user's document was the one that died.
+    """
+    try:
+        from hermes_logging import _session_context
+        sid = getattr(_session_context, "session_id", None)
+        return f" session={sid}" if sid else ""
+    except Exception:
+        return ""
+
+
 def _safe_warn(fmt: str, *args) -> None:
     """Emit a failure record without letting the logger change the outcome.
 
@@ -72,7 +88,7 @@ def _safe_warn(fmt: str, *args) -> None:
     gets. Proved by adversarial review round 3, 2026-08-10.
     """
     try:
-        _log.warning(fmt, *args)
+        _log.warning(fmt + _journey_suffix(), *args)
     except Exception:
         pass
 

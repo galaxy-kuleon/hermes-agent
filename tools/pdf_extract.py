@@ -94,7 +94,8 @@ def _safe_log(emit, fmt: str, *args) -> None:
     what the user gets. Proved by adversarial review round 3, 2026-08-10.
     """
     try:
-        emit(fmt, *args)
+        from tools.legacy_office import _journey_suffix
+        emit(fmt + _journey_suffix(), *args)
     except Exception:
         pass
 

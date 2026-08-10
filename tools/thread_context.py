@@ -76,6 +76,17 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     absent.
     """
     ctx = contextvars.copy_context()
+    # The session id is thread-local, and a tool runs on its own worker, so
+    # every failure a tool recorded was anonymous: the ledger knew WHICH LAYER
+    # failed but never WHOSE request. That is the one thing the plan's
+    # per-journey contract needs, and the id already encodes user and chat.
+    # Proved blocking by adversarial review round 9, 2026-08-10.
+    parent_session_id = None
+    try:
+        from hermes_logging import _session_context as _sc
+        parent_session_id = getattr(_sc, "session_id", None)
+    except Exception:
+        logger.debug("Could not capture parent session context", exc_info=True)
     parent_approval_cb = parent_sudo_cb = None
     setters = None
     try:
@@ -88,6 +99,13 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
     def _runner(*args, **kwargs):
         def _inner():
+            if parent_session_id:
+                try:
+                    from hermes_logging import set_session_context
+                    set_session_context(parent_session_id)
+                except Exception:
+                    logger.debug("Could not install session context on worker",
+                                 exc_info=True)
             if setters is not None:
                 set_approval, set_sudo = setters
                 try:
