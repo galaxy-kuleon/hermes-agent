@@ -1330,7 +1330,10 @@ def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
         "journey uid=%s chat=%s method=%s path=%s",
         user_id or "-", chat_id or "-",
         getattr(request, "method", "-"),
-        getattr(getattr(request, "rel_url", None), "path", "-"),
+        # The path is a client filename after yarl decodes it, so it can carry
+        # a line break and split the identity record. Round 17.
+        " | ".join(str(
+            getattr(getattr(request, "rel_url", None), "path", "-")).splitlines()),
     )
     if user_id and raw_user_groups is None:
         logger.warning("owui_acl_group_context_missing user_id=%s", user_id)

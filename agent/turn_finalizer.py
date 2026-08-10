@@ -186,9 +186,18 @@ def finalize_turn(
     _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
+    # The journey is stated explicitly. The ledger used to dig uid/chat out of
+    # the session id, which is opaque and caller-supplied on some routes, so an
+    # authenticated caller could make a real user's turn name a different
+    # person. Round 17.
+    try:
+        from tools.journey_context import journey_suffix as _js
+        _journey = _js()
+    except Exception:
+        _journey = ""
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
-        "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+        "tool_turns=%d last_msg_role=%s response_len=%d session=%s" + _journey
     )
     _diag_args = (
         # A structured record must be ONE line. The reason can come from
@@ -197,10 +206,13 @@ def finalize_turn(
         # line parsed, the failure was absent from the ledger, and the cursor
         # acknowledged it anyway. Same high-value error_near_max_iterations
         # family whose spaces were fixed in round 7. Proved round 15.
-        _one_line(_turn_exit_reason), agent.model, api_call_count, agent.max_iterations,
+        _one_line(_turn_exit_reason), _one_line(agent.model),
+        api_call_count, agent.max_iterations,
         _budget_used, _budget_max,
-        _turn_tool_count, _last_msg_role, _resp_len,
-        agent.session_id or "none",
+        _turn_tool_count, _one_line(_last_msg_role), _resp_len,
+        # model, session and last_tool were left uncollapsed: any of them can
+        # split the record just as the reason did. Round 17.
+        _one_line(agent.session_id or "none"),
     )
 
     if _last_msg_role == "tool" and not interrupted:
@@ -208,7 +220,7 @@ def finalize_turn(
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
             + _diag_msg + " last_tool=%s",
-            *_diag_args, _last_tool_name,
+            *_diag_args, _one_line(_last_tool_name),
         )
     else:
         logger.info(_diag_msg, *_diag_args)

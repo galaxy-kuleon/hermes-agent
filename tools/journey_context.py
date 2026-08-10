@@ -44,14 +44,21 @@ _JOURNEY_CHAT: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 
 def _id_safe(value: str) -> str:
-    """Ids must survive a whitespace-delimited log record.
+    """Make an id survive a whitespace-delimited log record, LOSSLESSLY.
 
     The ledger reads these back as `key=value` with a non-space value, so an id
-    carrying a space -- reachable on the session-chat route grammar -- would
-    truncate the correlation to its first word and quietly attach the failure
-    to a shorter, wrong id. Proved by adversarial review round 16.
+    carrying a space would truncate the correlation to its first word (round
+    16). My first fix replaced whitespace with "_", which is NOT injective:
+    `case 15`, `case_15` and `case  15` all became `case_15`, so three distinct
+    conversations shared one correlator and a failure could be attached to the
+    wrong one. Round 17 proved it on the deployed session-chat handler.
+
+    Percent-encoding is the inverse of the reader's grammar rather than a
+    lossy rewrite: distinct ids stay distinct, `%` itself is encoded, and an
+    ordinary UUID passes through untouched.
     """
-    return "_".join(str(value or "").split()) or ""
+    from urllib.parse import quote
+    return quote(str(value or ""), safe="") or ""
 
 
 def set_journey(uid: str, chat: str) -> None:
