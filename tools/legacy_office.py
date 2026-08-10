@@ -71,6 +71,15 @@ def _journey_suffix() -> str:
     user's document was the one that died.
     """
     try:
+        from tools.journey_context import journey_suffix
+        suffix = journey_suffix()
+        if suffix:
+            return suffix
+    except Exception:
+        pass
+    # Fallback only: the logging session id encodes uid/chat for the ordinary
+    # direct-tool path, but it is thread-local and delegation replaces it.
+    try:
         from hermes_logging import _session_context
         sid = getattr(_session_context, "session_id", None)
         return f" session={sid}" if sid else ""

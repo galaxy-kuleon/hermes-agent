@@ -1315,6 +1315,16 @@ def _extract_owui_scope(request: "web.Request") -> Dict[str, str]:
     # X-OpenWebUI-Chat-Id -- so nothing new needs minting; it only needs saying
     # out loud once per request, where it is already parsed and sanitised.
     # Ids only: no header values, no paths, no content.
+    # Bind the journey for everything this request goes on to do, including
+    # delegated children and tool workers. Round 10 proved the logging session
+    # id could not carry it: delegation replaces it, async fan-out never gets
+    # it, and a reused worker could inherit a STALE one -- attributing one
+    # user's failure to another's journey, which is worse than none.
+    try:
+        from tools.journey_context import set_journey
+        set_journey(user_id or "", chat_id or "")
+    except Exception:
+        logger.debug("could not bind journey context", exc_info=True)
     logger.info(
         "journey uid=%s chat=%s method=%s path=%s",
         user_id or "-", chat_id or "-",
