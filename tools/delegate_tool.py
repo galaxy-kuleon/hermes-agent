@@ -1654,7 +1654,10 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # The child crosses another executor boundary; without this it starts
+        # with an empty journey and every failure it records is anonymous.
+        from tools.thread_context import propagate_context_to_thread as _pctt
+        _child_future = _timeout_executor.submit(_pctt(_run_with_thread_capture))
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:

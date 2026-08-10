@@ -32,6 +32,7 @@ Requires:
 """
 
 import asyncio
+import contextvars
 import hashlib
 import html
 import hmac
@@ -5207,7 +5208,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 finally:
                     reset_trusted_export_context(export_context_token)
 
-        return await loop.run_in_executor(None, _run)
+        # A BARE run_in_executor drops the request's ContextVars, so the
+        # journey bound above never reached the agent turn at all and every
+        # later copy_context() faithfully copied an empty one. Proved by
+        # adversarial review round 11 on the real _run_agent worker.
+        _journey_ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, lambda: _journey_ctx.run(_run))
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
