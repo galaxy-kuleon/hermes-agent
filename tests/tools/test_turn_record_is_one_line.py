@@ -21,11 +21,17 @@ sys.path.insert(0, _ROOT)
 def _load_one_line():
     """Load the helper without importing the module's heavy dependencies."""
     src = open(os.path.join(_ROOT, "agent", "turn_finalizer.py")).read()
-    m = re.search(r"_ONE_LINE_MAX = \d+\n\n\ndef _one_line.*?return text\[:_ONE_LINE_MAX\]\n",
-                  src, re.S)
-    assert m, "the one-line helper is gone; the turn record can break in two again"
+    # Anchored on the helper itself, not on what happens to sit above it: the
+    # loader broke the moment another function was inserted between the
+    # constant and the def, and a test that fails for the wrong reason teaches
+    # nothing.
+    const = re.search(r"_ONE_LINE_MAX = \d+", src)
+    body = re.search(r"def _one_line.*?return text\[:_ONE_LINE_MAX\]\n", src, re.S)
+    assert const and body, ("the one-line helper is gone; the turn record can "
+                            "break in two again")
+    source = const.group(0) + "\n\n\n" + body.group(0)
     ns = {}
-    exec(compile(m.group(0), "<turn_finalizer>", "exec"), ns)
+    exec(compile(source, "<turn_finalizer>", "exec"), ns)
     return ns["_one_line"], src
 
 

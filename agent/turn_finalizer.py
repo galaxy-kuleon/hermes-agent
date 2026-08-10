@@ -30,6 +30,17 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 _ONE_LINE_MAX = 300
 
 
+def _id_safe_session(value) -> str:
+    """A single opaque token, whatever the caller supplied.
+
+    The record is whitespace-delimited key=value; a session id containing a
+    space is therefore not one field but several, and the extra fields are
+    attacker-chosen. Percent-encoding keeps it one token and stays injective.
+    """
+    from urllib.parse import quote
+    return quote(str(value if value is not None else ""), safe="") or "none"
+
+
 def _one_line(value) -> str:
     """Collapse anything that must sit in a one-line structured record.
 
@@ -212,7 +223,12 @@ def finalize_turn(
         _turn_tool_count, _one_line(_last_msg_role), _resp_len,
         # model, session and last_tool were left uncollapsed: any of them can
         # split the record just as the reason did. Round 17.
-        _one_line(agent.session_id or "none"),
+        #
+        # And the session id is encoded, not merely un-newlined: it is
+        # caller-supplied on some routes, and a space in it ended the
+        # session=(\S+) capture early, letting the rest inject a fake
+        # `uid=`/`chat=` pair ahead of the genuine one. Round 18.
+        _id_safe_session(agent.session_id or "none"),
     )
 
     if _last_msg_role == "tool" and not interrupted:
