@@ -27,6 +27,21 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+_ONE_LINE_MAX = 300
+
+
+def _one_line(value) -> str:
+    """Collapse anything that must sit in a one-line structured record.
+
+    Newlines and carriage returns become a literal marker rather than breaking
+    the record in two, and the result is bounded so a stack trace cannot push
+    the counters past a log-line limit.
+    """
+    text = str(value)
+    text = text.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+    return text[:_ONE_LINE_MAX]
+
+
 def finalize_turn(
     agent,
     *,
@@ -170,7 +185,13 @@ def finalize_turn(
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
+        # A structured record must be ONE line. The reason can come from
+        # str(exception), and a newline in it split this record before its
+        # model, counters, response length and session -- so neither physical
+        # line parsed, the failure was absent from the ledger, and the cursor
+        # acknowledged it anyway. Same high-value error_near_max_iterations
+        # family whose spaces were fixed in round 7. Proved round 15.
+        _one_line(_turn_exit_reason), agent.model, api_call_count, agent.max_iterations,
         _budget_used, _budget_max,
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",
