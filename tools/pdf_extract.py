@@ -17,14 +17,17 @@ so the agent wandered (soc_v2 convert, vision, browser) and never answered.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
 from tools.read_extract import ExtractionError
 
 # docling endpoint — shared with the OpenWebUI RAG docling integration.
+_log = logging.getLogger(__name__)
 _DOCLING_URL = os.environ.get("DOCLING_SERVER_URL", "http://docling:5001").rstrip("/")
 _DOCLING_CONVERT_PATH = "/v1/convert/file"
 # Named tunables (constants, not magic values). Env overrides for deployment.
@@ -140,11 +143,20 @@ def extract_pdf_text(path) -> str:
         headers={"Content-Type": f"multipart/form-data; boundary={_MULTIPART_BOUNDARY}"},
         method="POST",
     )
+    _waited = time.monotonic()
     if not _docling_slots.acquire(timeout=_DOCLING_QUEUE_WAIT_SECONDS):
+        _log.warning("sidecar_busy service=docling waited=%.1fs outcome=shed",
+                     time.monotonic() - _waited)
         raise ExtractionError(
             "docling is busy: no conversion slot within "
             f"{int(_DOCLING_QUEUE_WAIT_SECONDS)}s"
         )
+    _queued = time.monotonic() - _waited
+    if _queued > 1.0:
+        # A queue wait this long used to be spent inside the request timeout, so
+        # work that was never slow failed for having been queued (measured
+        # 2026-08-08: 44.2s of work, 96.3s elapsed). Now it is recorded instead.
+        _log.info("sidecar_queued service=docling waited=%.1fs bytes=%d", _queued, size)
     try:
         with urllib.request.urlopen(req, timeout=_timeout_for(size)) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))

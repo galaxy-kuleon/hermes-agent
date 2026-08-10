@@ -22,6 +22,7 @@ new failure mode.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import tempfile
@@ -34,6 +35,7 @@ SOFFICE_TIMEOUT_ENV = "HERMES_SOFFICE_TIMEOUT_SECONDS"
 DEFAULT_SOFFICE_TIMEOUT_SECONDS = 120
 # A legacy document large enough to exceed this is not something a chat turn can
 # usefully consume, and the conversion would dominate the turn's latency.
+_log = logging.getLogger(__name__)
 MAX_LEGACY_BYTES_ENV = "HERMES_SOFFICE_MAX_BYTES"
 # A busy sidecar is not a broken document. 503 is the shed-load signal the
 # soffice sidecar emits when every conversion slot is taken; 502/504 are the
@@ -138,6 +140,14 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
             status_code = getattr(response, "status_code", None)
             if status_code in RETRYABLE_STATUS and attempt < RETRY_ATTEMPTS:
                 last_detail = f"HTTP {status_code} (busy)"
+                # M3 failure-at-source. On 2026-08-08 nine of a user's eleven
+                # case authorities were shed with HTTP 503 in 0.0s and the only
+                # trace was "unreadable" in the answer; the incident had to be
+                # reproduced by hand to be seen at all. Name is a filename, so
+                # only its extension is logged.
+                _log.warning(
+                    "sidecar_busy service=soffice status=%s attempt=%d/%d ext=%s",
+                    status_code, attempt, RETRY_ATTEMPTS, source.suffix.lower())
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
                 continue
             response.raise_for_status()
