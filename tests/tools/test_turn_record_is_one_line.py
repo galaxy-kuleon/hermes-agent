@@ -59,6 +59,22 @@ class TurnRecordStaysOneLineTests(unittest.TestCase):
     def test_a_stack_trace_cannot_push_the_counters_off_the_line(self):
         self.assertLessEqual(len(self.one_line("A" * 5000)), 300)
 
+    def test_the_session_id_is_ONE_token_whatever_the_caller_sends(self):
+        """It is caller-supplied on some routes, and the record is
+        whitespace-delimited key=value: a space in it turns the rest of the id
+        into attacker-chosen fields, including a uid/chat pair ahead of the
+        genuine one. Round 18."""
+        src = self.src
+        m = re.search(r"def _id_safe_session.*?safe=\"\"\) or \"none\"\n", src, re.S)
+        self.assertTrue(m, "the session id is no longer encoded to one token")
+        ns = {}
+        exec(compile(m.group(0), "<turn_finalizer>", "exec"), ns)
+        encoded = ns["_id_safe_session"]("opaque uid=1111 chat=victim")
+        self.assertNotIn(" ", encoded)
+        self.assertNotIn("=", encoded)
+        self.assertIn("_id_safe_session(agent.session_id", src,
+                      "the emitter no longer encodes the session id")
+
     def test_the_emitter_actually_uses_it(self):
         """A helper nobody calls protects nothing."""
         self.assertIn("_one_line(_turn_exit_reason)", self.src,
