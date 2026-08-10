@@ -146,7 +146,8 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
                 # reproduced by hand to be seen at all. Name is a filename, so
                 # only its extension is logged.
                 _log.warning(
-                    "sidecar_busy service=soffice status=%s attempt=%d/%d ext=%s",
+                    "sidecar_busy service=soffice status=%s attempt=%d/%d ext=%s "
+                    "outcome=retry",
                     status_code, attempt, RETRY_ATTEMPTS, source.suffix.lower())
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
                 continue
@@ -160,12 +161,27 @@ def convert_to_ooxml(path: str) -> tuple[str, str]:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             last_detail = f"{type(exc).__name__}{f' HTTP {status}' if status else ''}"
             if status in RETRYABLE_STATUS and attempt < RETRY_ATTEMPTS:
+                _log.warning(
+                    "sidecar_busy service=soffice status=%s attempt=%d/%d ext=%s "
+                    "outcome=retry", status, attempt, RETRY_ATTEMPTS,
+                    source.suffix.lower())
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
                 continue
+            # The terminal failure -- the one that actually costs the user the
+            # document -- emitted nothing at all, because the only log sat
+            # behind `attempt < RETRY_ATTEMPTS`. The last 503 is precisely the
+            # one worth a record. Proved by adversarial review 2026-08-10.
+            _log.warning(
+                "sidecar_failed service=soffice status=%s attempts=%d ext=%s "
+                "outcome=gave_up kind=%s", status, attempt, source.suffix.lower(),
+                type(exc).__name__)
             raise ExtractionError(
                 f"soffice conversion failed for {source.name}: {last_detail}"
             ) from exc
     if payload is None:
+        _log.warning(
+            "sidecar_failed service=soffice attempts=%d ext=%s outcome=exhausted",
+            RETRY_ATTEMPTS, source.suffix.lower())
         raise ExtractionError(
             f"soffice conversion failed for {source.name}: {last_detail} "
             f"after {RETRY_ATTEMPTS} attempts"

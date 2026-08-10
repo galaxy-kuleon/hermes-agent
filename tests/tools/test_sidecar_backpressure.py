@@ -78,6 +78,23 @@ class SofficeBusyIsNotBrokenTests(unittest.TestCase):
         self.assertIn("503", message,
                       f"a busy sidecar must be distinguishable from a crashed one: {message}")
 
+    def test_the_TERMINAL_503_leaves_a_record(self):
+        """The shed that actually costs the user the document.
+
+        The only log sat behind `attempt < RETRY_ATTEMPTS`, so the last 503 --
+        the one that returns "unreadable" to the user -- emitted nothing at
+        all. Proved by adversarial review 2026-08-10.
+        """
+        with patch.object(legacy_office, "RETRY_BACKOFF_SECONDS", 0):
+            with patch("requests.post", return_value=_Resp(503)):
+                with self.assertLogs(legacy_office._log, level="WARNING") as caught:
+                    with self.assertRaises(ExtractionError):
+                        legacy_office.convert_to_ooxml(self.path)
+        text = "\n".join(caught.output)
+        self.assertIn("sidecar_failed service=soffice", text)
+        self.assertNotIn(os.path.basename(self.path), text,
+                         "a client filename must never reach the log")
+
     def test_a_400_is_not_retried(self):
         """A rejected document is a real answer; retrying it wastes the turn."""
         calls = []
@@ -164,6 +181,44 @@ class DoclingQueuesOutsideTheTimeoutTests(unittest.TestCase):
                         pdf_extract.extract_pdf_text(self.path)
         self.assertTrue(pdf_extract._docling_slots.acquire(timeout=1),
                         "slots were leaked by the failure path")
+        pdf_extract._docling_slots.release()
+
+    def test_a_slot_is_released_when_the_LOGGER_fails(self):
+        """The old test patched only urlopen, which sits inside the try.
+
+        Everything between a successful acquire and the `try` leaked the slot,
+        and a logging handler raising is ordinary Python. Proved by adversarial
+        review 2026-08-10 with a mutation probe: acquired=1, released=0. Two
+        docling slots leak permanently and every later read waits the full
+        queue budget for a slot that will never come back.
+        """
+        with patch.object(pdf_extract, "_DOCLING_QUEUE_WAIT_SECONDS", 1.0):
+            with patch.object(pdf_extract._log, "info",
+                              side_effect=RuntimeError("handler blew up")):
+                with patch.object(pdf_extract, "time") as fake_time:
+                    # Force the >1.0s branch so the logger is reached at all.
+                    fake_time.monotonic.side_effect = [0.0, 99.0] * 8
+                    with patch("urllib.request.urlopen", side_effect=OSError("boom")):
+                        for _ in range(pdf_extract._DOCLING_MAX_INFLIGHT + 2):
+                            with self.assertRaises(ExtractionError):
+                                pdf_extract.extract_pdf_text(self.path)
+        self.assertTrue(pdf_extract._docling_slots.acquire(timeout=1),
+                        "a raising log handler leaked the slot")
+        pdf_extract._docling_slots.release()
+
+    def test_a_slot_is_released_when_the_CLOCK_fails(self):
+        """Same gap, the other statement in it."""
+        with patch.object(pdf_extract, "_DOCLING_QUEUE_WAIT_SECONDS", 1.0):
+            with patch.object(pdf_extract, "time") as fake_time:
+                # First call (before acquire) fine, second raises -- exactly
+                # the post-acquire, pre-try window.
+                fake_time.monotonic.side_effect = [0.0, RuntimeError("clock")] * 8
+                with patch("urllib.request.urlopen", side_effect=OSError("boom")):
+                    for _ in range(pdf_extract._DOCLING_MAX_INFLIGHT + 2):
+                        with self.assertRaises(Exception):
+                            pdf_extract.extract_pdf_text(self.path)
+        self.assertTrue(pdf_extract._docling_slots.acquire(timeout=1),
+                        "a raising clock leaked the slot")
         pdf_extract._docling_slots.release()
 
 

@@ -151,25 +151,44 @@ def extract_pdf_text(path) -> str:
             "docling is busy: no conversion slot within "
             f"{int(_DOCLING_QUEUE_WAIT_SECONDS)}s"
         )
-    _queued = time.monotonic() - _waited
-    if _queued > 1.0:
-        # A queue wait this long used to be spent inside the request timeout, so
-        # work that was never slow failed for having been queued (measured
-        # 2026-08-08: 44.2s of work, 96.3s elapsed). Now it is recorded instead.
-        _log.info("sidecar_queued service=docling waited=%.1fs bytes=%d", _queued, size)
+    # The try MUST open on the statement immediately after a successful
+    # acquire. A clock call and a log call used to sit in the gap, and either
+    # can raise -- a logging handler throwing is ordinary Python -- leaking a
+    # slot permanently out of the two docling has. Proved by adversarial review
+    # 2026-08-10 with a mutation probe: acquired=1, released=0.
     try:
-        with urllib.request.urlopen(req, timeout=_timeout_for(size)) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception as exc:  # URLError, timeout, JSON error — all fail closed to fallback
-        raise ExtractionError(f"docling PDF extraction failed: {exc}") from exc
+        try:
+            _queued = time.monotonic() - _waited
+            if _queued > 1.0:
+                # A queue wait this long used to be spent inside the request
+                # timeout, so work that was never slow failed for having been
+                # queued (measured 2026-08-08: 44.2s of work, 96.3s elapsed).
+                _log.info("sidecar_queued service=docling waited=%.1fs bytes=%d",
+                          _queued, size)
+        except Exception:  # observability must not cost the user their document
+            pass
+        try:
+            with urllib.request.urlopen(req, timeout=_timeout_for(size)) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as exc:  # URLError, timeout, JSON error — fail closed
+            # Every failure leaves a record where it happens, not just the
+            # busy one: "which layer, with what status" is the question, and
+            # a timeout answers it as much as a 503 does.
+            _log.warning("sidecar_failed service=docling outcome=error kind=%s bytes=%d",
+                         type(exc).__name__, size)
+            raise ExtractionError(f"docling PDF extraction failed: {exc}") from exc
     finally:
         _docling_slots.release()
 
     if payload.get("status") != "success":
+        _log.warning("sidecar_failed service=docling outcome=not_success bytes=%d", size)
         raise ExtractionError(f"docling did not succeed: {payload.get('errors')!r}")
     doc = payload.get("document") or {}
     text = doc.get("md_content") or doc.get("text_content") or ""
     if not text.strip():
+        # The user sees "unreadable" for a scan with no OCR text. That is a
+        # different failure from a busy sidecar and must not read the same.
+        _log.warning("sidecar_failed service=docling outcome=no_text bytes=%d", size)
         raise ExtractionError(
             "PDF produced no extractable text (image-only scan without OCR text?)"
         )
