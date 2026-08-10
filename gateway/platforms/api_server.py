@@ -2631,6 +2631,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+        # Bind the journey here too. This route family is unused today (zero
+        # calls in the retained ledger) but an unbound route records every
+        # failure anonymously, and "nobody uses it yet" is how a blind spot
+        # becomes permanent. Proved by adversarial review round 14.
+        try:
+            from tools.journey_context import set_journey
+            set_journey(
+                _sanitize_owui_id(request.headers.get("X-OpenWebUI-User-Id", "")),
+                request.match_info.get("session_id", ""),
+            )
+        except Exception:
+            logger.debug("could not bind journey context", exc_info=True)
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -2676,6 +2688,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        # Bind the journey here too. This route family is unused today (zero
+        # calls in the retained ledger) but an unbound route records every
+        # failure anonymously, and "nobody uses it yet" is how a blind spot
+        # becomes permanent. Proved by adversarial review round 14.
+        try:
+            from tools.journey_context import set_journey
+            set_journey(
+                _sanitize_owui_id(request.headers.get("X-OpenWebUI-User-Id", "")),
+                request.match_info.get("session_id", ""),
+            )
+        except Exception:
+            logger.debug("could not bind journey context", exc_info=True)
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
