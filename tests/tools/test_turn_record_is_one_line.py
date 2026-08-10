@@ -39,6 +39,17 @@ class TurnRecordStaysOneLineTests(unittest.TestCase):
         self.assertNotIn("\r", got)
         self.assertIn("error_near_max_iterations", got)
 
+    def test_NOTHING_python_treats_as_a_line_break_can_split_it(self):
+        """The collector frames with str.splitlines(), which splits on far more
+        than CR/LF. The collapse is defined as the inverse of that framing, so
+        this enumerates the whole set rather than the ones I thought of."""
+        for ch in ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e",
+                   "\x85", "\u2028", "\u2029"):
+            with self.subTest(ch=repr(ch)):
+                got = self.one_line(f"error_near_max_iterations(a{ch}b)")
+                self.assertEqual(len(got.splitlines()), 1,
+                                 f"{ch!r} still splits the turn record in two")
+
     def test_a_stack_trace_cannot_push_the_counters_off_the_line(self):
         self.assertLessEqual(len(self.one_line("A" * 5000)), 300)
 

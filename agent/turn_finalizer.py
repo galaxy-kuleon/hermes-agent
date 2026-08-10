@@ -33,12 +33,18 @@ _ONE_LINE_MAX = 300
 def _one_line(value) -> str:
     """Collapse anything that must sit in a one-line structured record.
 
-    Newlines and carriage returns become a literal marker rather than breaking
-    the record in two, and the result is bounded so a stack trace cannot push
-    the counters past a log-line limit.
+    The collector frames docker output with ``str.splitlines()``, which splits
+    on far more than CR/LF -- VT, FF, FS, GS, RS, NEL, U+2028, U+2029. So the
+    collapse is defined as the exact inverse of that framing rather than as a
+    list of characters I happened to think of: join what splitlines() would
+    have separated. If splitlines() yields one element, no split can occur.
+    Round 15 collapsed only CR/LF; round 16 proved the rest still split the
+    record before its model, counters, response length and session.
+
+    Bounded too, so a stack trace cannot push the counters past a log-line
+    limit.
     """
-    text = str(value)
-    text = text.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+    text = " | ".join(str(value).splitlines()) or ""
     return text[:_ONE_LINE_MAX]
 
 

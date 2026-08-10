@@ -43,11 +43,22 @@ _JOURNEY_CHAT: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+def _id_safe(value: str) -> str:
+    """Ids must survive a whitespace-delimited log record.
+
+    The ledger reads these back as `key=value` with a non-space value, so an id
+    carrying a space -- reachable on the session-chat route grammar -- would
+    truncate the correlation to its first word and quietly attach the failure
+    to a shorter, wrong id. Proved by adversarial review round 16.
+    """
+    return "_".join(str(value or "").split()) or ""
+
+
 def set_journey(uid: str, chat: str) -> None:
     """Bind the current context to a user's conversation. Never raises."""
     try:
-        _JOURNEY_UID.set(uid or "")
-        _JOURNEY_CHAT.set(chat or "")
+        _JOURNEY_UID.set(_id_safe(uid))
+        _JOURNEY_CHAT.set(_id_safe(chat))
     except Exception:  # pragma: no cover - a correlator must never break a turn
         pass
 
