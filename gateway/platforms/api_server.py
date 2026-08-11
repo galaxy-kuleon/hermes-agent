@@ -3650,6 +3650,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 except (asyncio.CancelledError, Exception):
                     pass
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+        except asyncio.CancelledError:
+            # THE truncation cause, proved by reproduction 2026-08-11.
+            # CancelledError is a BaseException, not an Exception, so it walked
+            # straight past every handler below after prepare() had already
+            # committed the chunked framing. aiohttp then force-closes the
+            # transport without finish_response()/write_eof(), and the client
+            # sees exactly "Not enough data to satisfy transfer length header"
+            # -- an answer that stops dead with no explanation. A control
+            # RuntimeError did not truncate; only cancellation did.
+            #
+            # Reachable in production: docker reports StopTimeout=1 for this
+            # container while aiohttp's graceful shutdown allows 60s, so any
+            # stream still running one second after a stop is cancelled.
+            #
+            # Terminate the body honestly, then RE-RAISE: swallowing
+            # cancellation would break asyncio's contract and leave the task
+            # looking alive.
+            from tools.journey_context import journey_suffix as _js0
+            logger.error(
+                "stream_aborted service=gateway phase=cancelled error=CancelledError"
+                + _js0())
+            try:
+                await response.write(
+                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
+                )
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+            except Exception:
+                pass
+            raise
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
