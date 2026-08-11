@@ -2699,9 +2699,19 @@ class AIAgent:
             return ""
         reason = str(turn_exit_reason)
 
-        # Normal completion — stay quiet.  ``text_response(...)`` is the
-        # healthy terminal; anything that produced a real reply is fine.
+        # The explicit silent set. Everything NOT in it gets a message.
+        #   text_response(...)  -- the healthy terminal; a terse "Done." must
+        #                          not sprout a warning.
+        #   guardrail_halt      -- already streams its own halt message to the
+        #                          client (conversation_loop.py sets
+        #                          final_response from the halt decision), so a
+        #                          second explanation would talk over it.
+        #   interrupted_by_user -- the user stopped it on purpose, and the
+        #                          finalizer's `if not interrupted` gate means
+        #                          we are not normally reached at all.
         if reason.startswith("text_response"):
+            return ""
+        if reason in ("guardrail_halt", "interrupted_by_user"):
             return ""
 
         prefix = "⚠️ No reply: "
@@ -2769,9 +2779,27 @@ class AIAgent:
                 "the model produced no follow-up text. Send `continue` to "
                 "let it summarize."
             )
-        # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
-        # which already surfaces its own message) — don't second-guess.
-        return ""
+        # Everything else, INCLUDING "unknown" and any reason added later
+        # that nobody wired up here.
+        #
+        # This used to return "" with the note "don't second-guess". That
+        # protects against naming a wrong cause, but it pays for it with the
+        # exact defect this function exists to fix: the caller only consults us
+        # when `final_response` is empty or a truncated fragment, so silence
+        # here IS the blank box from #34452. A sentence that names no cause is
+        # not second-guessing -- it says what happened and admits what we do
+        # not know, which is strictly more than nothing.
+        #
+        # The polarity is deliberate: the silent cases are an explicit list,
+        # and anything unrecognised speaks. "unknown" is the initial value, so
+        # any exit path nobody anticipated lands there -- the same
+        # subtract-what-you-thought-of shape that has bitten this codebase
+        # repeatedly.
+        return (
+            prefix
+            + "the turn ended without producing an answer, and the reason was "
+            "not recorded. Send `continue` to retry."
+        )
 
     def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""

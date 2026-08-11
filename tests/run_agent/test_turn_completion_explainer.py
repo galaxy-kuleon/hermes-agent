@@ -71,11 +71,44 @@ def test_explanation_quiet_for_normal_text_response():
     assert out == ""
 
 
-def test_explanation_quiet_for_empty_reason():
+def test_silence_is_an_explicit_list():
+    """Only these stay quiet. Everything else speaks.
+
+    This assertion used to include "unknown", on the reasoning "don't
+    second-guess". The formatter is only consulted when `final_response` is
+    empty or a truncated fragment, so silence there IS the blank box #34452
+    exists to fix, and "unknown" is the INITIAL value -- every exit path nobody
+    anticipated lands on it. A sentence that names no cause is not a guess.
+    Reversed deliberately 2026-08-12; see the comment at the formatter's tail.
+    """
     assert AIAgent._format_turn_completion_explanation("") == ""
-    assert AIAgent._format_turn_completion_explanation("unknown") == ""
-    # guardrail_halt surfaces its own message; explainer stays out of the way.
+    # A terse healthy answer must not sprout a warning.
+    assert AIAgent._format_turn_completion_explanation(
+        "text_response(finish_reason=stop)") == ""
+    # guardrail_halt streams its own halt message; a second one talks over it.
     assert AIAgent._format_turn_completion_explanation("guardrail_halt") == ""
+    # the user stopped it on purpose.
+    assert AIAgent._format_turn_completion_explanation("interrupted_by_user") == ""
+
+
+def test_unknown_reason_still_tells_the_user_something():
+    out = AIAgent._format_turn_completion_explanation("unknown")
+    assert out, "an unrecorded reason must not leave the user with a blank box"
+    assert "not recorded" in out
+    assert "continue" in out.lower()
+
+
+def test_a_reason_nobody_wired_up_still_speaks():
+    """The failure shape this codebase keeps repeating: a name nobody listed.
+
+    The reason is generated at run time, so it cannot be in any map here or in
+    production -- exactly the case that used to fall through to silence.
+    """
+    import uuid
+    canary = "exit_" + uuid.uuid4().hex[:12]
+    out = AIAgent._format_turn_completion_explanation(canary)
+    assert out, f"an unanticipated reason ({canary}) fell through to silence"
+    assert canary not in out, "the internal reason must not be shown to the user"
 
 
 def test_explanation_for_empty_response_exhausted():
