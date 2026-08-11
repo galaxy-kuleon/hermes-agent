@@ -3430,7 +3430,11 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _write_content_delta(text: str) -> None:
                 """Send ``text`` using the shared checked content encoder."""
                 await response.write(_encode_content_delta(text))
-                _wire["content"] = True
+                if (text or "").strip():
+                    # "Wrote any string" is not "the user received something
+                    # readable": a whitespace-only delta suppressed the
+                    # fallback and still presented as an empty box.
+                    _wire["content"] = True
 
             def _encode_tool_progress_event(event_data: str) -> bytes:
                 return (
@@ -3620,6 +3624,25 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 if not _wire["content"]:
                     _late = ((result or {}).get("final_response") or "").strip()
+                    # final_response is user-facing by convention, not by
+                    # invariant -- producers can put raw provider or internal
+                    # error text in it, and this path is the one place it would
+                    # reach a user unreviewed. Anything that looks like a
+                    # traceback or an internal dump is replaced by an honest
+                    # sentence rather than shown. Proved reachable by QA review
+                    # 2026-08-11.
+                    _looks_internal = any(
+                        marker in _late
+                        for marker in ("Traceback (most recent call last)",
+                                       'File "/opt/hermes', "  File \"",
+                                       "openai.", "aiohttp.", "asyncio.")
+                    )
+                    if _late and _looks_internal:
+                        logger.warning(
+                            "empty_reply service=gateway reason=internal_text_withheld"
+                            + _journey_suffix_safe())
+                        _late = ("The agent stopped without producing an answer. "
+                                 "Nothing was saved; please try again.")
                     if _late:
                         await response.write(_encode_content_delta(_late))
                         _wire["content"] = True
@@ -3722,7 +3745,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
-            except Exception:
+            except BaseException:
+                # The terminator's own awaits are cancellable. A second
+                # cancellation while writing it escaped `except Exception` and
+                # reproduced the very truncation this handler exists to
+                # prevent. Proved by QA review 2026-08-11.
                 pass
             raise
         except Exception as _exc:
@@ -3772,7 +3799,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
-            except Exception:
+            except BaseException:
+                # The terminator's own awaits are cancellable. A second
+                # cancellation while writing it escaped `except Exception` and
+                # reproduced the very truncation this handler exists to
+                # prevent. Proved by QA review 2026-08-11.
                 pass
             raise
 
