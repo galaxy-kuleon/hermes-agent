@@ -3655,7 +3655,17 @@ class APIServerAdapter(BasePlatformAdapter):
             # so the client gets a proper response instead of a
             # TransferEncodingError from incomplete chunked encoding.
             import traceback as _tb
-            logger.error("Agent crashed mid-stream for %s: %s", completion_id, _tb.format_exc()[:300])
+            # stream_aborted, with the journey. This is the failure class that
+            # actually reaches users as a blank screen, and it was invisible to
+            # the journey ledger: it carried only a completion_id, and a
+            # traceback spans lines, so the record broke in two. Found
+            # 2026-08-11 while root-causing 23 real blank replies.
+            from tools.journey_context import journey_suffix as _js
+            logger.error(
+                "stream_aborted service=gateway phase=mid_stream error=%s" + _js(),
+                type(_exc).__name__)
+            logger.error("Agent crashed mid-stream for %s: %s", completion_id,
+                         " | ".join(_tb.format_exc()[:300].splitlines()))
             try:
                 error_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
@@ -4276,7 +4286,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             except Exception:
                 pass
-            logger.error("Agent crashed mid-stream for %s: %s", response_id, str(agent_error)[:300])
+            from tools.journey_context import journey_suffix as _js2
+            logger.error(
+                "stream_aborted service=gateway phase=mid_stream error=%s" + _js2(),
+                type(agent_error).__name__)
+            logger.error("Agent crashed mid-stream for %s: %s", response_id,
+                         " | ".join(str(agent_error)[:300].splitlines()))
 
         return response
 
