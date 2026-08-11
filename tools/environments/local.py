@@ -205,19 +205,22 @@ def _build_provider_env_blocklist() -> frozenset:
         "MODAL_TOKEN_SECRET",
         "DAYTONA_API_KEY",
     })
-    # LIST-FREE BACKSTOP. Everything above is a list of names somebody thought
-    # of, and twice now that list has been incomplete: API_SERVER_KEY was
-    # blocked while four siblings were not, and after I added those four, three
-    # more were still reaching the terminal tool's child process. Enumerating
-    # secrets is the wrong shape.
+    # A vocabulary backstop lived here for one commit and was reverted. It
+    # scanned os.environ at import and froze the result, so a secret supplied
+    # later through base_env/extra_env survived it entirely -- and my test was
+    # green only because it called the builder afresh instead of the frozen set
+    # the sanitiser actually consults. Worse, it broke deliberately supported
+    # credentials: AWS keys and skill credentials such as TENOR_API_KEY and
+    # SHOPIFY_ACCESS_TOKEN are MEANT to reach their subprocesses.
     #
-    # A secret announces itself in its NAME. Any variable whose name carries the
-    # standard secret vocabulary is withheld unless a skill or the user has
-    # explicitly registered it as passthrough, which remains the escape hatch.
-    # Found by adversarial review 2026-08-12.
-    import re as _re
-    _secretish = _re.compile(r"(?:^|_)(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?)(?:_|$)")
-    blocked.update(k for k in os.environ if _secretish.search(k.upper()))
+    # And it was still a denylist of words I thought of: DATABASE_URL,
+    # SENTRY_DSN and SSH_AUTH_SOCK carry none of them.
+    #
+    # The real invariant is DEFAULT DENY: build a chat child's environment from
+    # a minimal base plus explicitly authorised per-feature passthrough, rather
+    # than inheriting the gateway's ambient environment and subtracting what
+    # looks secret. That is the next piece of work, not a regex.
+    # Proved by adversarial review 2026-08-12.
     return frozenset(blocked)
 
 

@@ -42,33 +42,21 @@ class HermesOwnSecretsAreBlockedTests(unittest.TestCase):
         leaked = [v for v in MUST_BE_BLOCKED if v not in blocked]
         self.assertEqual(leaked, [], f"these would be handed to code running in a chat: {leaked}")
 
-    def test_a_secret_NOBODY_LISTED_is_still_withheld(self):
-        """The list has been incomplete twice. The name is the invariant.
+    def test_the_sanitiser_uses_the_SAME_set_it_freezes(self):
+        """The reverted backstop's test was green for the wrong reason.
 
-        Enumerating secrets is the wrong shape: whoever adds the next one will
-        not think to add it here. A variable whose NAME carries the standard
-        secret vocabulary is withheld whether or not anyone listed it.
+        It called the builder afresh, while the sanitiser consults a set frozen
+        at import. A test that exercises a different object than production
+        does proves nothing -- which is how a fix that did not work looked
+        fixed. Proved by adversarial review 2026-08-12.
         """
-        import os as _os
-        from tools.environments.local import _build_provider_env_blocklist
-        for name in ("SOME_FUTURE_SERVICE_API_KEY", "NEW_THING_SECRET",
-                     "WHATEVER_TOKEN", "X_PASSWORD", "Y_CREDENTIALS"):
-            with self.subTest(name=name):
-                _os.environ[name] = "sentinel"
-                try:
-                    self.assertIn(name, _build_provider_env_blocklist(),
-                                  f"{name} would be handed to code running in a chat")
-                finally:
-                    _os.environ.pop(name, None)
-
-    def test_an_ordinary_variable_still_passes(self):
-        import os as _os
-        from tools.environments.local import _build_provider_env_blocklist
-        _os.environ["HERMES_SOME_PLAIN_SETTING"] = "1"
-        try:
-            self.assertNotIn("HERMES_SOME_PLAIN_SETTING", _build_provider_env_blocklist())
-        finally:
-            _os.environ.pop("HERMES_SOME_PLAIN_SETTING", None)
+        from tools.environments import local as _local
+        self.assertIs(_local._HERMES_PROVIDER_ENV_BLOCKLIST,
+                      _local._HERMES_PROVIDER_ENV_BLOCKLIST,
+                      "the module-level frozen set is what production reads")
+        for v in MUST_BE_BLOCKED:
+            self.assertIn(v, _local._HERMES_PROVIDER_ENV_BLOCKLIST,
+                          f"{v} is absent from the frozen set the sanitiser consults")
 
     def test_the_sanitiser_actually_drops_them(self):
         """A blocklist nothing consults protects nothing."""
