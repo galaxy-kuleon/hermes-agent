@@ -66,7 +66,9 @@ from tools.file_reader_routing import reader_guidance
 logger = logging.getLogger(__name__)
 
 
-def emit_chat_completion_coverage_suffix(result: dict | None) -> str:
+def emit_chat_completion_coverage_suffix(
+    result: dict | None, streamed_so_far: str = ""
+) -> str:
     """Production adapter: coverage text for chat-completions SSE terminal.
 
     Mutation target (U1D all-exit gate): tests must call this function; replacing
@@ -90,12 +92,16 @@ def emit_chat_completion_coverage_suffix(result: dict | None) -> str:
             + "\n"
             + COVERAGE_INTERRUPTED_NOTE
         )
-    suffix = terminal_coverage_suffix("", result)
-    if not suffix:
-        footer = result.get("coverage_footer") or ""
-        if footer:
-            suffix = footer if str(footer).startswith("\n") else "\n" + str(footer)
-    return suffix or ""
+    # `streamed_so_far` is what the user has ALREADY been shown this turn.
+    # It was hard-coded empty, so a turn whose only output was the late
+    # explainer -- which already carries the footer -- got the footer a second
+    # time. Proved by QA review round 3, 2026-08-12.
+    #
+    # The fallback below was also deleted deliberately: terminal_coverage_suffix
+    # already handles the structured footer, the final-response fallback and
+    # dedup, and re-adding `coverage_footer` here defeated a correct empty
+    # (deduped) result -- the adapter was undoing the helper's decision.
+    return terminal_coverage_suffix(streamed_so_far or "", result) or ""
 
 
 def emit_responses_coverage_suffix(streamed_so_far: str, result: dict | None) -> str:
@@ -3454,7 +3460,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # final_response in the RESULT, and this writer never emitted the
             # result -- so the explainer fired, the text existed, and the user
             # still got an empty box.
-            _wire = {"content": False}
+            _wire = {"content": False, "text": ""}
 
             def _encode_content_delta(text: str) -> bytes:
                 """Encode the exact OpenAI ``delta.content`` bytes to be written."""
@@ -3470,6 +3476,7 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _write_content_delta(text: str) -> None:
                 """Send ``text`` using the shared checked content encoder."""
                 await response.write(_encode_content_delta(text))
+                _wire["text"] = (_wire.get("text", "") + (text or ""))[-8000:]
                 if (text or "").strip():
                     # "Wrote any string" is not "the user received something
                     # readable": a whitespace-only delta suppressed the
@@ -3700,6 +3707,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if _late:
                         await response.write(_encode_content_delta(_late))
                         _wire["content"] = True
+                        _wire["text"] = (_wire.get("text", "") + _late)[-8000:]
                         logger.info(
                             "empty_stream_recovered service=gateway chars=%d"
                             + _journey_suffix_safe(), len(_late))
@@ -3716,7 +3724,12 @@ class APIServerAdapter(BasePlatformAdapter):
             # Production adapter (mutation target): emit_chat_completion_coverage_suffix
             try:
                 suffix = emit_chat_completion_coverage_suffix(
-                    result if isinstance(result, dict) else None
+                    result if isinstance(result, dict) else None,
+                    # What the user has already been shown. On a turn whose
+                    # only output was the late explainer, that text already
+                    # carries the coverage footer, and passing "" here printed
+                    # it twice.
+                    streamed_so_far=_wire.get("text", ""),
                 )
                 if suffix:
                     cov_chunk = {
