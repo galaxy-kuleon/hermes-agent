@@ -124,6 +124,23 @@ def _build_provider_env_blocklist() -> frozenset:
         pass
 
     blocked.update({
+        # Hermes' own secrets, not a provider's. `API_SERVER_KEY` was already
+        # here -- somebody decided the gateway key must not reach code running
+        # in a chat -- but four siblings were not, and the asymmetry looks like
+        # an oversight rather than a decision. Found 2026-08-11 while reviewing
+        # the ACL Increment 2 boundary; all four are read in-process only
+        # (gateway, plugins, shared_skill_writer), so nothing spawned needs
+        # them, and `tools.env_passthrough` remains the escape hatch if that
+        # ever changes.
+        #
+        # This is DEFENCE IN DEPTH, not a fix for the escalation: the writer
+        # secret is bind-mounted from the host, where file permissions are not
+        # enforced, so code that hardcodes the path still reads it. It removes
+        # the handed-to-you version of the attack, nothing more.
+        "HERMES_SKILL_WRITER_SECRET_FILE",
+        "HERMES_SKILL_WRITER_SOCKET",
+        "SKIP_RAG_HANDOFF_SIGNING_KEY",
+        "OPENVIKING_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
         "OPENAI_API_BASE",
