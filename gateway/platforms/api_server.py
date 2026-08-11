@@ -3752,6 +3752,30 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        except BaseException as _be:
+            # The rest of the family. CancelledError was the one that hurt
+            # users, but GeneratorExit, SystemExit and KeyboardInterrupt reach
+            # this point the same way -- past `except Exception`, after the
+            # chunked framing is already committed -- and leave the body
+            # unterminated for exactly the same reason. Fixing the instance
+            # and not the class is a mistake I have made three times today.
+            #
+            # Ordered AFTER `except Exception` so the richer error path above
+            # still handles ordinary failures. Always re-raises.
+            try:
+                from tools.journey_context import journey_suffix as _js3
+                logger.error(
+                    "stream_aborted service=gateway phase=base_exception error=%s"
+                    + _js3(), type(_be).__name__)
+                await response.write(
+                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
+                )
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+            except Exception:
+                pass
+            raise
+
         return response
 
     async def _write_sse_responses(
