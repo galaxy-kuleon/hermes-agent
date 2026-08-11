@@ -261,6 +261,31 @@ def _bounded_tool_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return bounded
 
 
+async def _terminate_stream_body(response, completion_id, created, model, logger) -> None:
+    """Close the HTTP conversation, one best-effort step at a time.
+
+    Each step gets its own guard, in increasing order of importance, so a
+    cancellation while writing the finish chunk cannot cost us the `write_eof`
+    that actually terminates the chunked body. A single try around all three
+    made the second cancellation skip exactly the step that mattered.
+    """
+    import json as _json
+    steps = (
+        lambda: response.write(
+            f"data: {_json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
+        ),
+        lambda: response.write(b"data: [DONE]\n\n"),
+        lambda: response.write_eof(),
+    )
+    for step in steps:
+        try:
+            await step()
+        except BaseException:
+            # Keep going: the next step may still succeed, and write_eof is the
+            # one the client is waiting for.
+            continue
+
+
 def _journey_suffix_safe() -> str:
     try:
         from tools.journey_context import journey_suffix
@@ -3739,18 +3764,13 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.error(
                 "stream_aborted service=gateway phase=cancelled error=CancelledError"
                 + _js0())
-            try:
-                await response.write(
-                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
-                )
-                await response.write(b"data: [DONE]\n\n")
-                await response.write_eof()
-            except BaseException:
-                # The terminator's own awaits are cancellable. A second
-                # cancellation while writing it escaped `except Exception` and
-                # reproduced the very truncation this handler exists to
-                # prevent. Proved by QA review 2026-08-11.
-                pass
+            # One guard per step. Wrapping all three in a single try meant that
+            # catching a second cancellation exited the whole block and skipped
+            # `[DONE]` and -- far worse -- `write_eof()`, handing the client the
+            # exact TransferEncodingError this exists to prevent. Proved by QA
+            # review round 2, 2026-08-11.
+            await _terminate_stream_body(
+                response, completion_id, created, model, logger)
             raise
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
@@ -3794,17 +3814,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.error(
                     "stream_aborted service=gateway phase=base_exception error=%s"
                     + _js3(), type(_be).__name__)
-                await response.write(
-                    f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
-                )
-                await response.write(b"data: [DONE]\n\n")
-                await response.write_eof()
             except BaseException:
-                # The terminator's own awaits are cancellable. A second
-                # cancellation while writing it escaped `except Exception` and
-                # reproduced the very truncation this handler exists to
-                # prevent. Proved by QA review 2026-08-11.
                 pass
+            # Same per-step terminator as the cancellation branch: a single
+            # guard around all three writes let a second cancellation skip the
+            # write_eof the client is actually waiting for.
+            await _terminate_stream_body(
+                response, completion_id, created, model, logger)
             raise
 
         return response
