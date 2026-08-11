@@ -191,7 +191,14 @@ class TestChatCompletionsCoverageSuffixWire:
         # Model prose was streamed.
         assert _MODEL_PROSE in joined
         # Coverage arrived via the live suffix call (not model deltas alone).
-        assert COVERAGE_FOOTER_TITLE in joined
+        # COUNT, not presence. The Responses writer appended the footer to
+        # final_text_parts twice -- once inside _emit_text_delta and once
+        # beside it -- so the wire delta was right while output_text.done and
+        # the stored text carried it twice. `in` could not see that; this can.
+        # Proved by review 2026-08-12.
+        assert joined.count(COVERAGE_FOOTER_TITLE) == 1, (
+            f"coverage footer appears {joined.count(COVERAGE_FOOTER_TITLE)}x, expected once"
+        )
         assert _CANARY_HANDLE in joined
         # Suffix is a distinct content chunk (not only inside model prose chunk).
         assert any(
@@ -256,7 +263,14 @@ class TestResponsesCoverageSuffixWire:
         done_text = _responses_done_text(blob)
 
         assert _MODEL_PROSE in joined
-        assert COVERAGE_FOOTER_TITLE in joined
+        # COUNT, not presence. The Responses writer appended the footer to
+        # final_text_parts twice -- once inside _emit_text_delta and once
+        # beside it -- so the wire delta was right while output_text.done and
+        # the stored text carried it twice. `in` could not see that; this can.
+        # Proved by review 2026-08-12.
+        assert joined.count(COVERAGE_FOOTER_TITLE) == 1, (
+            f"coverage footer appears {joined.count(COVERAGE_FOOTER_TITLE)}x, expected once"
+        )
         assert _CANARY_HANDLE in joined
         # Distinct delta from the suffix call site (not only model prose).
         assert any(

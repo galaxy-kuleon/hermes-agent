@@ -4379,8 +4379,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         emitted_coverage_footer=emitted_coverage_footer,
                     )
                     if cov_suffix:
+                        # _emit_text_delta already appends to final_text_parts.
+                        # Appending again put the footer in the wire delta once
+                        # but TWICE in response.output_text.done and in the
+                        # stored completed text, and the green test only
+                        # asserted presence so it could not see that. Proved by
+                        # review 2026-08-12.
                         await _emit_text_delta(cov_suffix)
-                        final_text_parts.append(cov_suffix)
                 except Exception as _cov_err:
                     logger.warning("responses stream coverage emit failed: %s", _cov_err)
             except Exception as e:  # noqa: BLE001
