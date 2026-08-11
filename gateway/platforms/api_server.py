@@ -261,6 +261,14 @@ def _bounded_tool_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return bounded
 
 
+def _journey_suffix_safe() -> str:
+    try:
+        from tools.journey_context import journey_suffix
+        return journey_suffix()
+    except Exception:
+        return ""
+
+
 def _minimal_tool_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Retain lifecycle correlation when the normal bounded event is still large."""
     tool = str(payload.get("tool", ""))
@@ -3400,6 +3408,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     f'<summary>Tool Executed</summary>\n{result_body}\n</details>\n'
                 )
 
+            # Did anything the user can read actually reach the wire this turn?
+            # A dict, not a local, because the write happens inside a nested
+            # scope. Proved 2026-08-11: the turn-completion explainer replaces
+            # final_response in the RESULT, and this writer never emitted the
+            # result -- so the explainer fired, the text existed, and the user
+            # still got an empty box.
+            _wire = {"content": False}
+
             def _encode_content_delta(text: str) -> bytes:
                 """Encode the exact OpenAI ``delta.content`` bytes to be written."""
                 content_chunk = {
@@ -3414,6 +3430,7 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _write_content_delta(text: str) -> None:
                 """Send ``text`` using the shared checked content encoder."""
                 await response.write(_encode_content_delta(text))
+                _wire["content"] = True
 
             def _encode_tool_progress_event(event_data: str) -> bytes:
                 return (
@@ -3589,6 +3606,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+
+            # The missing bridge. The turn-completion explainer replaces
+            # final_response inside finalize_turn, and this writer consumed
+            # only what the live callbacks streamed -- so when a turn produced
+            # no deltas the explainer fired, its text sat in the result, and
+            # the user got an empty message box anyway. Six real users hit this
+            # in the last 30 days. The Responses-API writer in this same file
+            # already had the bridge; chat completions did not.
+            #
+            # Only when nothing readable reached the wire: a turn that streamed
+            # normally is untouched.
+            try:
+                if not _wire["content"]:
+                    _late = ((result or {}).get("final_response") or "").strip()
+                    if _late:
+                        await response.write(_encode_content_delta(_late))
+                        _wire["content"] = True
+                        logger.info(
+                            "empty_stream_recovered service=gateway chars=%d"
+                            + _journey_suffix_safe(), len(_late))
+                    else:
+                        from tools.journey_context import journey_suffix as _js1
+                        logger.warning(
+                            "empty_reply service=gateway reason=no_content_and_no_final"
+                            + _js1())
+            except Exception as _late_err:
+                logger.warning("late final_response emit failed for %s: %s",
+                               completion_id, _late_err)
 
             # M-U1-D all-exit A-channel: coverage suffix BEFORE stop/[DONE].
             # Production adapter (mutation target): emit_chat_completion_coverage_suffix
