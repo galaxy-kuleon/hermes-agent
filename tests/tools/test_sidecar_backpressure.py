@@ -91,7 +91,14 @@ class SofficeBusyIsNotBrokenTests(unittest.TestCase):
                     with self.assertRaises(ExtractionError):
                         legacy_office.convert_to_ooxml(self.path)
         text = "\n".join(caught.output)
-        self.assertIn("sidecar_failed service=soffice", text)
+        # COUNT, not presence. A terminal failure emitted twice would inflate
+        # the incident count in the journey ledger while this assertion stayed
+        # green -- the same shape as the coverage footer that was stored twice
+        # under an `in` assertion. Caught by sweeping my own new tests
+        # 2026-08-12.
+        self.assertEqual(
+            text.count("sidecar_failed service=soffice"), 1,
+            f"terminal record emitted {text.count('sidecar_failed service=soffice')}x, expected once")
         self.assertNotIn(os.path.basename(self.path), text,
                          "a client filename must never reach the log")
 
@@ -105,7 +112,9 @@ class SofficeBusyIsNotBrokenTests(unittest.TestCase):
             with self.assertLogs(legacy_office._log, level="WARNING") as caught:
                 with self.assertRaises(ExtractionError):
                     legacy_office.convert_to_ooxml(self.path)
-        self.assertIn("outcome=empty_payload", "\n".join(caught.output))
+        _t = "\n".join(caught.output)
+        self.assertEqual(_t.count("outcome=empty_payload"), 1,
+                         f"empty-200 record emitted {_t.count('outcome=empty_payload')}x, expected once")
 
     def test_a_broken_log_handler_cannot_change_what_the_user_gets(self):
         """Observability must never turn ExtractionError into RuntimeError.
