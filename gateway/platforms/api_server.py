@@ -261,6 +261,21 @@ def _bounded_tool_progress_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return bounded
 
 
+# A traceback has a shape ordinary prose does not: the header line, or an
+# indented `File "...", line N`. Matching module-name substrings instead was
+# wrong in both directions -- see the call site.
+_TRACEBACK_SHAPE_RE = re.compile(
+    r'Traceback \(most recent call last\)|^\s+File "[^"]+", line \d+',
+    re.MULTILINE,
+)
+# The second shape: a bare exception line, `SomeError: detail`, with nothing
+# before it. `AsyncOpenAIError: <internal>` slipped past the traceback shape
+# and past a hand-written module list, because it is neither -- but it does
+# have a form. Anchored to the start of the whole string so prose that merely
+# mentions an exception mid-sentence is untouched.
+_BARE_EXCEPTION_RE = re.compile(r'^[A-Za-z_][\w.]*(?:Error|Exception):\s')
+
+
 async def _terminate_stream_body(response, completion_id, created, model, logger) -> None:
     """Close the HTTP conversation, one best-effort step at a time.
 
@@ -3656,18 +3671,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     # traceback or an internal dump is replaced by an honest
                     # sentence rather than shown. Proved reachable by QA review
                     # 2026-08-11.
-                    _looks_internal = any(
-                        marker in _late
-                        for marker in ("Traceback (most recent call last)",
-                                       'File "/opt/hermes', "  File \"",
-                                       "openai.", "aiohttp.", "asyncio.")
+                    # STRUCTURE, not a list of module names I happened to
+                    # think of. The first version matched "openai.",
+                    # "aiohttp." and "asyncio." as substrings, which withheld a
+                    # legitimate answer to a Python question mentioning
+                    # `asyncio.create_task()` while letting
+                    # `AsyncOpenAIError: <internal>` straight through -- wrong
+                    # in both directions at once. Proved by QA review round 2,
+                    # 2026-08-11.
+                    #
+                    # A traceback has a shape no ordinary answer has: the
+                    # header line, or an indented `File "...", line N`. That is
+                    # the only thing claimed here, and it is best-effort: this
+                    # is a last-resort path, not a redaction boundary.
+                    _looks_internal = bool(
+                        _TRACEBACK_SHAPE_RE.search(_late)
+                        or _BARE_EXCEPTION_RE.match(_late)
                     )
                     if _late and _looks_internal:
                         logger.warning(
                             "empty_reply service=gateway reason=internal_text_withheld"
                             + _journey_suffix_safe())
-                        _late = ("The agent stopped without producing an answer. "
-                                 "Nothing was saved; please try again.")
+                        # No claim about what was or was not saved: a tool may
+                        # already have had a side effect this turn, which made
+                        # the old "Nothing was saved" simply false.
+                        _late = ("The agent stopped before it produced an answer. "
+                                 "Please check the conversation and try again.")
                     if _late:
                         await response.write(_encode_content_delta(_late))
                         _wire["content"] = True
