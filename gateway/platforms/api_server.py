@@ -42,6 +42,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -159,6 +160,9 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+# Matches /v1/runs/{id}/stop: enough for the agent's 0.3s interrupt polling
+# and existing 2s transport joins, while leaving 25s of Docker's 30s grace.
+SSE_AGENT_CANCEL_DRAIN_SECONDS = 5.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 TOOL_PROGRESS_SSE_LINE_MAX_BYTES = 65_536
@@ -280,6 +284,79 @@ _TRACEBACK_SHAPE_RE = re.compile(
 # have a form. Anchored to the start of the whole string so prose that merely
 # mentions an exception mid-sentence is untouched.
 _BARE_EXCEPTION_RE = re.compile(r'^[A-Za-z_][\w.]*(?:Error|Exception):\s')
+
+
+async def _stop_cancelled_sse_agent(
+    agent_task,
+    agent_ref,
+    agent_cancel_event,
+    completion_id: str,
+) -> None:
+    """Cooperatively stop and bounded-drain this request's agent task."""
+    # Publish cancellation before consulting agent_ref. If cancellation wins the
+    # startup race, _run_agent sees this event immediately after publishing the
+    # newly-created agent and interrupts it before run_conversation starts.
+    if agent_cancel_event is not None:
+        agent_cancel_event.set()
+
+    agent = agent_ref[0] if agent_ref else None
+    if agent is not None:
+        try:
+            agent.interrupt("SSE handler cancelled")
+        except Exception as exc:
+            logger.warning(
+                "sse_agent_interrupt_failed service=gateway completion_id=%s "
+                "error=%s" + _journey_suffix_safe(),
+                completion_id,
+                type(exc).__name__,
+            )
+
+    # Retrieve an already-completed task's result/exception; do not leave an
+    # asyncio warning behind while the enclosing handler re-raises cancellation.
+    if agent_task.done():
+        try:
+            agent_task.result()
+        except BaseException:
+            pass
+        return
+
+    cancel_wrapper = False
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(agent_task),
+            timeout=SSE_AGENT_CANCEL_DRAIN_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        cancel_wrapper = True
+        logger.warning(
+            "sse_agent_drain_timeout service=gateway completion_id=%s "
+            "timeout_seconds=%.1f executor_worker_may_still_be_unwinding=true"
+            + _journey_suffix_safe(),
+            completion_id,
+            SSE_AGENT_CANCEL_DRAIN_SECONDS,
+        )
+    except BaseException as exc:
+        # This also handles a second cancellation of the SSE handler. If the
+        # child finished, awaiting it already retrieved its exception. Otherwise
+        # ownership still requires us to cancel and drain the asyncio wrapper.
+        cancel_wrapper = not agent_task.done()
+        if cancel_wrapper:
+            logger.warning(
+                "sse_agent_drain_aborted service=gateway completion_id=%s "
+                "error=%s" + _journey_suffix_safe(),
+                completion_id,
+                type(exc).__name__,
+            )
+
+    if cancel_wrapper:
+        # This cancels the asyncio wrapper, not the executor thread. The
+        # cooperative interrupt above is what stops run_conversation; the thread
+        # may still finish a synchronous persistence write already in progress.
+        agent_task.cancel()
+        try:
+            await agent_task
+        except BaseException:
+            pass
 
 
 async def _terminate_stream_body(response, completion_id, created, model, logger) -> None:
@@ -3178,6 +3255,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            agent_cancel_event = threading.Event()
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -3188,6 +3266,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 reasoning_callback=_on_reasoning,
                 agent_ref=agent_ref,
+                agent_cancel_event=agent_cancel_event,
                 gateway_session_key=gateway_session_key,
                 user_id=user_id,
                 chat_id=chat_id,
@@ -3204,6 +3283,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                agent_cancel_event=agent_cancel_event,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -3330,7 +3410,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
+        gateway_session_key: str = None, agent_cancel_event=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -3813,6 +3893,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # review round 2, 2026-08-11.
             await _terminate_stream_body(
                 response, completion_id, created, model, logger)
+            await _stop_cancelled_sse_agent(
+                agent_task, agent_ref, agent_cancel_event, completion_id)
             raise
         except Exception as _exc:
             # Agent crashed mid-stream.  Try to emit an error chunk
@@ -5326,6 +5408,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         reasoning_callback=None,
         agent_ref: Optional[list] = None,
+        agent_cancel_event=None,
         gateway_session_key: Optional[str] = None,
         user_id: Optional[str] = None,
         chat_id: Optional[str] = None,
@@ -5398,6 +5481,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
+                if agent_cancel_event is not None and agent_cancel_event.is_set():
+                    agent.interrupt(
+                        "SSE handler cancelled before agent startup completed")
                 effective_task_id = session_id or str(uuid.uuid4())
                 if granted_file_paths is None:
                     result = agent.run_conversation(
