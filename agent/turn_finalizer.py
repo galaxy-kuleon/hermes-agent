@@ -398,12 +398,11 @@ def finalize_turn(
             if _cov_is_active(effective_task_id):
                 _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
                 text = final_response or ""
-                if "## Attachment coverage" not in text:
-                    final_response = (
-                        (text.rstrip() + "\n" + _coverage_footer)
-                        if text
-                        else _coverage_footer
-                    )
+                final_response = (
+                    (text.rstrip() + "\n" + _coverage_footer)
+                    if text
+                    else _coverage_footer
+                )
                 _coverage_status = "unavailable"
                 _persistent_body = final_response
         except Exception:

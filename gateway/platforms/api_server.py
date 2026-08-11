@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 
 def emit_chat_completion_coverage_suffix(
-    result: dict | None, streamed_so_far: str = ""
+    result: dict | None, emitted_coverage_footer: str | None = None
 ) -> str:
     """Production adapter: coverage text for chat-completions SSE terminal.
 
@@ -93,26 +93,20 @@ def emit_chat_completion_coverage_suffix(
             + "\n"
             + COVERAGE_INTERRUPTED_NOTE
         )
-    # `streamed_so_far` is what the user has ALREADY been shown this turn.
-    # It was hard-coded empty, so a turn whose only output was the late
-    # explainer -- which already carries the footer -- got the footer a second
-    # time. Proved by QA review round 3, 2026-08-12.
-    #
-    # The fallback below was also deleted deliberately: terminal_coverage_suffix
-    # already handles the structured footer, the final-response fallback and
-    # dedup, and re-adding `coverage_footer` here defeated a correct empty
-    # (deduped) result -- the adapter was undoing the helper's decision.
-    return terminal_coverage_suffix(streamed_so_far or "", result) or ""
+    return terminal_coverage_suffix(
+        result, emitted_coverage_footer=emitted_coverage_footer
+    ) or ""
 
 
-def emit_responses_coverage_suffix(streamed_so_far: str, result: dict | None) -> str:
+def emit_responses_coverage_suffix(
+    result: dict | None, emitted_coverage_footer: str | None = None
+) -> str:
     """Production adapter: coverage text for Responses SSE terminal.
 
     Mutation target: same as emit_chat_completion_coverage_suffix.
     """
     from tools.attachment_ledger import (
         COVERAGE_INTERRUPTED_NOTE,
-        COVERAGE_UNAVAILABLE_BEGIN,
         COVERAGE_UNAVAILABLE_TEXT,
         terminal_coverage_suffix,
     )
@@ -121,15 +115,15 @@ def emit_responses_coverage_suffix(streamed_so_far: str, result: dict | None) ->
         # Same all-exit reason as the chat-completions adapter: no result means
         # the turn ended by exception or interruption, and staying silent would
         # let that read as complete coverage.
-        if COVERAGE_UNAVAILABLE_BEGIN in (streamed_so_far or ""):
-            return ""
         return (
             "\n"
             + COVERAGE_UNAVAILABLE_TEXT.rstrip()
             + "\n"
             + COVERAGE_INTERRUPTED_NOTE
         )
-    return terminal_coverage_suffix(streamed_so_far or "", result) or ""
+    return terminal_coverage_suffix(
+        result, emitted_coverage_footer=emitted_coverage_footer
+    ) or ""
 
 
 def _hermes_version() -> str:
@@ -3540,7 +3534,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # final_response in the RESULT, and this writer never emitted the
             # result -- so the explainer fired, the text existed, and the user
             # still got an empty box.
-            _wire = {"content": False, "text": ""}
+            _wire = {"content": False, "emitted_coverage_footer": None}
 
             def _encode_content_delta(text: str) -> bytes:
                 """Encode the exact OpenAI ``delta.content`` bytes to be written."""
@@ -3556,7 +3550,6 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _write_content_delta(text: str) -> None:
                 """Send ``text`` using the shared checked content encoder."""
                 await response.write(_encode_content_delta(text))
-                _wire["text"] = (_wire.get("text", "") + (text or ""))[-8000:]
                 if (text or "").strip():
                     # "Wrote any string" is not "the user received something
                     # readable": a whitespace-only delta suppressed the
@@ -3751,6 +3744,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 if not _wire["content"]:
                     _late = ((result or {}).get("final_response") or "").strip()
+                    _late_is_final_response = True
                     # final_response is user-facing by convention, not by
                     # invariant -- producers can put raw provider or internal
                     # error text in it, and this path is the one place it would
@@ -3784,10 +3778,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         # the old "Nothing was saved" simply false.
                         _late = ("The agent stopped before it produced an answer. "
                                  "Please check the conversation and try again.")
+                        _late_is_final_response = False
                     if _late:
                         await response.write(_encode_content_delta(_late))
                         _wire["content"] = True
-                        _wire["text"] = (_wire.get("text", "") + _late)[-8000:]
+                        if _late_is_final_response and isinstance(result, dict):
+                            _footer = result.get("coverage_footer")
+                            if isinstance(_footer, str) and _footer.strip():
+                                _wire["emitted_coverage_footer"] = _footer
                         logger.info(
                             "empty_stream_recovered service=gateway chars=%d"
                             + _journey_suffix_safe(), len(_late))
@@ -3805,11 +3803,10 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 suffix = emit_chat_completion_coverage_suffix(
                     result if isinstance(result, dict) else None,
-                    # What the user has already been shown. On a turn whose
-                    # only output was the late explainer, that text already
-                    # carries the coverage footer, and passing "" here printed
-                    # it twice.
-                    streamed_so_far=_wire.get("text", ""),
+                    # Set only by the successful late-final-response write above.
+                    # Model prose containing the same heading is not provenance.
+                    emitted_coverage_footer=_wire.get(
+                        "emitted_coverage_footer"),
                 )
                 if suffix:
                     cov_chunk = {
@@ -4058,6 +4055,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
+        emitted_coverage_footer: Optional[str] = None
 
         def _persist_response_snapshot(
             response_env: Dict[str, Any],
@@ -4366,17 +4364,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
-                    final_text_parts.append(agent_final)
+                    if isinstance(result, dict):
+                        _footer = result.get("coverage_footer")
+                        if isinstance(_footer, str) and _footer.strip():
+                            emitted_coverage_footer = _footer
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = result["error"]
                 # M-U1-D all-exit A-channel: coverage after model text.
                 try:
-                    streamed_so_far = "".join(final_text_parts) or final_response_text or ""
                     cov_suffix = emit_responses_coverage_suffix(
-                        streamed_so_far,
                         result if isinstance(result, dict) else None,
+                        emitted_coverage_footer=emitted_coverage_footer,
                     )
                     if cov_suffix:
                         await _emit_text_delta(cov_suffix)

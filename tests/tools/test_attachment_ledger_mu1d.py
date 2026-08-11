@@ -269,15 +269,28 @@ class StreamSuffixTests(unittest.TestCase):
             "final_response": "MODEL ANSWER" + footer,
             "coverage_footer": footer,
         }
-        suffix = terminal_coverage_suffix("MODEL ANSWER", result)
+        suffix = terminal_coverage_suffix(result)
         self.assertIn(COVERAGE_FOOTER_BEGIN, suffix)
         self.assertNotIn("MODEL ANSWER", suffix.replace(COVERAGE_FOOTER_BEGIN, ""))
 
-    def test_terminal_suffix_empty_when_already_streamed(self):
+    def test_terminal_suffix_suppresses_only_exact_emitted_footer(self):
         footer = f"\n{COVERAGE_FOOTER_TITLE}\nx\n"
-        streamed = "MODEL" + footer
-        result = {"coverage_footer": footer, "final_response": streamed}
-        self.assertEqual(terminal_coverage_suffix(streamed, result), "")
+        result = {"coverage_footer": footer, "final_response": "MODEL" + footer}
+        self.assertEqual(
+            terminal_coverage_suffix(
+                result, emitted_coverage_footer=footer
+            ),
+            "",
+        )
+        marker_only_model_text = f"MODEL mentions {COVERAGE_FOOTER_TITLE}"
+        self.assertNotIn(footer.strip(), marker_only_model_text)
+        self.assertEqual(terminal_coverage_suffix(result), footer)
+        self.assertEqual(
+            terminal_coverage_suffix(
+                result, emitted_coverage_footer=footer + "different"
+            ),
+            footer,
+        )
 
     def test_api_server_source_emits_coverage_before_done(self):
         src = Path(__file__).resolve().parents[2] / (

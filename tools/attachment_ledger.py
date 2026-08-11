@@ -508,8 +508,10 @@ def finalize_attachment_coverage(
             footer = COVERAGE_UNAVAILABLE_TEXT
             if interrupted:
                 footer = footer.rstrip() + "\n" + COVERAGE_INTERRUPTED_NOTE
-            if COVERAGE_UNAVAILABLE_BEGIN not in text and COVERAGE_FOOTER_BEGIN not in text:
-                text = (text.rstrip() + "\n" + footer) if text else footer
+            # This is the one authoritative finalizer call. Model prose that
+            # happens to contain a coverage heading is not proof that this
+            # mechanism-produced footer was appended.
+            text = (text.rstrip() + "\n" + footer) if text else footer
             meta.update(footer=footer, status="unavailable")
             return text, meta
         return final_response, meta
@@ -529,8 +531,10 @@ def finalize_attachment_coverage(
             footer = COVERAGE_UNAVAILABLE_TEXT
             if interrupted:
                 footer = footer.rstrip() + "\n" + COVERAGE_INTERRUPTED_NOTE
-            if COVERAGE_UNAVAILABLE_BEGIN not in text and COVERAGE_FOOTER_BEGIN not in text:
-                text = (text.rstrip() + "\n" + footer) if text else footer
+            # This is the one authoritative finalizer call. Model prose that
+            # happens to contain a coverage heading is not proof that this
+            # mechanism-produced footer was appended.
+            text = (text.rstrip() + "\n" + footer) if text else footer
             meta.update(footer=footer, status="unavailable")
             return text, meta
         return final_response, meta
@@ -539,42 +543,29 @@ def finalize_attachment_coverage(
         meta["status"] = "complete"
         return final_response, meta
 
-    if COVERAGE_FOOTER_BEGIN in text:
-        meta.update(footer=footer, status="ok")
-        return text, meta
     text = (text.rstrip() + "\n" + footer) if text else footer
     meta.update(footer=footer, status="ok")
     return text, meta
 
 
 def terminal_coverage_suffix(
-    streamed_text: str,
     result: dict[str, Any] | None,
+    *,
+    emitted_coverage_footer: str | None = None,
 ) -> str:
-    """Coverage-only suffix that streaming adapters emit before stop/[DONE].
+    """Return the structured footer unless this exact footer was emitted.
 
-    Prefers structured ``coverage_footer`` on the agent result (survives
-    plugins that rewrote ``final_response`` prose). Never re-emits the full
-    model answer — only the mechanism-produced coverage / unavailable block.
+    ``emitted_coverage_footer`` is provenance supplied by the writer after a
+    successful mechanism-owned write. Arbitrary model text is never inspected.
     """
     if not isinstance(result, dict):
         return ""
-    streamed = streamed_text or ""
     footer = result.get("coverage_footer") or ""
-    if isinstance(footer, str) and footer.strip():
-        if COVERAGE_FOOTER_BEGIN in streamed or COVERAGE_UNAVAILABLE_BEGIN in streamed:
-            if footer.strip() in streamed or COVERAGE_FOOTER_BEGIN in streamed:
-                return ""
-        return footer if footer.startswith("\n") else "\n" + footer.lstrip("\n")
-
-    final = result.get("final_response") or ""
-    if not isinstance(final, str) or not final:
+    if not isinstance(footer, str) or not footer.strip():
         return ""
-    for marker in (COVERAGE_FOOTER_BEGIN, COVERAGE_UNAVAILABLE_BEGIN):
-        idx = final.find(marker)
-        if idx >= 0 and marker not in streamed:
-            return ("\n" if not final[idx:].startswith("\n") else "") + final[idx:]
-    return ""
+    if emitted_coverage_footer == footer:
+        return ""
+    return footer if footer.startswith("\n") else "\n" + footer.lstrip("\n")
 
 
 def deliver_coverage_to_persistent_body(
@@ -618,7 +609,7 @@ def deliver_coverage_to_persistent_body(
         "failed": bool(failed),
     }
     if stream:
-        suffix = terminal_coverage_suffix(streamed_text or "", result)
+        suffix = terminal_coverage_suffix(result)
         result["stream_suffix"] = suffix
         # Persistent body: prefer full final_response (includes footer);
         # if model streamed partial text without footer, body is still final_response.

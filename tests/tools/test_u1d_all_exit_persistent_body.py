@@ -118,12 +118,10 @@ def _run_turn(
 
     body = delivered.get("persistent_assistant_body") or ""
     if stream:
-        # Chat-completions path uses empty streamed prefix at terminal (model
-        # already flushed deltas); Responses path uses full streamed so far.
+        # This synthetic boundary has no successful writer-owned footer receipt,
+        # so both adapters must emit the structured footer.
         suffix_cc = api_mod.emit_chat_completion_coverage_suffix(delivered)
-        suffix_rs = api_mod.emit_responses_coverage_suffix(
-            model_text or "", delivered
-        )
+        suffix_rs = api_mod.emit_responses_coverage_suffix(delivered)
         # Wire would append one suffix; both adapters must non-empty when footer exists
         delivered["_wire_suffix_chat"] = suffix_cc
         delivered["_wire_suffix_responses"] = suffix_rs
@@ -318,7 +316,7 @@ class ProductionAdapterMutationTests(unittest.TestCase):
         with patch.object(api_mod, "emit_chat_completion_coverage_suffix", return_value=""):
             with patch.object(api_mod, "emit_responses_coverage_suffix", return_value=""):
                 s1 = api_mod.emit_chat_completion_coverage_suffix(delivered)
-                s2 = api_mod.emit_responses_coverage_suffix("report", delivered)
+                s2 = api_mod.emit_responses_coverage_suffix(delivered)
                 with self.assertRaises(AssertionError):
                     self.assertTrue(s1 or s2)
 
