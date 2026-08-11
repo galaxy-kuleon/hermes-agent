@@ -141,6 +141,9 @@ def _build_provider_env_blocklist() -> frozenset:
         "HERMES_SKILL_WRITER_SOCKET",
         "SKIP_RAG_HANDOFF_SIGNING_KEY",
         "OPENVIKING_API_KEY",
+        "HERMES_FILE_CAPABILITY_KEY",
+        "LOCAL_EXPORT_ARTIFACT_SIGNING_KEY",
+        "OPENWEBUI_BRIDGE_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
         "OPENAI_API_BASE",
@@ -202,6 +205,19 @@ def _build_provider_env_blocklist() -> frozenset:
         "MODAL_TOKEN_SECRET",
         "DAYTONA_API_KEY",
     })
+    # LIST-FREE BACKSTOP. Everything above is a list of names somebody thought
+    # of, and twice now that list has been incomplete: API_SERVER_KEY was
+    # blocked while four siblings were not, and after I added those four, three
+    # more were still reaching the terminal tool's child process. Enumerating
+    # secrets is the wrong shape.
+    #
+    # A secret announces itself in its NAME. Any variable whose name carries the
+    # standard secret vocabulary is withheld unless a skill or the user has
+    # explicitly registered it as passthrough, which remains the escape hatch.
+    # Found by adversarial review 2026-08-12.
+    import re as _re
+    _secretish = _re.compile(r"(?:^|_)(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?)(?:_|$)")
+    blocked.update(k for k in os.environ if _secretish.search(k.upper()))
     return frozenset(blocked)
 
 

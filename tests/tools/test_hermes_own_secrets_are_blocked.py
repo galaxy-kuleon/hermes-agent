@@ -26,6 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 # fails for the wrong reason teaches nothing. It is asserted against the
 # running container instead.
 MUST_BE_BLOCKED = (
+    "HERMES_FILE_CAPABILITY_KEY",
+    "LOCAL_EXPORT_ARTIFACT_SIGNING_KEY",
+    "OPENWEBUI_BRIDGE_API_KEY",
     "HERMES_SKILL_WRITER_SECRET_FILE",
     "HERMES_SKILL_WRITER_SOCKET",
     "SKIP_RAG_HANDOFF_SIGNING_KEY",
@@ -38,6 +41,34 @@ class HermesOwnSecretsAreBlockedTests(unittest.TestCase):
         from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST as blocked
         leaked = [v for v in MUST_BE_BLOCKED if v not in blocked]
         self.assertEqual(leaked, [], f"these would be handed to code running in a chat: {leaked}")
+
+    def test_a_secret_NOBODY_LISTED_is_still_withheld(self):
+        """The list has been incomplete twice. The name is the invariant.
+
+        Enumerating secrets is the wrong shape: whoever adds the next one will
+        not think to add it here. A variable whose NAME carries the standard
+        secret vocabulary is withheld whether or not anyone listed it.
+        """
+        import os as _os
+        from tools.environments.local import _build_provider_env_blocklist
+        for name in ("SOME_FUTURE_SERVICE_API_KEY", "NEW_THING_SECRET",
+                     "WHATEVER_TOKEN", "X_PASSWORD", "Y_CREDENTIALS"):
+            with self.subTest(name=name):
+                _os.environ[name] = "sentinel"
+                try:
+                    self.assertIn(name, _build_provider_env_blocklist(),
+                                  f"{name} would be handed to code running in a chat")
+                finally:
+                    _os.environ.pop(name, None)
+
+    def test_an_ordinary_variable_still_passes(self):
+        import os as _os
+        from tools.environments.local import _build_provider_env_blocklist
+        _os.environ["HERMES_SOME_PLAIN_SETTING"] = "1"
+        try:
+            self.assertNotIn("HERMES_SOME_PLAIN_SETTING", _build_provider_env_blocklist())
+        finally:
+            _os.environ.pop("HERMES_SOME_PLAIN_SETTING", None)
 
     def test_the_sanitiser_actually_drops_them(self):
         """A blocklist nothing consults protects nothing."""
