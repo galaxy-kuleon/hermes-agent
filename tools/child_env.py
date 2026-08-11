@@ -91,19 +91,52 @@ CHANNEL_FIXED = "fixed"
 CHANNEL_GENERATED = "generated"
 
 
+def _stable_key(item):
+    """A total order over keys of any type, so sorting cannot raise.
+
+    ``sorted(mapping.items())`` compares keys directly, so a mapping holding
+    both ``1`` and ``"NAME"`` raised TypeError *before* the promised rejection
+    receipt could be produced -- the mechanism crashing instead of recording
+    that a caller sent something invalid. Type name first keeps it total;
+    ``str`` second keeps it deterministic.
+    """
+    key = item[0]
+    return (type(key).__name__, str(key))
+
+
 @dataclass(frozen=True)
 class ChildEnvSpec:
     """What one kind of chat child is allowed to receive.
 
-    Build with :meth:`create`, which snapshots mutable arguments into immutable
-    values. Constructing the dataclass directly is possible but then the caller
-    owns the immutability guarantee.
+    Normalisation happens in ``__post_init__``, so it applies to EVERY way of
+    building a spec. It used to live in ``create()``, which meant the exported
+    dataclass constructor still accepted a live ``set`` and a caller mutating
+    it afterwards silently widened a later child's environment. Adversarial
+    review proved that with a mutant that survived the entire suite: dropping
+    the snapshot in ``create()`` changed no test, because nothing tested
+    mutation-after-create for ``base_names``.
+
+    ``frozen=True`` freezes the attribute, not the collection behind it, so the
+    invariant has to be a conversion rather than a convention. A comment asking
+    callers to use the factory is not a mechanism.
     """
 
     kind: str
     grants: frozenset[str] = frozenset()
     fixed_env: tuple[tuple[str, str], ...] = ()
     base_names: frozenset[str] = DEFAULT_BASE_NAMES
+
+    def __post_init__(self) -> None:
+        set_ = object.__setattr__          # frozen dataclass: normalise in place
+        set_(self, "kind", str(self.kind))
+        set_(self, "grants", frozenset(self.grants or ()))
+        fixed = self.fixed_env
+        if isinstance(fixed, Mapping):
+            fixed = fixed.items()
+        set_(self, "fixed_env", tuple(sorted(tuple(fixed or ()), key=_stable_key)))
+        base = self.base_names
+        set_(self, "base_names",
+             DEFAULT_BASE_NAMES if base is None else frozenset(base))
 
     @staticmethod
     def create(
@@ -113,14 +146,8 @@ class ChildEnvSpec:
         fixed_env: Mapping[str, str] | None = None,
         base_names: Iterable[str] | None = None,
     ) -> "ChildEnvSpec":
-        return ChildEnvSpec(
-            kind=str(kind),
-            grants=frozenset(grants),
-            fixed_env=tuple(sorted((fixed_env or {}).items())),
-            base_names=(frozenset(base_names)
-                        if base_names is not None
-                        else DEFAULT_BASE_NAMES),
-        )
+        return ChildEnvSpec(kind=kind, grants=grants,
+                            fixed_env=fixed_env, base_names=base_names)
 
 
 @dataclass(frozen=True)
@@ -132,8 +159,13 @@ class ChildEnvResult:
     ``rejected`` and ``missing`` carry names and reasons only, never values: a
     receipt that quoted a value would leak the thing this module exists to
     withhold.
+
+    ``kind`` names the child this was built for. Without it the receipt cannot
+    answer the per-kind question the whole design rests on -- which child got
+    which grants -- and a rollout would be reading unattributed counts.
     """
 
+    kind: str
     env: dict[str, str]
     provenance: tuple[tuple[str, str], ...] = ()
     rejected: tuple[tuple[str, str, str], ...] = ()   # (channel, name, reason)
@@ -216,15 +248,23 @@ def construct_chat_child_env(
             continue
         _take(CHANNEL_FIXED, name, value)
 
-    # 4. the mechanism's own channel. Last writer.
-    for name, value in sorted((generated or {}).items(), key=lambda kv: str(kv[0])):
-        reason = _name_reason(name, frozenset())
+    # 4. the last writer. `denied` applies here too: this is a public
+    #    parameter, so calling it "the mechanism's own channel" was a trust
+    #    assertion about callers, not a property of the code -- and a denied
+    #    name handed in through `generated` reached the child untouched.
+    #    Adversarial review reproduced exactly that. If a generated name ever
+    #    genuinely needs an exemption it must be an explicit, enumerated
+    #    mechanism-owned name, never a blanket exemption for a caller mapping.
+    generated_items = generated.items() if isinstance(generated, Mapping) else (generated or ())
+    for name, value in sorted(tuple(generated_items), key=_stable_key):
+        reason = _name_reason(name, denied)
         if reason:
             rejected.append((CHANNEL_GENERATED, str(name), reason))
             continue
         _take(CHANNEL_GENERATED, name, value)
 
     return ChildEnvResult(
+        kind=spec.kind,
         env=env,
         provenance=tuple(sorted(provenance.items())),
         rejected=tuple(rejected),

@@ -96,6 +96,44 @@ class PurityTests(unittest.TestCase):
         result = construct_chat_child_env(source=source, spec=spec)
         self.assertEqual(result.env, {"ALLOWED": "yes", "FEATURE": "1"})
 
+    def test_mutating_base_names_afterwards_changes_nothing(self):
+        """The mutant that survived the whole first suite.
+
+        Dropping the `frozenset(base_names)` snapshot changed no test, because
+        only `grants` and `fixed_env` had a mutation-after-create case. A
+        caller who kept their set could then widen a later child's base.
+        """
+        base = {"PATH"}
+        spec = ChildEnvSpec.create("chat", base_names=base)
+        base.add("LATE_SECRET")
+        result = construct_chat_child_env(
+            source={"PATH": "/bin", "LATE_SECRET": "leaked"}, spec=spec)
+        self.assertEqual(result.env, {"PATH": "/bin"})
+
+    def test_the_dataclass_constructor_normalises_too(self):
+        """`.create()` is a convenience, not the security boundary.
+
+        The exported dataclass constructor is public; when normalisation lived
+        only in the factory, constructing directly with a live set kept the
+        caller's collection and every guarantee above evaporated.
+        """
+        grants = {"ALLOWED"}
+        base = {"PATH"}
+        fixed = {"FEATURE": "1"}
+        spec = ChildEnvSpec(kind="chat", grants=grants,
+                            fixed_env=fixed, base_names=base)
+        grants.add("SNEAKY")
+        base.add("ALSO_SNEAKY")
+        fixed["THIRD"] = "3"
+        result = construct_chat_child_env(
+            source={"PATH": "/bin", "ALLOWED": "yes",
+                    "SNEAKY": "no", "ALSO_SNEAKY": "no"},
+            spec=spec)
+        self.assertEqual(result.env, {"PATH": "/bin", "ALLOWED": "yes", "FEATURE": "1"})
+        self.assertIsInstance(spec.grants, frozenset)
+        self.assertIsInstance(spec.base_names, frozenset)
+        self.assertIsInstance(spec.fixed_env, tuple)
+
     def test_mutating_the_source_afterwards_changes_nothing(self):
         source = {"PATH": "/bin"}
         spec = ChildEnvSpec.create("chat")
@@ -202,6 +240,26 @@ class RejectionAtEveryChannelTests(unittest.TestCase):
         self.assertEqual(result.env, {})
         self.assertEqual(result.rejected, ((CHANNEL_GRANT, forced, REASON_FORCE_PREFIX),))
 
+    def test_a_denied_name_cannot_re_enter_through_the_generated_channel(self):
+        """`generated` is a public parameter, not a private channel.
+
+        It was exempted from `denied` on the grounds that the mechanism owns
+        it. That was a statement about intended callers, not about the code:
+        every caller can pass that mapping, so the exemption was a bypass API
+        of exactly the shape this module exists to remove. Found by
+        adversarial review 2026-08-12.
+        """
+        secret = _canary()
+        spec = ChildEnvSpec.create("chat", base_names=set())
+        result = construct_chat_child_env(
+            source={}, spec=spec,
+            denied=frozenset({secret}),
+            generated={secret: "leaked", "HERMES_RPC_SOCKET": "/run/x.sock"},
+        )
+        self.assertEqual(result.env, {"HERMES_RPC_SOCKET": "/run/x.sock"})
+        self.assertEqual(result.rejected,
+                         ((CHANNEL_GENERATED, secret, REASON_DENIED),))
+
     def test_a_receipt_never_carries_a_value(self):
         secret = _canary()
         value = "sk-" + uuid.uuid4().hex
@@ -258,6 +316,26 @@ class NameAndValueContractTests(unittest.TestCase):
         )
         self.assertEqual(result.env, {}, "an ungranted lowercase twin is still not copied")
 
+    def test_a_mixed_type_fixed_env_is_rejected_rather_than_crashing(self):
+        """Sorting compared the keys directly, so this raised TypeError.
+
+        The mechanism must produce a rejection receipt for a caller's bad
+        input, not die on it: a crash here becomes an unhandled failure in
+        whatever spawn path is being protected.
+        """
+        spec = ChildEnvSpec.create("chat", base_names=set(),
+                                   fixed_env={7: "num", "NAME": "ok"})
+        result = construct_chat_child_env(source={}, spec=spec)
+        self.assertEqual(result.env, {"NAME": "ok"})
+        self.assertEqual(result.rejected, ((CHANNEL_FIXED, "7", REASON_INVALID_NAME),))
+
+    def test_the_receipt_names_the_child_kind_it_was_built_for(self):
+        """Per-kind grants are the design; an unattributed receipt cannot show
+        which child received what during a staged rollout."""
+        spec = ChildEnvSpec.create("execute_code", base_names={"PATH"})
+        result = construct_chat_child_env(source={"PATH": "/bin"}, spec=spec)
+        self.assertEqual(result.kind, "execute_code")
+
     def test_the_generated_channel_is_name_validated_too(self):
         spec = ChildEnvSpec.create("chat", base_names=set())
         result = construct_chat_child_env(
@@ -267,8 +345,65 @@ class NameAndValueContractTests(unittest.TestCase):
                          ((CHANNEL_GENERATED, "BAD=NAME", REASON_INVALID_NAME),))
 
 
+def _wiring_offenders(source: str, rel: str = "<snippet>") -> "list[str]":
+    """Every way a module can reach the constructor. Shared by the tree scan
+    and by the positive controls, so the two can never drift apart."""
+    offenders: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return offenders
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = getattr(node, "module", "") or ""
+            names = [a.name for a in node.names]
+            if module.endswith("child_env") or any(
+                    n == "child_env" or n.endswith(".child_env") for n in names):
+                offenders.append(f"{rel}:{node.lineno} imports child_env")
+        elif isinstance(node, ast.Name) and node.id == "construct_chat_child_env":
+            offenders.append(f"{rel}:{node.lineno} references the constructor")
+        elif isinstance(node, ast.Attribute) and node.attr == "construct_chat_child_env":
+            offenders.append(f"{rel}:{node.lineno} calls the constructor")
+    return offenders
+
+
 class UnwiredTests(unittest.TestCase):
     """UNWIRED is a claim about the tree, so the tree is what gets parsed."""
+
+    # Each of these IS wiring and must be caught. The first version of the gate
+    # returned nothing for `from tools import child_env` -- the form a real
+    # wiring commit is most likely to use -- so "the gate ran and found
+    # nothing" proved nothing. Found by adversarial review 2026-08-12.
+    #
+    # Each snippet triggers exactly ONE detector and names which. My first
+    # version put an import AND a call in every snippet, so deleting either
+    # detector left the other one firing and the control still passed: the
+    # presence-not-cause mistake, in the very test written to catch it.
+    WIRING_FORMS = (
+        ("from tools.child_env import construct_chat_child_env\n", "imports child_env"),
+        ("from tools import child_env\n", "imports child_env"),
+        ("from tools import child_env as ce\n", "imports child_env"),
+        ("import tools.child_env\n", "imports child_env"),
+        ("ce.construct_chat_child_env(source=s, spec=p)\n", "calls the constructor"),
+        ("construct_chat_child_env(source=s, spec=p)\n", "references the constructor"),
+    )
+
+    # ...and this is NOT: a local of the same name already exists in
+    # code_execution_tool.py, and a gate that fires on it is a gate nobody can
+    # keep green.
+    NON_WIRING = "child_env = _scrub_child_env(os.environ)\nchild_env['TZ'] = 'UTC'\n"
+
+    def test_the_gate_catches_every_form_of_wiring(self):
+        for form, reason in self.WIRING_FORMS:
+            with self.subTest(form=form.strip()):
+                found = _wiring_offenders(form)
+                self.assertTrue(found, "this wiring would have passed the gate")
+                self.assertTrue(
+                    any(reason in f for f in found),
+                    f"caught, but by the wrong rule: {found} (wanted {reason!r})")
+
+    def test_the_gate_does_not_fire_on_an_unrelated_local(self):
+        self.assertEqual(_wiring_offenders(self.NON_WIRING), [])
 
     def test_no_production_module_imports_or_calls_the_constructor(self):
         root = Path(__file__).resolve().parents[2]
@@ -280,24 +415,12 @@ class UnwiredTests(unittest.TestCase):
                 continue
             if rel == Path("tools/child_env.py"):
                 continue
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("child_env"):
-                    offenders.append(f"{rel}:{node.lineno} imports child_env")
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        if alias.name.endswith("child_env"):
-                            offenders.append(f"{rel}:{node.lineno} imports child_env")
-                elif isinstance(node, ast.Name) and node.id == "construct_chat_child_env":
-                    offenders.append(f"{rel}:{node.lineno} references the constructor")
+            offenders += _wiring_offenders(
+                path.read_text(encoding="utf-8", errors="replace"), str(rel))
         self.assertEqual(
             offenders, [],
             "this commit is the mechanism only; wiring is a separate, visible change:\n"
             + "\n".join(offenders))
-
 
 if __name__ == "__main__":
     unittest.main()
