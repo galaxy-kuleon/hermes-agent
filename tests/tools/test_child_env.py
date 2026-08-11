@@ -150,6 +150,32 @@ class PurityTests(unittest.TestCase):
         self.assertEqual(b.env, {"PATH": "/bin"})
 
 
+class BasePolicyTests(unittest.TestCase):
+    """The default base is the one grant every child gets. Pin it exactly."""
+
+    def test_the_default_base_is_exactly_the_reviewed_set(self):
+        """A canary proves unknown names are not copied; only this proves that
+        a KNOWN dangerous one was not added to the policy.
+
+        Adversarial review added `DATABASE_URL` to `DEFAULT_BASE_NAMES` and all
+        25 tests stayed green: the noisy-source test's source does not contain
+        that name, and every other test imports the same constant, so the suite
+        simply agreed with the widened policy. A test that consumes production
+        policy cannot detect a change to it.
+
+        Changing this set is a deliberate act. Update this assertion in the
+        same commit, and say in the message why the new name must reach every
+        chat child.
+        """
+        self.assertEqual(
+            set(DEFAULT_BASE_NAMES),
+            {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "USER", "SHELL", "PWD"})
+
+    def test_no_base_name_is_a_force_spelling(self):
+        for name in DEFAULT_BASE_NAMES:
+            self.assertFalse(name.startswith(FORCE_PREFIX), name)
+
+
 class AuthorityOrderTests(unittest.TestCase):
     """Four channels can write the same name. Exactly one must win."""
 
@@ -328,6 +354,28 @@ class NameAndValueContractTests(unittest.TestCase):
         result = construct_chat_child_env(source={}, spec=spec)
         self.assertEqual(result.env, {"NAME": "ok"})
         self.assertEqual(result.rejected, ((CHANNEL_FIXED, "7", REASON_INVALID_NAME),))
+
+    def test_a_key_that_cannot_be_rendered_still_gets_a_receipt(self):
+        """`str()` is caller-controlled code.
+
+        Both the sort key and the rejection receipt called it bare, so an
+        object whose `__str__` raises took the mechanism down at the exact
+        moment it was recording that the caller had sent something invalid.
+        Adversarial review disproved the "any key type" claim this way.
+        """
+        class Hostile:
+            def __str__(self):
+                raise RuntimeError("str exploded")
+
+            def __hash__(self):
+                return 1
+
+        spec = ChildEnvSpec.create("chat", base_names=set(),
+                                   fixed_env={Hostile(): "v", "OK": "yes"})
+        result = construct_chat_child_env(source={}, spec=spec)
+        self.assertEqual(result.env, {"OK": "yes"})
+        self.assertEqual(result.rejected,
+                         ((CHANNEL_FIXED, "<unprintable>", REASON_INVALID_NAME),))
 
     def test_the_receipt_names_the_child_kind_it_was_built_for(self):
         """Per-kind grants are the design; an unattributed receipt cannot show

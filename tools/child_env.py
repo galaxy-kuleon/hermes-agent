@@ -34,11 +34,13 @@ change a later result.
 
 REJECTION HAPPENS AT THE FINAL AUTHORITY, NOT AT ONE INPUT
 ----------------------------------------------------------
-Every channel a caller can influence -- base, grants, feature values -- is
-checked against the same rule, because validating one input and trusting the
-rest is precisely how ``base_env`` and ``extra_env`` became bypasses. Only
-``generated``, which the mechanism itself owns and no caller can reach, writes
-last.
+EVERY channel is checked against the same rule -- base, grants, feature values
+and ``generated`` alike -- because validating one input and trusting the rest
+is precisely how ``base_env`` and ``extra_env`` became bypasses. ``generated``
+was briefly exempt, on the grounds that the mechanism owns it; it is a public
+parameter that any caller can pass, so that was a statement about intended
+callers rather than a property of the code, and a denied name handed in that
+way reached the child. It is last writer, not unchecked.
 
 ``_HERMES_FORCE_X`` is never decoded into ``X`` here: the request is rejected
 and recorded under the name the caller actually used, so a rejection cannot be
@@ -91,17 +93,35 @@ CHANNEL_FIXED = "fixed"
 CHANNEL_GENERATED = "generated"
 
 
+_UNPRINTABLE = "<unprintable>"
+
+
+def _safe_str(value) -> str:
+    """``str(value)``, or a placeholder if the object refuses to render.
+
+    Used for sort keys and for rejection receipts. Both used bare ``str()``,
+    which is caller-controlled code: an object whose ``__str__`` raises took
+    down the mechanism at the exact moment it was trying to record that the
+    caller had sent something invalid.
+    """
+    try:
+        return str(value)
+    except Exception:
+        return _UNPRINTABLE
+
+
 def _stable_key(item):
-    """A total order over keys of any type, so sorting cannot raise.
+    """A total order over ordinary keys, so sorting cannot raise.
 
     ``sorted(mapping.items())`` compares keys directly, so a mapping holding
     both ``1`` and ``"NAME"`` raised TypeError *before* the promised rejection
-    receipt could be produced -- the mechanism crashing instead of recording
-    that a caller sent something invalid. Type name first keeps it total;
-    ``str`` second keeps it deterministic.
+    receipt could be produced. Type name first keeps it total; the rendered key
+    second keeps it deterministic. Objects that cannot render sort together
+    under one placeholder -- they are rejected as invalid names anyway, so
+    their relative order carries no meaning.
     """
     key = item[0]
-    return (type(key).__name__, str(key))
+    return (type(key).__name__, _safe_str(key))
 
 
 @dataclass(frozen=True)
@@ -214,7 +234,7 @@ def construct_chat_child_env(
 
     def _take(channel: str, name: object, value: object) -> None:
         if not isinstance(value, str):
-            rejected.append((channel, str(name), REASON_INVALID_VALUE))
+            rejected.append((channel, _safe_str(name), REASON_INVALID_VALUE))
             return
         env[str(name)] = value
         provenance[str(name)] = channel
@@ -223,7 +243,7 @@ def construct_chat_child_env(
     for name in sorted(spec.base_names, key=str):
         reason = _name_reason(name, denied)
         if reason:
-            rejected.append((CHANNEL_BASE, str(name), reason))
+            rejected.append((CHANNEL_BASE, _safe_str(name), reason))
             continue
         if name in source:
             _take(CHANNEL_BASE, name, source[name])
@@ -232,10 +252,10 @@ def construct_chat_child_env(
     for name in sorted(spec.grants, key=str):
         reason = _name_reason(name, denied)
         if reason:
-            rejected.append((CHANNEL_GRANT, str(name), reason))
+            rejected.append((CHANNEL_GRANT, _safe_str(name), reason))
             continue
         if name not in source:
-            missing.append(str(name))
+            missing.append(_safe_str(name))
             continue
         _take(CHANNEL_GRANT, name, source[name])
 
@@ -244,7 +264,7 @@ def construct_chat_child_env(
     for name, value in spec.fixed_env:
         reason = _name_reason(name, denied)
         if reason:
-            rejected.append((CHANNEL_FIXED, str(name), reason))
+            rejected.append((CHANNEL_FIXED, _safe_str(name), reason))
             continue
         _take(CHANNEL_FIXED, name, value)
 
@@ -259,7 +279,7 @@ def construct_chat_child_env(
     for name, value in sorted(tuple(generated_items), key=_stable_key):
         reason = _name_reason(name, denied)
         if reason:
-            rejected.append((CHANNEL_GENERATED, str(name), reason))
+            rejected.append((CHANNEL_GENERATED, _safe_str(name), reason))
             continue
         _take(CHANNEL_GENERATED, name, value)
 
