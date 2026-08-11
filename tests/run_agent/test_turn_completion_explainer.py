@@ -98,6 +98,21 @@ def test_unknown_reason_still_tells_the_user_something():
     assert "continue" in out.lower()
 
 
+def test_pending_tool_result_message_is_reachable():
+    """The most specific message we have for the exact symptom users report.
+
+    `turn_finalizer` computes "the agent was mid-work and just stopped" to emit
+    an operator warning, and the formatter has a written-out message for it --
+    but `pending_tool_result` is never a `_turn_exit_reason`, so nothing could
+    reach it. The finalizer now passes it when the reason is otherwise
+    uninformative and the last message was a tool result.
+    """
+    out = AIAgent._format_turn_completion_explanation("pending_tool_result")
+    assert out, "the pending-tool message is unreachable again"
+    assert "tool result" in out
+    assert "continue" in out.lower()
+
+
 def test_a_reason_nobody_wired_up_still_speaks():
     """The failure shape this codebase keeps repeating: a name nobody listed.
 
@@ -212,3 +227,38 @@ def test_run_conversation_normal_reply_stays_quiet():
     assert result["turn_exit_reason"].startswith("text_response")
     assert result["final_response"] == "Done."
     assert "No reply:" not in result["final_response"]
+
+
+def test_finalizer_prefers_a_real_cause_over_the_stop_shape():
+    """Precedence, asserted against the finalizer's own source.
+
+    A cause like `budget_exhausted` is more actionable than "it stopped with a
+    tool pending", so the substitution must apply ONLY when the reason carries
+    no information. Asserted structurally because driving the finalizer needs
+    the whole agent runtime.
+    """
+    import ast
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[2] / "agent" / "turn_finalizer.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    subs = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", "") == "_explain_reason" for t in n.targets)
+        and isinstance(n.value, ast.Constant)
+        and n.value.value == "pending_tool_result"
+    ]
+    assert subs, "the pending_tool_result substitution is gone"
+    guard = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and any(
+            isinstance(c, ast.Assign)
+            and any(getattr(t, "id", "") == "_explain_reason" for t in c.targets)
+            and isinstance(c.value, ast.Constant)
+            and c.value.value == "pending_tool_result"
+            for c in node.body
+        ):
+            guard = ast.unparse(node.test)
+    assert guard, "the substitution is unguarded"
+    assert "unknown" in guard, f"a real cause would be overridden: {guard}"
+    assert "tool" in guard, f"the substitution is not tied to a pending tool: {guard}"

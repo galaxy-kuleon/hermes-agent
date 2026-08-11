@@ -297,8 +297,20 @@ def finalize_turn(
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
                 )
                 if _is_empty_terminal or _is_partial_fragment:
+                    # "The agent was mid-work and just stopped" is the exact
+                    # symptom users report, this file computes it at line 234
+                    # to emit the operator warning -- and the explainer had a
+                    # written-out message for it that nothing could ever reach,
+                    # because `pending_tool_result` is never a `_turn_exit_reason`.
+                    # Only used when the reason is otherwise uninformative: a
+                    # real cause like `budget_exhausted` is more actionable than
+                    # the shape of the stop, so it keeps precedence.
+                    _explain_reason = _turn_exit_reason
+                    if (str(_turn_exit_reason) in ("", "unknown")
+                            and _last_msg_role == "tool"):
+                        _explain_reason = "pending_tool_result"
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
+                        _explain_reason
                     )
                     if _explanation:
                         if _is_empty_terminal:
