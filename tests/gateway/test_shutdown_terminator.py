@@ -1002,6 +1002,52 @@ class BoundedWriterTests(unittest.TestCase):
         self.assertIn("write_eof", seen["attempts"],
                       "a cancellation on one step cost the client its EOF")
 
+    def test_a_body_the_owner_ALREADY_ended_gets_no_second_attempt(self):
+        """Found by deploying the previous commit to the live 8083 gateway.
+
+        One stream, restarted mid-answer. The client received the notice,
+        `finish_reason: stop` and `[DONE]` — curl exited 0. And the log said:
+
+            stream_closed_at_shutdown ... phase=cancelled
+            stream_notice_undeliverable service=gateway phase=terminal
+            stream_shutdown_sweep attempted=1 complete=1 closed_bare=0 still_open=0
+
+        A perfectly delivered interruption reported as a user who was never
+        told. The owner ended the body and deregistered; the sweep, still
+        holding a lifecycle that said `terminated=True`, looked the response up
+        in the registry, found nothing, took the unregistered path and wrote
+        into a closed body. Left alone it would put a false failure in every
+        deploy's numbers — and the whole point of these rounds is that the
+        operator signal must not lie.
+        """
+        m, seen = self.m, {}
+
+        async def scenario():
+            resp = _FakeResponse()
+            lc = m._register_stream_body(resp, ("id", 1, "model", None), None)
+            # The owner ends it properly, then deregisters, exactly as the
+            # handler's `finally` does.
+            await m._terminate_stream_body(
+                resp, "id", 1, "model", None,
+                notice=m.SHUTDOWN_INTERRUPTION_NOTICE)
+            self.assertTrue(lc.terminated)
+            m._LIVE_STREAM_BODIES.pop(resp, None)
+            attempts_after_owner = len(resp.attempts)
+            # The sweep, holding the lifecycle it snapshotted earlier.
+            ok = await m._terminate_stream_body(
+                resp, "id", 1, "model", None,
+                notice=m.SHUTDOWN_INTERRUPTION_NOTICE,
+                shutdown_writer=True, lifecycle=lc)
+            seen["ok"] = ok
+            seen["extra"] = len(resp.attempts) - attempts_after_owner
+
+        asyncio.run(scenario())
+        self.assertEqual(seen["extra"], 0,
+                         "the sweep wrote a second ending into a body the "
+                         "owner had already closed")
+        self.assertTrue(seen["ok"],
+                        "an already-complete body was reported as a failure")
+
     def test_the_SWEEP_leaves_no_writer_alive_when_the_notice_landed_first(self):
         """The end-to-end shape of round 12 A1, at the level it was measured.
 

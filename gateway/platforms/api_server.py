@@ -550,8 +550,10 @@ async def _terminate_live_stream_bodies(app=None) -> None:
         tasks = [_asyncio.ensure_future(
                      _terminate_stream_body(r, *lc.args,
                                             notice=SHUTDOWN_INTERRUPTION_NOTICE,
-                                            shutdown_writer=True))
-                 for r, lc in items]
+                                            shutdown_writer=True,
+                                            lifecycle=lc))
+                 for r, lc in items
+                 if not lc.terminated and not lc.eof_sent]
         if not tasks:
             return {"attempted": 0, "complete": 0, "closed_bare": 0,
                     "still_open": 0}
@@ -649,7 +651,8 @@ async def _terminate_live_stream_bodies(app=None) -> None:
 
 async def _terminate_stream_body(response, completion_id, created, model, logger,
                                  notice: str = "",
-                                 shutdown_writer: bool = False) -> bool:
+                                 shutdown_writer: bool = False,
+                                 lifecycle=None) -> bool:
     """Close the HTTP conversation, once, whoever asks.
 
     Serialized on the response's lifecycle lock, so the request handler and the
@@ -658,7 +661,18 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
     landed is not a complete ending, and reporting it as one is what let a
     cut-off answer look finished.
     """
-    lc = _LIVE_STREAM_BODIES.get(response)
+    # PREFER THE CALLER'S LIFECYCLE. The sweep holds one from its snapshot; the
+    # registry entry is popped by the handler's `finally` the moment it
+    # returns. Looking the response up here loses that race: the owner ends the
+    # body properly, deregisters, and the sweep -- still holding a lifecycle
+    # that says terminated=True -- finds nothing, takes the unregistered path,
+    # and tries to write a SECOND ending into a closed body. The write fails,
+    # which is correct, but it then reports `stream_notice_undeliverable`, so a
+    # perfectly delivered interruption logs as a user who was never told.
+    # Proved on the live 8083 gateway by the deploy that shipped this file's
+    # previous commit: one stream, one complete ending on the wire, one bogus
+    # warning.
+    lc = lifecycle if lifecycle is not None else _LIVE_STREAM_BODIES.get(response)
     if lc is None:
         # Unregistered body: no lifecycle to record progress on, so the
         # irreversible half of the result has nowhere to live. Return only the
