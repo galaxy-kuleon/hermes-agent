@@ -501,8 +501,13 @@ async def _terminate_live_stream_bodies(app=None) -> None:
         return
     n = await _sweep(first)
     # Anything that appeared while we waited.
-    late = [(r, lc) for r, lc in _LIVE_STREAM_BODIES.items()
-            if not lc.terminated and all(r is not r0 for r0, _l in first)]
+    # SNAPSHOT first. Iterating the live mapping while handlers deregister in
+    # their `finally` raises "dictionary changed size during iteration" -- and a
+    # WeakKeyDictionary can also shrink under you when a response is collected
+    # mid-loop, with no concurrency at all.
+    _seen = {id(r0) for r0, _l in first}
+    late = [(r, lc) for r, lc in list(_LIVE_STREAM_BODIES.items())
+            if not lc.terminated and id(r) not in _seen]
     if late:
         n += await _sweep(late)
     logger = None

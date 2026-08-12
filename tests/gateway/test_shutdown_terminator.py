@@ -188,6 +188,43 @@ class ShutdownTerminatorTests(unittest.TestCase):
         self.assertEqual(joined.count(b"[DONE]"), 1, "two endings were written")
         self.assertEqual(r.eof_calls, 1, "EOF written twice")
 
+    def test_deregistration_during_the_sweep_does_not_explode(self):
+        """A handler deregistering mid-shutdown must not break the sweep.
+
+        HONEST SCOPE, because a mutation proved the limit: this covers a
+        handler popping its own entry while shutdown runs. It does NOT cover
+        the reason the `list()` snapshot is there — a WeakKeyDictionary
+        shrinking under GC *during* the comprehension. Single-threaded asyncio
+        cannot interleave a comprehension with another coroutine, so removing
+        the snapshot still passes here. The snapshot is correct by construction
+        against collection, and that part is untestable deterministically;
+        saying so is better than a test that implies otherwise.
+        """
+        m = _mod()
+
+        async def _scenario():
+            keep = _FakeResponse()
+            doomed = _FakeResponse()
+
+            async def _owner():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    # exactly what the handler's `finally` does, mid-sweep
+                    m._LIVE_STREAM_BODIES.pop(doomed, None)
+                    return None
+
+            task = asyncio.ensure_future(_owner())
+            await asyncio.sleep(0)
+            _register(m, keep, task)
+            _register(m, doomed)
+            await m._terminate_live_stream_bodies(None)
+            return keep
+
+        keep = asyncio.run(_scenario())
+        self.assertEqual(keep.eof_calls, 1,
+                         "shutdown died partway through the sweep")
+
     def test_no_open_bodies_is_a_quiet_no_op(self):
         asyncio.run(_mod()._terminate_live_stream_bodies(None))
 
