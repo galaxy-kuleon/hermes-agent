@@ -353,6 +353,69 @@ async def _stop_cancelled_sse_agent(
             pass
 
 
+# Every stream body currently open, with the arguments needed to terminate it.
+# The framework does NOT force an in-flight StreamResponse down on shutdown --
+# proved on this image on 2026-08-12 with a disposable container:
+#
+#   docker stop --time=30 -> stopped at 30.2s, curl rc=18, no [DONE], exit 137
+#   docker stop --time=75 -> stopped at 75.2s, curl rc=18, no [DONE], exit 137
+#   ...with the shutdown terminator below:
+#   docker stop --time=30 -> stopped at  1.2s, curl rc=0,  [DONE] present, exit 0
+#
+# rc=18 is "transfer closed with outstanding read data remaining" -- the
+# "Not enough data to satisfy transfer length header" a user sees mid-answer.
+# Raising stop_grace_period does not fix it; it only buys time to finish
+# naturally. This registry is what makes the existing terminator reachable at
+# the one moment it is needed most, and it makes shutdown FASTER, not slower.
+_LIVE_STREAM_BODIES: "dict" = {}
+
+# A hung write must not hold shutdown open past the orchestrator's grace; a
+# truncated body is bad, a container that will not stop is worse.
+STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
+
+
+async def _terminate_live_stream_bodies(app=None) -> None:
+    """Terminate every open stream body, once, on shutdown.
+
+    Registered as an aiohttp `on_shutdown` callback. Best-effort and bounded:
+    each body is terminated by the same `_terminate_stream_body` the handler
+    would have used, so a client mid-answer gets a finish chunk, `[DONE]`, and a
+    properly closed chunked body instead of a severed socket.
+    """
+    import asyncio as _asyncio
+    live = list(_LIVE_STREAM_BODIES.items())
+    if not live:
+        return
+    _LIVE_STREAM_BODIES.clear()
+    logger = None
+    for _resp, args in live:
+        logger = args[-1] or logger
+    # `asyncio.wait`, NOT `wait_for`. `wait_for` bounds by CANCELLING the inner
+    # task and then awaiting it -- and `_terminate_stream_body` guards every
+    # step with `except BaseException: pass`, which swallows that cancellation
+    # and keeps going. So `wait_for` would wait forever on a write that hangs,
+    # and the bound would be decorative. Found by a mutation probe that hung for
+    # nine minutes instead of failing, which is the loudest way a test can tell
+    # you the thing it is testing does not work.
+    #
+    # `wait` returns (done, pending) WITHOUT cancelling. A stuck body is left
+    # behind and the loop tears it down at exit; shutdown proceeds either way.
+    tasks = [_asyncio.ensure_future(_terminate_stream_body(resp, *args))
+             for resp, args in live]
+    try:
+        _done, pending = await _asyncio.wait(
+            tasks, timeout=STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS)
+        for _t in pending:
+            _t.cancel()          # best effort; it may be swallowed, and that is fine
+    except BaseException:
+        pass
+    if logger is not None:
+        try:
+            logger.info("terminated %d stream body(ies) on shutdown", len(live))
+        except BaseException:
+            pass
+
+
 async def _terminate_stream_body(response, completion_id, created, model, logger) -> None:
     """Close the HTTP conversation, one best-effort step at a time.
 
@@ -3431,6 +3494,10 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+        # Registered AFTER prepare (before it, there is no body to terminate)
+        # and removed in `finally` (a normal return terminates its own body, so
+        # a stale entry would make shutdown write to a closed transport).
+        _LIVE_STREAM_BODIES[response] = (completion_id, created, model, logger)
 
         try:
             last_activity = time.monotonic()
@@ -3943,6 +4010,12 @@ class APIServerAdapter(BasePlatformAdapter):
             await _terminate_stream_body(
                 response, completion_id, created, model, logger)
             raise
+
+        finally:
+            # Every exit path, including the two that terminate the body
+            # themselves. A stale entry would make the shutdown terminator
+            # write to an already-closed transport.
+            _LIVE_STREAM_BODIES.pop(response, None)
 
         return response
 
@@ -6665,6 +6738,11 @@ class APIServerAdapter(BasePlatformAdapter):
             except (ConnectionRefusedError, OSError):
                 pass  # port is free
 
+            # Reachable only from here: the app is what aiohttp shuts down, and
+            # `on_shutdown` is the one hook that runs while the transports are
+            # still writable.
+            if _terminate_live_stream_bodies not in self._app.on_shutdown:
+                self._app.on_shutdown.append(_terminate_live_stream_bodies)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, self._host, self._port)
