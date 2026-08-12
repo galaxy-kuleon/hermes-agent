@@ -491,7 +491,13 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
         lambda: response.write(b"data: [DONE]\n\n"),
         lambda: response.write_eof(),
     )
-    _eof_ok = False
+    # Every step, not just the last. "write_eof landed" is weaker than what the
+    # shutdown path claims with it: a probe made the finish chunk and [DONE]
+    # both fail while EOF succeeded, and this returned True -- so a body the
+    # client received with NO finish reason and NO [DONE] was recorded as "the
+    # user got a proper ending". The HTTP body was terminated; the SSE
+    # conversation was not.
+    _steps_ok = [False] * len(steps)
     for _i, step in enumerate(steps):
         try:
             await step()
@@ -500,15 +506,14 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
             # one the client is waiting for.
             continue
         else:
-            if _i == len(steps) - 1:
-                _eof_ok = True
-    # Whether the CLIENT actually got a terminated body, not whether we tried.
+            _steps_ok[_i] = True
+    # Whether the CLIENT actually got a complete ending, not whether we tried.
     # The shutdown path used to mark a response as cleanly closed on intent
     # alone, so a body whose every write failed was still recorded as "the user
     # got a proper ending" -- and a later, real handler exception was suppressed
     # behind that. A false negative on a genuine failure is worse than the false
     # positive it replaced.
-    return _eof_ok
+    return all(_steps_ok)
 
 
 def _journey_suffix_safe() -> str:
@@ -3969,7 +3974,23 @@ class APIServerAdapter(BasePlatformAdapter):
                                 await response.write(_encode_content_delta(_msg))
                                 _wire["content"] = True
                                 _delivered = True
-                            except BaseException:
+                            except (asyncio.CancelledError, GeneratorExit):
+                                # Cancellation must NOT be swallowed here. This
+                                # `except BaseException: pass` was mine, written
+                                # today, and it is the exact anti-pattern the
+                                # four earlier terminator commits exist to undo:
+                                # eating the cancellation loses the explanation,
+                                # leaves a pending cancellation on the task, and
+                                # then lets the code below send [DONE] as though
+                                # the request ended normally. Re-raise and let
+                                # the cancellation path terminate the body
+                                # honestly.
+                                raise
+                            except Exception:
+                                # An ordinary write failure (dead client) is
+                                # genuinely best-effort: nothing more can reach
+                                # them, and `_delivered` stays False so the log
+                                # does not claim otherwise.
                                 pass
                             from tools.journey_context import journey_suffix as _js1
                             # Three states, because they mean different things:

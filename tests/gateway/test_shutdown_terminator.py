@@ -155,11 +155,21 @@ class ShutdownTerminatorTests(unittest.TestCase):
             asyncio.run(m._terminate_stream_body(dead, "id", 1, "m", None)),
             False, "a failed write_eof still reported the body as terminated, "
                    "which is what lets a real failure be suppressed later")
-        # ...and a failure EARLIER must not cost the EOF its truthful report.
+        # A finish chunk and [DONE] that BOTH failed, with a successful EOF, is
+        # not "a proper ending" -- the HTTP body is terminated but the SSE
+        # conversation never was, and the client has no finish reason and no
+        # [DONE]. Reporting True there is what let the shutdown path mark it as
+        # cleanly closed and then suppress a later real failure behind it.
         partial = _FakeResponse(fail_on={0, 1})
         self.assertIs(
             asyncio.run(m._terminate_stream_body(partial, "id", 1, "m", None)),
-            True, "the EOF landed but was reported as failed")
+            False, "an EOF with no finish chunk and no [DONE] was reported as a "
+                   "complete ending")
+        # ...and one failed step is enough to make it incomplete.
+        only_done = _FakeResponse(fail_on={0})
+        self.assertIs(
+            asyncio.run(m._terminate_stream_body(only_done, "id", 1, "m", None)),
+            False, "a missing finish chunk still reported a complete ending")
 
     def test_a_body_whose_writes_all_fail_is_not_marked(self):
         """End to end: intent must not become a mark."""
@@ -352,6 +362,25 @@ class EmptyReplyVocabularyTests(unittest.TestCase):
         self.assertIn("no_content_and_no_final_generic", src,
                       "a generic delivery is indistinguishable from a specific "
                       "one in the logs")
+
+    def test_cancellation_is_not_swallowed_by_the_explanation_write(self):
+        """My own `except BaseException: pass`, written today.
+
+        Eating a cancellation here loses the explanation, leaves the
+        cancellation pending on the task, and then lets the code below emit
+        `[DONE]` as though the request ended normally — the exact defect the
+        four earlier terminator commits exist to undo, reintroduced inside
+        their own fix.
+        """
+        src = _api_server_source()
+        idx = src.index("_delivered = True")
+        window = src[idx:idx + 900]
+        self.assertIn("except (asyncio.CancelledError, GeneratorExit)", window,
+                      "cancellation is caught by a bare BaseException handler "
+                      "again")
+        self.assertIn("raise", window, "cancellation is caught and not re-raised")
+        self.assertNotIn("except BaseException:\n                                pass",
+                         window, "the swallow-everything guard is back")
 
     def test_a_provider_message_with_a_filename_is_not_echoed(self):
         m = _mod()
