@@ -375,6 +375,18 @@ _LIVE_STREAM_BODIES: "dict" = {}
 # user who actually received a clean ending.
 _SHUTDOWN_TERMINATED: "set" = set()
 
+# Responses whose owner was cancelled BY SHUTDOWN. The owner's own cancellation
+# path terminates the body correctly -- but it does not know WHY it was
+# cancelled, so it wrote a clean ending with no notice and the user got an
+# incomplete answer presented as complete. Handing over to the owner without
+# telling it the reason reintroduced the very defect the notice exists to close.
+_SHUTDOWN_CANCELLED: "set" = set()
+
+# Responses the callback has taken over because the owner did not finish inside
+# the handover. The owner may still be alive and backpressured; if its write
+# later completes, it must not append a SECOND finish chunk, [DONE] and EOF.
+_SHUTDOWN_TAKEOVER: "set" = set()
+
 # A hung write must not hold shutdown open past the orchestrator's grace; a
 # truncated body is bad, a container that will not stop is worse.
 STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
@@ -473,7 +485,11 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     # handler that does NOT finish leaves us writing, and by then it is the sole
     # writer left.
     _owners = [a[4] if len(a) > 4 else None for _r, a in live]
-    for _own in _owners:
+    for (_r, _a), _own in zip(live, _owners):
+        # Tell the owner WHY, before cancelling it, so its own termination
+        # carries the notice. Without this the handover produced a clean
+        # ending on a cut-off answer -- round 8's defect through a new door.
+        _SHUTDOWN_CANCELLED.add(_r)
         if _own is not None and not _own.done():
             _own.cancel()
     if any(_own is not None for _own in _owners):
@@ -483,11 +499,18 @@ async def _terminate_live_stream_bodies(app=None) -> None:
                 timeout=STREAM_SHUTDOWN_HANDOVER_SECONDS)
         except BaseException:
             pass
+    _ours = [(r, a) for r, a in live
+             if (len(a) < 5 or a[4] is None or not a[4].done())]
+    for _r, _a in _ours:
+        # From here the callback is the writer. An owner that wakes up
+        # backpressured must not append a second ending on top of ours.
+        _SHUTDOWN_TAKEOVER.add(_r)
+        _SHUTDOWN_CANCELLED.discard(_r)
     tasks = [_asyncio.ensure_future(
                  _terminate_stream_body(resp, *args[:4],
-                                        notice=SHUTDOWN_INTERRUPTION_NOTICE))
-             for resp, args in live
-             if (len(args) < 5 or args[4] is None or not args[4].done())]
+                                        notice=SHUTDOWN_INTERRUPTION_NOTICE,
+                                        shutdown_writer=True))
+             for resp, args in _ours]
     if not tasks:
         # Every handler finished its own ending. Nothing left to write, and
         # nothing to mark: the handler's own path already terminated honestly.
@@ -495,9 +518,7 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     try:
         _done, pending = await _asyncio.wait(
             tasks, timeout=STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS)
-        _wrote = [r for r, a in live
-                  if (len(a) < 5 or a[4] is None or not a[4].done())]
-        for _resp, _t in zip(_wrote, tasks):
+        for (_resp, _a), _t in zip(_ours, tasks):
             if _t in _done and _t.exception() is None and _t.result() is True:
                 _SHUTDOWN_TERMINATED.add(_resp)
         for _t in pending:
@@ -524,7 +545,8 @@ SHUTDOWN_INTERRUPTION_NOTICE = (
 
 
 async def _terminate_stream_body(response, completion_id, created, model, logger,
-                                 notice: str = "") -> bool:
+                                 notice: str = "",
+                                 shutdown_writer: bool = False) -> bool:
     """Close the HTTP conversation, one best-effort step at a time.
 
     Each step gets its own guard, in increasing order of importance, so a
@@ -546,6 +568,15 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
     # client received with NO finish reason and NO [DONE] was recorded as "the
     # user got a proper ending". The HTTP body was terminated; the SSE
     # conversation was not.
+    if not shutdown_writer and response in _SHUTDOWN_TAKEOVER:
+        # The callback owns this body now, so an owner arriving late must stand
+        # down: a second ending is worse than none. The callback itself sets
+        # `shutdown_writer`, because otherwise it would refuse its own call --
+        # which is exactly what happened, and four previously-green tests said
+        # so immediately.
+        return False
+    if not notice and response in _SHUTDOWN_CANCELLED:
+        notice = SHUTDOWN_INTERRUPTION_NOTICE
     if notice:
         # BEFORE the terminal, so it lands inside the answer the user is
         # reading rather than after the conversation has been closed.

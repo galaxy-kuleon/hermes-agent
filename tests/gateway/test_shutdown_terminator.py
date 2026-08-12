@@ -106,6 +106,8 @@ class ShutdownTerminatorTests(unittest.TestCase):
     def setUp(self):
         _mod()._LIVE_STREAM_BODIES.clear()
         _mod()._SHUTDOWN_TERMINATED.clear()
+        _mod()._SHUTDOWN_CANCELLED.clear()
+        _mod()._SHUTDOWN_TAKEOVER.clear()
 
     tearDown = setUp
 
@@ -301,6 +303,105 @@ class ShutdownTerminatorTests(unittest.TestCase):
             r.writes, [],
             "the callback wrote over an owner that was still finishing its own "
             "ending -- cancelling is not handing over")
+
+    def test_a_RESPONSIVE_owner_still_tells_the_user_it_was_cut_short(self):
+        """The composition my two other tests each covered half of.
+
+        The notice test used the legacy four-element (no owner) registration;
+        the owner test only checked that the callback wrote nothing. Neither
+        composed a REAL five-element registration with an owner that runs its
+        own cancellation termination — and in that path the owner wrote a clean
+        finish + [DONE] + EOF with NO notice, and the callback then correctly
+        stood aside. The user got an incomplete answer presented as complete:
+        round 8's defect, through a new door, with 31 green tests.
+        """
+        m = _mod()
+
+        async def _scenario():
+            r = _FakeResponse()
+
+            async def _owner():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    # exactly what the real handler's cancellation path does
+                    await m._terminate_stream_body(r, "id", 1, "model", None)
+                    return None
+
+            task = asyncio.ensure_future(_owner())
+            await asyncio.sleep(0)
+            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            await m._terminate_live_stream_bodies(None)
+            await asyncio.sleep(0.05)
+            return r
+
+        r = asyncio.run(_scenario())
+        joined = b"".join(r.writes)
+        self.assertIn(b"cut short", joined,
+                      "the owner terminated cleanly without telling the user "
+                      "the answer was truncated")
+        self.assertEqual(joined.count(b"[DONE]"), 1, "two endings were written")
+        self.assertEqual(r.eof_calls, 1, "EOF written twice")
+
+    def test_the_callback_MARKS_takeover_when_the_owner_misses_the_handover(self):
+        """End to end, because the hand-placed mark proved nothing.
+
+        My other takeover test put the response in the set by hand, so a mutant
+        that never marked it survived: the guard worked and nothing ever set it.
+        Here the owner ignores cancellation past the handover, the callback
+        writes, and only then does the owner try to terminate — which is the
+        real sequence and the only one that exercises the marking.
+        """
+        m = _mod()
+        saved = m.STREAM_SHUTDOWN_HANDOVER_SECONDS
+        m.STREAM_SHUTDOWN_HANDOVER_SECONDS = 0.05
+
+        async def _scenario():
+            r = _FakeResponse()
+
+            async def _owner():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    # Backpressured: still alive well past the handover.
+                    await asyncio.sleep(0.5)
+                    return None
+
+            task = asyncio.ensure_future(_owner())
+            await asyncio.sleep(0)
+            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            await m._terminate_live_stream_bodies(None)
+            wrote_by_callback = len(r.writes)
+            # ...and now the late owner tries to end it too.
+            await m._terminate_stream_body(r, "id", 1, "model", None)
+            return r, wrote_by_callback
+
+        try:
+            r, by_callback = asyncio.run(_scenario())
+        finally:
+            m.STREAM_SHUTDOWN_HANDOVER_SECONDS = saved
+        self.assertGreater(by_callback, 0,
+                           "the callback did not write for an owner that "
+                           "missed the handover")
+        self.assertEqual(len(r.writes), by_callback,
+                         "the late owner appended a second ending on top of "
+                         "the callback's")
+        self.assertEqual(r.eof_calls, 1, "EOF written twice")
+
+    def test_a_late_owner_cannot_append_a_second_ending(self):
+        """If the owner is backpressured past the handover, the callback writes
+        — and the owner must then stand down rather than appending a second
+        finish chunk, [DONE] and EOF on top."""
+        m = _mod()
+        r = _FakeResponse()
+        m._SHUTDOWN_TAKEOVER.add(r)
+        try:
+            out = asyncio.run(m._terminate_stream_body(r, "id", 1, "m", None))
+        finally:
+            m._SHUTDOWN_TAKEOVER.discard(r)
+        self.assertIs(out, False)
+        self.assertEqual(r.writes, [], "a second ending was appended")
+        self.assertEqual(r.eof_calls, 0)
 
     def test_no_open_bodies_is_a_quiet_no_op(self):
         asyncio.run(_mod()._terminate_live_stream_bodies(None))
