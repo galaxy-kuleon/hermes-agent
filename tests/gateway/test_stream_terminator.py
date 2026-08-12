@@ -238,21 +238,60 @@ class HandlerOrderTests(unittest.TestCase):
 
     def test_the_terminator_guards_each_step_separately(self):
         """One try around all three steps is the defect 744c22053 fixed. The
-        loop-with-per-step-guard shape is what keeps write_eof reachable."""
+        loop-with-per-step-guard shape is what keeps write_eof reachable.
+
+        The writes moved into `_terminate_stream_body_locked` when the
+        lifecycle lock arrived, and this test kept naming the old function --
+        so it went red and stayed red, because the suite that owns the
+        terminator was run and this neighbouring one was not. Look for the
+        function that actually writes, whatever it is called."""
         tree = ast.parse(_api_server_source())
-        fn = next(
-            (n for n in ast.walk(tree)
-             if isinstance(n, ast.AsyncFunctionDef) and n.name == "_terminate_stream_body"),
-            None)
-        self.assertIsNotNone(fn, "_terminate_stream_body is gone")
+        fns = [n for n in ast.walk(tree)
+               if isinstance(n, ast.AsyncFunctionDef)
+               and n.name.startswith("_terminate_stream_body")]
+        fn = next((n for n in fns
+                   if any(isinstance(x, (ast.For, ast.AsyncFor))
+                          for x in ast.walk(n))), None)
+        self.assertIsNotNone(
+            fn, f"no terminator function has a per-step loop any more "
+                f"(looked at {[n.name for n in fns]})")
         loops = [n for n in ast.walk(fn) if isinstance(n, (ast.For, ast.AsyncFor))]
         self.assertTrue(loops, "the per-step loop is gone; steps are guarded together again")
+        # The guard may sit inline in the loop, or in a small helper the loop
+        # calls -- the shape that matters is one guard PER STEP, not one around
+        # all of them. When per-step bounding arrived the guard moved into
+        # `_bounded`, which is the same property expressed once instead of
+        # three times.
         tries = [n for n in ast.walk(loops[0]) if isinstance(n, ast.Try)]
-        self.assertTrue(tries, "the per-step guard inside the loop is gone")
+        if not tries:
+            helpers = {h.name: h for h in ast.walk(fn)
+                       if isinstance(h, (ast.AsyncFunctionDef, ast.FunctionDef))
+                       and h is not fn}
+            called = {n.func.id for n in ast.walk(loops[0])
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            for name in called & set(helpers):
+                tries.extend(n for n in ast.walk(helpers[name])
+                             if isinstance(n, ast.Try))
+        self.assertTrue(
+            tries, "no per-step guard: neither inside the loop nor in any "
+                   "helper the loop calls")
         caught = [ast.unparse(h.type) if h.type else "bare" for h in tries[0].handlers]
         self.assertIn(
             "BaseException", caught,
             f"the per-step guard must cover BaseException, not just {caught}")
+        # The point of the shape: EOF stays reachable when an earlier step
+        # fails. It is written OUTSIDE the loop, after it, so no per-step
+        # failure can skip it. (Behavioural cover for this lives in
+        # tests/gateway/test_shutdown_terminator.py --
+        # `test_eof_is_recorded_even_when_the_ending_was_incomplete`.)
+        eof_calls = [n for n in ast.walk(fn)
+                     if isinstance(n, ast.Attribute) and n.attr == "write_eof"]
+        self.assertTrue(eof_calls, "the terminator no longer closes the body")
+        loop_lines = range(loops[0].lineno, loops[0].end_lineno + 1)
+        self.assertTrue(
+            any(n.lineno not in loop_lines for n in eof_calls),
+            "write_eof only happens inside the per-step loop; a failure "
+            "pattern that exits the loop early would leave the body open")
 
 
 if __name__ == "__main__":
