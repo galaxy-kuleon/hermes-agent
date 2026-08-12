@@ -373,10 +373,54 @@ _LIVE_STREAM_BODIES: "dict" = {}
 # truncated body is bad, a container that will not stop is worse.
 STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
 
-# An internal reason string is for a human to read, not a place to paste a
-# model's output into a chat. Bounded so a pathological error cannot become the
-# answer.
-EMPTY_REPLY_REASON_MAX_CHARS = 300
+# CLOSED VOCABULARY, and the reason it has to be closed.
+#
+# I first rendered `result["error"]` directly, bounded to 300 characters,
+# reasoning it was "an internal string our own loop produced". **That was
+# false**, and adversarial review proved it on the deployed runtime with
+# synthetic text:
+#
+#     SUMMARY=HTTP 400: Cannot process Smith-v-Jones-SETTLEMENT-DRAFT.docx
+#     WIRE=⚠️ No reply: HTTP 400: Cannot process Smith-v-Jones-SETTLEMENT-DRAFT.docx
+#
+# Two producers carry untrusted text: `_summarize_api_error` accepts
+# `body.error.message` and raw `str(error)` from the provider, and the invalid
+# tool-call path interpolates a MODEL-CHOSEN tool name. A length bound bounds
+# length, not provenance -- a filename fits in 300 characters comfortably.
+#
+# So the loop's internal constants are MAPPED to sentences this file owns, and
+# anything unrecognised gets the generic one. The gateway never renders a string
+# it did not write.
+_EMPTY_REPLY_SENTENCES = (
+    ("Response truncated due to output length limit",
+     "the answer hit the model's output length limit before it finished."),
+    ("Stream repeatedly dropped mid tool-call",
+     "the connection to the model kept dropping mid tool-call, so the tool "
+     "never ran."),
+    ("Incomplete REASONING_SCRATCHPAD",
+     "the model's reasoning block stayed incomplete after retries."),
+    ("Codex response remained incomplete",
+     "the model kept returning an incomplete response after several "
+     "continuation attempts."),
+    ("Model generated invalid tool call",
+     "the model kept asking for a tool that does not exist."),
+)
+_EMPTY_REPLY_GENERIC = ("the turn ended without producing an answer.")
+
+
+def _empty_reply_sentence(error) -> str:
+    """Our own sentence for a loop reason, or the generic one. Never their text.
+
+    Prefix matching, because the two dynamic producers append untrusted text to
+    a constant head -- matching the head keeps the classification while leaving
+    the tail unread.
+    """
+    if isinstance(error, str):
+        head = error.strip()
+        for prefix, sentence in _EMPTY_REPLY_SENTENCES:
+            if head.startswith(prefix):
+                return sentence
+    return _EMPTY_REPLY_GENERIC
 
 
 async def _terminate_live_stream_bodies(app=None) -> None:
@@ -3879,23 +3923,31 @@ class APIServerAdapter(BasePlatformAdapter):
                         # The reason is a bounded internal string produced by our
                         # own loop, not model output, so surfacing it tells the
                         # user what happened instead of showing a blank box.
-                        _why = ""
-                        if isinstance(result, dict):
-                            _err = result.get("error")
-                            if isinstance(_err, str) and _err.strip():
-                                _why = _err.strip()[:EMPTY_REPLY_REASON_MAX_CHARS]
-                        if _why:
-                            _msg = ("\u26a0\ufe0f No reply: " + _why
+                        _err = result.get("error") if isinstance(result, dict) else None
+                        _known = any(
+                            isinstance(_err, str) and _err.strip().startswith(_p)
+                            for _p, _ in _EMPTY_REPLY_SENTENCES)
+                        if _known:
+                            _msg = ("\u26a0\ufe0f No reply: "
+                                    + _empty_reply_sentence(_err)
                                     + " Send `continue` to retry.")
+                            # The log must not claim more than the wire got. The
+                            # first version logged "explained" from inside a
+                            # `try`, so a failed write still reported that the
+                            # user had been told why -- a metric lying about the
+                            # exact thing it was built to measure.
+                            _delivered = False
                             try:
                                 await response.write(_encode_content_delta(_msg))
                                 _wire["content"] = True
+                                _delivered = True
                             except BaseException:
                                 pass
                             from tools.journey_context import journey_suffix as _js1
                             logger.warning(
-                                "empty_reply service=gateway "
-                                "reason=no_content_and_no_final_explained"
+                                "empty_reply service=gateway reason="
+                                + ("no_content_and_no_final_explained"
+                                   if _delivered else "no_content_and_no_final")
                                 + _js1())
                         else:
                             from tools.journey_context import journey_suffix as _js1

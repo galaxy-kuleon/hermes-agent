@@ -265,15 +265,70 @@ class EmptyReplyReasonTests(unittest.TestCase):
         """Not every early return carries an error string. That case must stay
         distinguishable in the logs rather than being folded into the explained
         one, or the ledger loses the ability to count them apart."""
-        self.assertIn("reason=no_content_and_no_final_explained", self.src)
-        self.assertIn('"empty_reply service=gateway reason=no_content_and_no_final"',
-                      self.src)
+        self.assertIn('"no_content_and_no_final_explained"', self.src)
+        self.assertIn("no_content_and_no_final", self.src)
+        # ...and the explained label must be chosen by whether the write
+        # SUCCEEDED, not merely attempted. The first version logged it from
+        # inside the try, so a failed write still reported the user had been
+        # told why -- a metric lying about the one thing it was built to
+        # measure.
+        self.assertIn("if _delivered else", self.src,
+                      "the explained label is not conditioned on delivery")
 
-    def test_the_surfaced_reason_is_bounded(self):
-        """An internal reason is for a human to read, not a place for a
-        pathological error to become the answer."""
-        self.assertIn("EMPTY_REPLY_REASON_MAX_CHARS", self.src)
-        idx = self.src.index('_err = result.get("error")')
-        self.assertIn("EMPTY_REPLY_REASON_MAX_CHARS", self.src[idx:idx + 600],
-                      "the bound exists but is not applied where the reason is "
-                      "taken")
+    def test_the_providers_text_never_reaches_the_wire(self):
+        """The M4 boundary, and the reason this is a closed vocabulary.
+
+        I first rendered `result["error"]` directly with a 300-character bound,
+        calling it "an internal string our own loop produced". It is not:
+        `_summarize_api_error` accepts `body.error.message` and raw
+        `str(error)`, and the invalid-tool path interpolates a MODEL-CHOSEN
+        name. Adversarial review put a synthetic filename through it and watched
+        it reach the wire. A length bound bounds length, not provenance.
+        """
+        self.assertNotIn("EMPTY_REPLY_REASON_MAX_CHARS", self.src,
+                         "the length-bounded raw-error path is back")
+        self.assertIn("_EMPTY_REPLY_SENTENCES", self.src)
+        self.assertNotIn("_why = _err.strip()", self.src,
+                         "the raw error is being rendered again")
+
+
+@unittest.skipIf(_SKIP, _SKIP)
+class EmptyReplyVocabularyTests(unittest.TestCase):
+    """Behavioural: only sentences this file owns may be produced."""
+
+    def test_a_provider_message_with_a_filename_is_not_echoed(self):
+        m = _mod()
+        leak = "HTTP 400: Cannot process Smith-v-Jones-SETTLEMENT-DRAFT.docx"
+        out = m._empty_reply_sentence(leak)
+        self.assertNotIn("Smith-v-Jones", out)
+        self.assertNotIn(".docx", out)
+        self.assertEqual(out, m._EMPTY_REPLY_GENERIC)
+
+    def test_a_model_chosen_tool_name_is_not_echoed(self):
+        m = _mod()
+        out = m._empty_reply_sentence(
+            "Model generated invalid tool call: read_/Users/kg/clients/acme.pdf")
+        self.assertNotIn("acme", out)
+        self.assertNotIn("/Users", out)
+        self.assertIn("does not exist", out)
+
+    def test_each_known_reason_maps_to_its_own_sentence(self):
+        m = _mod()
+        seen = set()
+        for prefix, sentence in m._EMPTY_REPLY_SENTENCES:
+            got = m._empty_reply_sentence(prefix + " ...trailing junk...")
+            self.assertEqual(got, sentence)
+            seen.add(got)
+        self.assertEqual(len(seen), len(m._EMPTY_REPLY_SENTENCES),
+                         "two reasons collapsed onto one sentence")
+
+    def test_every_rendered_sentence_is_literal_in_this_file(self):
+        """The property that actually protects the boundary: whatever comes out
+        must appear verbatim in the source, so no input can shape it."""
+        m = _mod()
+        src = _api_server_source()
+        for probe in ("", "unknown thing", "HTTP 500 " + "x" * 500, None, 42):
+            out = m._empty_reply_sentence(probe)
+            self.assertIn(out, src,
+                          f"a sentence not written in this file reached the "
+                          f"user for input {probe!r}")
