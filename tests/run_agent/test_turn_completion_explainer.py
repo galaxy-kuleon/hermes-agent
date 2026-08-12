@@ -262,3 +262,45 @@ def test_finalizer_prefers_a_real_cause_over_the_stop_shape():
     assert guard, "the substitution is unguarded"
     assert "unknown" in guard, f"a real cause would be overridden: {guard}"
     assert "tool" in guard, f"the substitution is not tied to a pending tool: {guard}"
+
+
+# The reasons this deployment has actually produced, measured on 2026-08-12
+# from 59 real turns in the journey ledger (55 + 4, no others). Not a guess at
+# what the code can emit -- a census of what it DID emit to real users.
+#
+# Every existing test above checks that an unlisted reason is not silent. That
+# is a weaker property than the one that matters here: `interrupted_during_api_
+# call` has a specific, accurate message today, and deleting that branch would
+# keep every one of those tests passing while telling a user "the reason was
+# not recorded" about a reason that is recorded and named. Generic-instead-of-
+# specific is a silent regression; this is the test that fails on it.
+_OBSERVED_LIVE_REASONS = (
+    ("text_response(finish_reason=stop)", "silent"),
+    ("interrupted_during_api_call", "specific"),
+)
+
+_GENERIC_MARKER = "the reason was not recorded"
+
+
+def test_every_reason_seen_in_production_is_handled_on_purpose():
+    for reason, expected in _OBSERVED_LIVE_REASONS:
+        out = AIAgent._format_turn_completion_explanation(reason)
+        if expected == "silent":
+            assert out == "", (
+                f"{reason!r} is 55 of 59 real turns -- a warning here puts a "
+                f"banner on almost every healthy answer, got {out!r}")
+        else:
+            assert out, f"{reason!r} fell through to silence"
+            assert _GENERIC_MARKER not in out, (
+                f"{reason!r} lost its specific message and now claims the "
+                f"reason was not recorded -- but it IS recorded: {out!r}")
+
+
+def test_the_generic_message_is_still_reachable_for_a_genuine_unknown():
+    """Negative control for the test above.
+
+    Without this, deleting the generic branch entirely would satisfy the
+    specificity assertion by making every message specific -- and the unknown
+    exit path, the whole reason this function was inverted, would go silent.
+    """
+    assert _GENERIC_MARKER in AIAgent._format_turn_completion_explanation("unknown")
