@@ -438,7 +438,22 @@ def _register_stream_body(response, args, owner) -> "_StreamLifecycle":
 
 # A hung write must not hold shutdown open past the orchestrator's grace: a
 # truncated body is bad, a container that will not stop is worse.
-STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
+# The terminal is at most four wire steps: notice, finish, [DONE], EOF.
+STREAM_SHUTDOWN_MAX_TERMINAL_STEPS = 4
+# Per-wire-step bound. A step is one write to an already-open socket; if it
+# takes longer than this the peer is gone or the transport is wedged, and
+# waiting longer only delays the ending for everyone else.
+STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS = 1.5
+# DERIVED, not chosen. These were picked independently once, and the arithmetic
+# quietly contradicted itself: four steps at 2.0s each is 8s of permitted work
+# inside a 5s deadline plus a 2s drain. The sweep then gave up while its own
+# writer was still legitimately working, which is the exact state the drain
+# exists to prevent. A deadline that cannot accommodate the work it authorises
+# is not a deadline, it is a lie with a number in it.
+STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = (
+    STREAM_SHUTDOWN_MAX_TERMINAL_STEPS * STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS)
+# One more step: a writer cancelled at the deadline still gets to attempt EOF.
+STREAM_SHUTDOWN_WRITER_DRAIN_SECONDS = STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS
 # How long the owning handler gets to finish its own termination after being
 # cancelled, before the callback writes instead.
 STREAM_SHUTDOWN_HANDOVER_SECONDS = 1.0
@@ -446,12 +461,7 @@ STREAM_SHUTDOWN_HANDOVER_SECONDS = 1.0
 # ever. Reaching it means requests are still arriving after N full sweeps,
 # which is a load-balancer problem, not a stream problem.
 STREAM_SHUTDOWN_MAX_DRAIN_WAVES = 8
-# Per-wire-step bound. A step is one write to an already-open socket; if it
-# takes longer than this the peer is gone or the transport is wedged, and
-# waiting longer only delays the ending for everyone else.
-STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS = 2.0
-# How long to wait for terminator tasks we just cancelled to actually finish.
-STREAM_SHUTDOWN_WRITER_DRAIN_SECONDS = 2.0
+
 
 # What a user is told when a restart cuts their answer short. A terminal alone
 # is WORSE than the truncation it replaced: a truncated body looks broken, while
@@ -543,7 +553,8 @@ async def _terminate_live_stream_bodies(app=None) -> None:
                                             shutdown_writer=True))
                  for r, lc in items]
         if not tasks:
-            return 0
+            return {"attempted": 0, "complete": 0, "closed_bare": 0,
+                    "still_open": 0}
         try:
             done, pending = await _asyncio.wait(
                 tasks, timeout=STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS)
@@ -573,7 +584,22 @@ async def _terminate_live_stream_bodies(app=None) -> None:
                             pass
         except BaseException:
             pass
-        return len(tasks)
+        # COUNT WHAT HAPPENED, not how many we asked for. Returning
+        # `len(tasks)` and logging it as "terminated N" told the operator the
+        # opposite of the lifecycle: one attempted body that ended with
+        # terminated=False and eof_sent=False was reported as a clean
+        # termination. The four outcomes are genuinely different and only one
+        # of them is good.
+        outcome = {"attempted": len(tasks), "complete": 0,
+                   "closed_bare": 0, "still_open": 0}
+        for _r, _lc in items:
+            if _lc.terminated:
+                outcome["complete"] += 1
+            elif _lc.eof_sent:
+                outcome["closed_bare"] += 1
+            else:
+                outcome["still_open"] += 1
+        return outcome
 
     global _STREAMS_SHUTTING_DOWN
     _STREAMS_SHUTTING_DOWN = True    # FIRST: closes the arrive-after-us hole
@@ -584,12 +610,22 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     # third wave exactly as one missed a second. Keep going while a pass finds
     # work, stop as soon as one comes up empty. An idle shutdown does one empty
     # pass and returns, so this costs nothing when there is nothing to do.
-    seen, n, waves, logger = set(), 0, 0, None
+    seen, waves, logger = set(), 0, None
+    totals = {"attempted": 0, "complete": 0, "closed_bare": 0, "still_open": 0}
     while waves < STREAM_SHUTDOWN_MAX_DRAIN_WAVES:
         # SNAPSHOT. Iterating the live mapping while handlers deregister in
         # their `finally` raises "dictionary changed size during iteration" --
         # and a WeakKeyDictionary can also shrink under you when a response is
         # collected mid-loop, with no concurrency at all.
+        # `seen` means ONE attempt per body, ever. Not for cost -- because a
+        # second attempt can duplicate an irreversible terminal. aiohttp's
+        # StreamWriter.write_eof puts `0\r\n\r\n` on the transport and THEN
+        # awaits drain; a cancellation landing between those two lines leaves
+        # the terminal chunk already on the wire with nothing recording that it
+        # got there. Retrying from the notice would then write a second ending
+        # after the first one shipped. Without per-step wire provenance, one
+        # attempt is the safe policy and a residual failure stays visibly
+        # broken -- which is the whole rule this file runs on.
         batch = [(r, lc) for r, lc in list(_LIVE_STREAM_BODIES.items())
                  if id(r) not in seen and not lc.terminated and not lc.eof_sent]
         if not batch:
@@ -597,11 +633,16 @@ async def _terminate_live_stream_bodies(app=None) -> None:
         seen |= {id(r) for r, _lc in batch}
         for _r, _lc in batch:
             logger = _lc.args[-1] or logger
-        n += await _sweep(batch)
+        for _k, _v in (await _sweep(batch)).items():
+            totals[_k] += _v
         waves += 1
     if logger is not None:
         try:
-            logger.info("terminated %d stream body(ies) on shutdown", n)
+            logger.info(
+                "stream_shutdown_sweep service=gateway attempted=%d "
+                "complete=%d closed_bare=%d still_open=%d waves=%d",
+                totals["attempted"], totals["complete"],
+                totals["closed_bare"], totals["still_open"], waves)
         except BaseException:
             pass
 
@@ -622,8 +663,11 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
         # Unregistered body: no lifecycle to record progress on, so the
         # irreversible half of the result has nowhere to live. Return only the
         # completeness verdict, matching this function's contract.
-        ok, _eof = await _terminate_stream_body_locked(
-            response, completion_id, created, model, logger, notice)
+        ok, _eof, _cancelled = await _terminate_stream_body_locked(
+            response, completion_id, created, model, logger, notice,
+            shutdown_writer=shutdown_writer)
+        if _cancelled and shutdown_writer:
+            raise asyncio.CancelledError()
         return ok
     async with lc.lock:
         if lc.terminated or lc.eof_sent:
@@ -635,15 +679,24 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
         if not notice and lc.shutdown:
             # The owner does not know WHY it was cancelled; the lifecycle does.
             notice = SHUTDOWN_INTERRUPTION_NOTICE
-        ok, eof = await _terminate_stream_body_locked(
-            response, completion_id, created, model, logger, notice)
+        ok, eof, _cancelled = await _terminate_stream_body_locked(
+            response, completion_id, created, model, logger, notice,
+            shutdown_writer=shutdown_writer)
+        # State BEFORE propagating: a cancelled writer that reached EOF still
+        # closed the body, and the next wave has to know that.
         lc.terminated = ok
         lc.eof_sent = lc.eof_sent or eof
+        if _cancelled and shutdown_writer:
+            # End as cancelled so the sweep's drain can actually observe this
+            # task finishing, instead of watching a task that swallowed its own
+            # cancellation and kept the lock.
+            raise asyncio.CancelledError()
         return ok
 
 
 async def _terminate_stream_body_locked(response, completion_id, created, model,
-                                        logger, notice: str = ""):
+                                        logger, notice: str = "",
+                                        shutdown_writer: bool = False):
     """The writes themselves. Never called without the lock when one exists.
 
     Returns `(complete, eof_sent)`. The second value is the irreversible one:
@@ -667,10 +720,31 @@ async def _terminate_stream_body_locked(response, completion_id, created, model,
     # that BLOCKS rather than failing keeps that task alive -- holding the
     # lifecycle lock, past the callback, into loop teardown, until SIGKILL
     # recreates the truncation this whole path exists to prevent.
+    # ONE CANCELLATION POLICY CANNOT SERVE TWO OWNERS, and treating them alike
+    # is what defeated the outer deadline.
+    #
+    # The request handler's own terminator is deliberately stubborn: it is
+    # already being cancelled -- that is WHY it is writing an ending -- so a
+    # second cancellation must not stop it finishing the sentence.
+    #
+    # The shutdown callback's writer is the opposite. It was cancelled BECAUSE
+    # the shutdown deadline expired. Walking on to the next step then spends
+    # budget the caller has already given up waiting for: the sweep returns
+    # while this task is still alive holding the lifecycle lock, the drain
+    # observes nothing to drain, and if the process loses the rest of its grace
+    # mid-write the client gets exactly the truncated body this path exists to
+    # prevent. It must stop and let itself be drained.
+    cancelled = False
+
     async def _bounded(coro_factory) -> bool:
+        nonlocal cancelled
         try:
             await _asyncio_mod.wait_for(coro_factory(),
                                         STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS)
+        except _asyncio_mod.CancelledError:
+            # OUR timeout raises TimeoutError; this is somebody cancelling us.
+            cancelled = True
+            return False
         except BaseException:
             return False
         return True
@@ -703,7 +777,7 @@ async def _terminate_stream_body_locked(response, completion_id, created, model,
                     "phase=terminal")
             except BaseException:
                 pass
-            return False, await _write_eof()
+            return False, await _write_eof(), cancelled
 
     steps = (
         lambda: response.write(
@@ -717,8 +791,12 @@ async def _terminate_stream_body_locked(response, completion_id, created, model,
         # below is the one the client is waiting for. Each attempt is bounded,
         # so "keep going" cannot become "block for ever on step two".
         ok[i] = await _bounded(step)
+        if cancelled and shutdown_writer:
+            break
+    # EOF is still attempted once, even when cancelled: it is the step the
+    # client is actually waiting on, and it is bounded like the rest.
     eof = await _write_eof()
-    return all(ok) and eof, eof
+    return all(ok) and eof, eof, cancelled
 
 
 def _journey_suffix_safe() -> str:

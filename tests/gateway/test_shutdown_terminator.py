@@ -824,19 +824,27 @@ class BoundedWriterTests(unittest.TestCase):
     exists to prevent, reached the long way round.
     """
 
-    _FAST = {
-        "STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS": 0.05,
-        "STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS": 0.10,
-        "STREAM_SHUTDOWN_WRITER_DRAIN_SECONDS": 0.50,
-        "STREAM_SHUTDOWN_HANDOVER_SECONDS": 0.01,
-    }
+    # SCALED, not chosen. Hand-picked fast constants are how the real defect
+    # hid: production allowed four 2.0s steps inside a 5.0s deadline plus a
+    # 2.0s drain (8s of work in a 7s budget), while this fixture used four
+    # 0.05s steps inside 0.10 + 0.50 (0.2s of work in a 0.6s budget). The
+    # fixture was generous exactly where production was short, so a test that
+    # looked like it modelled the deadline modelled its opposite. One factor,
+    # applied to every constant, keeps the ratio the code actually ships.
+    _SCALE = 0.02
+    _SCALED = (
+        "STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS",
+        "STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS",
+        "STREAM_SHUTDOWN_WRITER_DRAIN_SECONDS",
+        "STREAM_SHUTDOWN_HANDOVER_SECONDS",
+    )
 
     def setUp(self):
         self.m = _mod()
-        self._saved = {k: getattr(self.m, k) for k in self._FAST}
+        self._saved = {k: getattr(self.m, k) for k in self._SCALED}
         self._flag = self.m._STREAMS_SHUTTING_DOWN
-        for k, v in self._FAST.items():
-            setattr(self.m, k, v)
+        for k, v in self._saved.items():
+            setattr(self.m, k, v * self._SCALE)
         self.m._LIVE_STREAM_BODIES.clear()
 
     def tearDown(self):
@@ -881,6 +889,162 @@ class BoundedWriterTests(unittest.TestCase):
                            "one blocked step swallowed the whole ending")
         self.assertIn("write_eof", seen["attempts"],
                       "a blocked content write cost the client its EOF")
+
+    def test_the_deadline_can_actually_accommodate_the_work_it_authorises(self):
+        """The arithmetic, checked rather than assumed.
+
+        Four bounded steps at 2.0s each is 8s of permitted work; the sweep gave
+        up at 5s and drained for 2. The sweep was therefore GUARANTEED, on a
+        slow transport, to return while its own writer was still legitimately
+        working -- the exact state the drain exists to prevent, written into
+        the constants.
+        """
+        m = self.m
+        worst_case = (self._saved["STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS"]
+                      * m.STREAM_SHUTDOWN_MAX_TERMINAL_STEPS)
+        budget = (self._saved["STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS"]
+                  + self._saved["STREAM_SHUTDOWN_WRITER_DRAIN_SECONDS"])
+        self.assertLessEqual(
+            worst_case, budget,
+            f"the terminator may legitimately spend {worst_case}s, and the "
+            f"sweep waits {budget}s — a deadline that cannot accommodate the "
+            f"work it authorises is a lie with a number in it")
+
+    def test_a_writer_cancelled_at_the_deadline_STOPS_instead_of_walking_on(self):
+        """Round 12 A1. One cancellation policy cannot serve two owners.
+
+        The handler's own terminator is deliberately stubborn: it is already
+        being cancelled, which is WHY it is writing an ending, so a second
+        cancellation must not stop it mid-sentence. The shutdown callback's
+        writer was cancelled BECAUSE the deadline expired -- if it walks on to
+        the next step it spends budget nobody is waiting for, and the sweep
+        returns while it still holds the lifecycle lock.
+
+        The NOTICE must succeed first. A cancellation on the notice takes the
+        undeliverable-notice gate and returns immediately, so it exercises none
+        of this -- which is exactly what an earlier version of this test did,
+        and it passed against a writer that walked on.
+        """
+        m, seen = self.m, {}
+
+        class _BlockAfterFirst(_FakeResponse):
+            async def write(self, data):
+                self.attempts.append("write")
+                if len(self.attempts) > 1:
+                    await asyncio.sleep(3600)
+                self.writes.append(data)
+
+            async def write_eof(self):
+                self.attempts.append("write_eof")
+                await asyncio.sleep(3600)
+
+        async def scenario():
+            resp = _BlockAfterFirst()
+            lc = m._register_stream_body(resp, ("id", 1, "model", None), None)
+            task = asyncio.ensure_future(m._terminate_stream_body(
+                resp, "id", 1, "model", None,
+                notice=m.SHUTDOWN_INTERRUPTION_NOTICE, shutdown_writer=True))
+            # Land inside the SECOND step, after the notice has gone out.
+            await asyncio.sleep(m.STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS * 0.5)
+            task.cancel()
+            await asyncio.sleep(m.STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS * 5)
+            seen["done"] = task.done()
+            seen["cancelled"] = task.done() and task.cancelled()
+            seen["locked"] = lc.lock.locked()
+            seen["attempts"] = list(resp.attempts)
+
+        asyncio.run(scenario())
+        self.assertTrue(seen["done"],
+                        "the cancelled shutdown writer is still running")
+        self.assertFalse(seen["locked"],
+                         "the cancelled shutdown writer still holds the "
+                         "lifecycle lock, so no later wave can end this body")
+        self.assertTrue(
+            seen["cancelled"],
+            "it swallowed its own cancellation and returned normally — the "
+            "sweep's drain then has nothing to observe finishing")
+        writes = [a for a in seen["attempts"] if a == "write"]
+        self.assertLess(
+            len(writes), 3,
+            f"it kept writing after the deadline cancelled it: "
+            f"{seen['attempts']}")
+        self.assertIn("write_eof", seen["attempts"],
+                      "stopping cost the client the one step it waits for")
+
+    def test_the_HANDLER_owned_terminator_still_finishes_its_sentence(self):
+        """The other half of the same rule. Making the callback writer stop
+        must not make the handler's own terminator give up -- that stubbornness
+        is a previous fix (a4930218) and re-swallowing it here would reopen the
+        truncation it closed."""
+        m, seen = self.m, {}
+
+        class _CancelOnce(_FakeResponse):
+            def __init__(self):
+                super().__init__()
+                self._fired = False
+
+            async def write(self, data):
+                self.attempts.append("write")
+                if not self._fired:
+                    self._fired = True
+                    raise asyncio.CancelledError()
+                self.writes.append(data)
+
+        async def scenario():
+            resp = _CancelOnce()
+            m._register_stream_body(resp, ("id", 1, "model", None), None)
+            await m._terminate_stream_body(
+                resp, "id", 1, "model", None,
+                notice=m.SHUTDOWN_INTERRUPTION_NOTICE)   # handler-owned
+            seen["attempts"] = list(resp.attempts)
+
+        asyncio.run(scenario())
+        self.assertIn("write_eof", seen["attempts"],
+                      "a cancellation on one step cost the client its EOF")
+
+    def test_the_SWEEP_leaves_no_writer_alive_when_the_notice_landed_first(self):
+        """The end-to-end shape of round 12 A1, at the level it was measured.
+
+        Its probe reported, immediately after `_terminate_live_stream_bodies()`
+        returned and before loop teardown:
+
+            CANCEL_DRAIN elapsed=0.302 alive=1 lock=True
+                         attempts=write1,write2,write3,eof
+
+        A writer still on the wire, still holding the lifecycle lock, after the
+        callback said it was finished. Blocking on the FIRST write cannot show
+        this -- that path returns through the undeliverable-notice gate.
+        """
+        m, seen = self.m, {}
+
+        class _BlockAfterFirst(_FakeResponse):
+            async def write(self, data):
+                self.attempts.append("write")
+                if len(self.attempts) > 1:
+                    await asyncio.sleep(3600)
+                self.writes.append(data)
+
+            async def write_eof(self):
+                self.attempts.append("write_eof")
+                await asyncio.sleep(3600)
+
+        async def scenario():
+            resp = _BlockAfterFirst()
+            lc = m._register_stream_body(resp, ("id", 1, "model", None), None)
+            await m._terminate_live_stream_bodies()
+            # No await in between: whatever is running here was running when
+            # the shutdown callback returned.
+            seen["alive"] = [tk for tk in asyncio.all_tasks()
+                             if tk is not asyncio.current_task()
+                             and not tk.done()]
+            seen["locked"] = lc.lock.locked()
+
+        asyncio.run(scenario())
+        self.assertEqual(seen["alive"], [],
+                         "the shutdown callback returned while a writer it "
+                         "started was still on the wire")
+        self.assertFalse(seen["locked"],
+                         "that writer still owns the lifecycle lock")
 
     def test_the_sweep_does_not_report_done_while_a_writer_is_still_running(self):
         """`asyncio.wait(..., timeout)` returning is not the writer stopping."""
