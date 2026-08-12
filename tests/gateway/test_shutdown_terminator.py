@@ -229,3 +229,51 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyReplyReasonTests(unittest.TestCase):
+    """'finished without any content' — the loop knew why, and we discarded it.
+
+    Six early returns in `conversation_loop.py` produce
+    `{final_response: None, partial: True, error: "..."}` and **bypass
+    TurnFinalizer**, so the empty-turn explainer cannot fire for any of them.
+    The non-streaming handler turns that same dict into an HTTP 502; the
+    streaming writer ignored `error` and emitted a normal finish + `[DONE]` with
+    no content. The user got a blank box while the reason sat unread in the
+    result dict.
+
+    Structural, because the branch needs a full streaming turn to reach and the
+    point is that the value is READ at all.
+    """
+
+    def setUp(self):
+        self.src = _api_server_source()
+
+    def test_the_reason_is_read_from_the_result(self):
+        self.assertIn('_err = result.get("error")', self.src,
+                      "the streaming writer still discards the reason the loop "
+                      "computed, so the user keeps getting a blank box")
+
+    def test_it_is_surfaced_on_the_wire_not_only_logged(self):
+        idx = self.src.index('_err = result.get("error")')
+        window = self.src[idx:idx + 1400]
+        self.assertIn("_encode_content_delta(_msg)", window,
+                      "the reason is computed and then never written to the "
+                      "client -- a log line is not an answer")
+
+    def test_the_no_reason_case_still_logs_the_bare_shape(self):
+        """Not every early return carries an error string. That case must stay
+        distinguishable in the logs rather than being folded into the explained
+        one, or the ledger loses the ability to count them apart."""
+        self.assertIn("reason=no_content_and_no_final_explained", self.src)
+        self.assertIn('"empty_reply service=gateway reason=no_content_and_no_final"',
+                      self.src)
+
+    def test_the_surfaced_reason_is_bounded(self):
+        """An internal reason is for a human to read, not a place for a
+        pathological error to become the answer."""
+        self.assertIn("EMPTY_REPLY_REASON_MAX_CHARS", self.src)
+        idx = self.src.index('_err = result.get("error")')
+        self.assertIn("EMPTY_REPLY_REASON_MAX_CHARS", self.src[idx:idx + 600],
+                      "the bound exists but is not applied where the reason is "
+                      "taken")

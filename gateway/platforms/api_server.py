@@ -373,6 +373,11 @@ _LIVE_STREAM_BODIES: "dict" = {}
 # truncated body is bad, a container that will not stop is worse.
 STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
 
+# An internal reason string is for a human to read, not a place to paste a
+# model's output into a chat. Bounded so a pathological error cannot become the
+# answer.
+EMPTY_REPLY_REASON_MAX_CHARS = 300
+
 
 async def _terminate_live_stream_bodies(app=None) -> None:
     """Terminate every open stream body, once, on shutdown.
@@ -3857,10 +3862,46 @@ class APIServerAdapter(BasePlatformAdapter):
                             "empty_stream_recovered service=gateway chars=%d"
                             + _journey_suffix_safe(), len(_late))
                     else:
-                        from tools.journey_context import journey_suffix as _js1
-                        logger.warning(
-                            "empty_reply service=gateway reason=no_content_and_no_final"
-                            + _js1())
+                        # The loop ALREADY KNOWS why, and this path was throwing
+                        # it away. Six early returns in conversation_loop.py --
+                        # three invalid tool calls, repeated truncated tool
+                        # calls, unrecoverable first-response truncation, a
+                        # nonretryable provider error, an incomplete scratchpad,
+                        # Codex incomplete after continuations -- return
+                        # {final_response: None, partial: True, error: "..."}
+                        # and bypass TurnFinalizer entirely, so the empty-turn
+                        # explainer can never fire for them. The NON-streaming
+                        # handler turns the same dict into a 502; the streaming
+                        # writer ignored `error`/`partial`/`failed` and emitted
+                        # a normal finish + [DONE] with no content. That is
+                        # "finished without any content" as the user meets it.
+                        #
+                        # The reason is a bounded internal string produced by our
+                        # own loop, not model output, so surfacing it tells the
+                        # user what happened instead of showing a blank box.
+                        _why = ""
+                        if isinstance(result, dict):
+                            _err = result.get("error")
+                            if isinstance(_err, str) and _err.strip():
+                                _why = _err.strip()[:EMPTY_REPLY_REASON_MAX_CHARS]
+                        if _why:
+                            _msg = ("\u26a0\ufe0f No reply: " + _why
+                                    + " Send `continue` to retry.")
+                            try:
+                                await response.write(_encode_content_delta(_msg))
+                                _wire["content"] = True
+                            except BaseException:
+                                pass
+                            from tools.journey_context import journey_suffix as _js1
+                            logger.warning(
+                                "empty_reply service=gateway "
+                                "reason=no_content_and_no_final_explained"
+                                + _js1())
+                        else:
+                            from tools.journey_context import journey_suffix as _js1
+                            logger.warning(
+                                "empty_reply service=gateway reason=no_content_and_no_final"
+                                + _js1())
             except Exception as _late_err:
                 logger.warning("late final_response emit failed for %s: %s",
                                completion_id, _late_err)
