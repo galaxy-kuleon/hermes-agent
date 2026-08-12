@@ -369,6 +369,12 @@ async def _stop_cancelled_sse_agent(
 # the one moment it is needed most, and it makes shutdown FASTER, not slower.
 _LIVE_STREAM_BODIES: "dict" = {}
 
+# Bodies this process closed itself during shutdown. The handler is still
+# running and will discover the closed transport moments later; without this it
+# reports that discovery as `stream_aborted`, i.e. a blank-screen failure, for a
+# user who actually received a clean ending.
+_SHUTDOWN_TERMINATED: "set" = set()
+
 # A hung write must not hold shutdown open past the orchestrator's grace; a
 # truncated body is bad, a container that will not stop is worse.
 STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
@@ -449,6 +455,8 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     #
     # `wait` returns (done, pending) WITHOUT cancelling. A stuck body is left
     # behind and the loop tears it down at exit; shutdown proceeds either way.
+    for _resp, _args in live:
+        _SHUTDOWN_TERMINATED.add(_resp)
     tasks = [_asyncio.ensure_future(_terminate_stream_body(resp, *args))
              for resp, args in live]
     try:
@@ -4064,11 +4072,25 @@ class APIServerAdapter(BasePlatformAdapter):
             # traceback spans lines, so the record broke in two. Found
             # 2026-08-11 while root-causing 23 real blank replies.
             from tools.journey_context import journey_suffix as _js
-            logger.error(
-                "stream_aborted service=gateway phase=mid_stream error=%s" + _js(),
-                type(_exc).__name__)
-            logger.error("Agent crashed mid-stream for %s: %s", completion_id,
-                         " | ".join(_tb.format_exc()[:300].splitlines()))
+            if response in _SHUTDOWN_TERMINATED:
+                # NOT an abort. The shutdown callback already closed this body
+                # cleanly -- the client has its finish chunk, [DONE] and EOF --
+                # and the handler is only now discovering the response is gone.
+                # Logging `stream_aborted` here put a FALSE failure into the
+                # journey ledger for every stream open at deploy time, which
+                # would have made the very metric built to count blank screens
+                # report one for a user who got a clean ending. Proved on a
+                # disposable container: CLIENT_EOF clean=1 done=1, followed by
+                # stream_aborted phase=mid_stream.
+                _SHUTDOWN_TERMINATED.discard(response)
+                logger.info(
+                    "stream_closed_at_shutdown service=gateway" + _js())
+            else:
+                logger.error(
+                    "stream_aborted service=gateway phase=mid_stream error=%s" + _js(),
+                    type(_exc).__name__)
+                logger.error("Agent crashed mid-stream for %s: %s", completion_id,
+                             " | ".join(_tb.format_exc()[:300].splitlines()))
             try:
                 error_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",

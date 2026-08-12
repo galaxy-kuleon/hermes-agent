@@ -332,3 +332,46 @@ class EmptyReplyVocabularyTests(unittest.TestCase):
             self.assertIn(out, src,
                           f"a sentence not written in this file reached the "
                           f"user for input {probe!r}")
+
+
+class FalseAbortTests(unittest.TestCase):
+    """A clean shutdown must not be recorded as a blank screen.
+
+    Proved on a disposable container running the REAL writer: the client got
+    `CLIENT_EOF clean=1 done=1` — a finish chunk, `[DONE]`, a properly closed
+    body — and the handler, still running, then discovered the closed transport
+    and logged `stream_aborted phase=mid_stream`. That record is what the
+    journey ledger counts as a user-visible failure, so every stream open at
+    deploy time would have produced a false one, in the exact metric built to
+    count blank screens.
+    """
+
+    def setUp(self):
+        self.src = _api_server_source()
+
+    def test_shutdown_closed_bodies_are_marked(self):
+        self.assertIn("_SHUTDOWN_TERMINATED.add(", self.src,
+                      "nothing records that WE closed the body, so the handler "
+                      "cannot tell a shutdown from a crash")
+
+    def test_the_handler_checks_before_calling_it_an_abort(self):
+        idx = self.src.index("stream_aborted service=gateway phase=mid_stream")
+        head = self.src.rfind("_SHUTDOWN_TERMINATED", 0, idx)
+        self.assertGreater(head, 0, "the abort log is not guarded at all")
+        self.assertLess(self.src[head:idx].count("\n"), 20,
+                        "the guard drifted away from the log it protects")
+
+    def test_the_honest_label_exists_and_is_not_an_error(self):
+        """It still has to be VISIBLE — a shutdown that closed live streams is
+        worth counting, just not as a failure."""
+        self.assertIn("stream_closed_at_shutdown", self.src)
+        idx = self.src.index("stream_closed_at_shutdown")
+        window = self.src[max(0, idx - 200):idx]
+        self.assertIn("logger.info", window,
+                      "a clean shutdown close is logged at error level, which "
+                      "puts it back in the failure counts by another name")
+
+    def test_the_mark_is_consumed_so_a_later_real_abort_still_reports(self):
+        """A response object could be reused or a second exception could follow;
+        a sticky mark would silence a genuine abort."""
+        self.assertIn("_SHUTDOWN_TERMINATED.discard(", self.src)
