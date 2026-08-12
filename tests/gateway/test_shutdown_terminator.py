@@ -181,6 +181,38 @@ class ShutdownTerminatorTests(unittest.TestCase):
                          "a body that never reached the client was recorded as "
                          "cleanly closed")
 
+    def test_the_user_is_TOLD_the_answer_was_cut_short(self):
+        """A terminal alone is worse than the truncation it replaced.
+
+        `finish_reason=stop` plus `[DONE]` tells the reader "this is your
+        complete answer". A truncated body at least looks broken. Proved on the
+        code before this: VISIBLE_SHUTDOWN_NOTICE_COUNT=0,
+        FINISH_REASON_STOP_COUNT=1, HANDLER_STILL_RUNNING=True — an unfinished
+        answer presented as finished, with the handler still running.
+        """
+        m = _mod()
+        r = _FakeResponse()
+        m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None)
+        asyncio.run(m._terminate_live_stream_bodies(None))
+        joined = b"".join(r.writes)
+        self.assertIn(b"cut short", joined,
+                      "the user is handed a silently incomplete answer that "
+                      "looks complete")
+        self.assertIn(b"restart", joined)
+        # ...and it must arrive BEFORE the terminal, inside the answer.
+        notice_at = joined.index(b"cut short")
+        done_at = joined.index(b"[DONE]")
+        self.assertLess(notice_at, done_at,
+                        "the notice lands after the conversation was closed")
+
+    def test_a_normal_termination_carries_no_notice(self):
+        """The cancellation path is a different event — a user who pressed stop
+        must not be told the service restarted."""
+        m = _mod()
+        r = _FakeResponse()
+        asyncio.run(m._terminate_stream_body(r, "id", 1, "model", None))
+        self.assertNotIn(b"cut short", b"".join(r.writes))
+
     def test_no_open_bodies_is_a_quiet_no_op(self):
         asyncio.run(_mod()._terminate_live_stream_bodies(None))
 
@@ -195,7 +227,7 @@ class ShutdownTerminatorTests(unittest.TestCase):
         either way, but a test that hangs is a test a runner without its own
         timeout will sit on forever. This one fails in two seconds.
         """
-        import threading
+        import time as _time
         m = _mod()
 
         class _Hangs(_FakeResponse):
@@ -205,16 +237,36 @@ class ShutdownTerminatorTests(unittest.TestCase):
         m._LIVE_STREAM_BODIES[_Hangs()] = ("id", 1, "m", None)
         saved = m.STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS
         m.STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 0.05
-        finished = threading.Event()
+        # A private loop, closed WITHOUT awaiting stragglers. `asyncio.run`
+        # cancels leftover tasks and then awaits them -- and the per-step guard
+        # in the terminator swallows that cancellation, so the teardown hangs
+        # on a task nobody is waiting for. That measured asyncio.run's cleanup,
+        # not the property under test, which is narrower and is the one that
+        # matters: does the shutdown callback RETURN inside its bound.
+        # BOTH properties, because each alone was wrong once:
+        #  * a private loop closed without awaiting stragglers, so the test
+        #    measures the callback rather than asyncio.run's teardown (the
+        #    teardown hangs on a task whose cancellation the per-step guard
+        #    swallows);
+        #  * inside a daemon thread with a join deadline, so removing the bound
+        #    makes this FAIL in two seconds instead of hanging the suite. I had
+        #    each of these and lost the other while fixing the first.
+        import threading
+        finished, elapsed = threading.Event(), []
 
         def _worker():
+            loop = asyncio.new_event_loop()
             try:
-                asyncio.run(m._terminate_live_stream_bodies(None))
+                started = _time.monotonic()
+                loop.run_until_complete(m._terminate_live_stream_bodies(None))
+                elapsed.append(_time.monotonic() - started)
+            except BaseException:
+                pass
             finally:
+                loop.close()
                 finished.set()
 
-        th = threading.Thread(target=_worker, daemon=True)
-        th.start()
+        threading.Thread(target=_worker, daemon=True).start()
         try:
             self.assertTrue(
                 finished.wait(timeout=2.0),

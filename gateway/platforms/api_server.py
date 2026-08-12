@@ -456,7 +456,9 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     # `wait` returns (done, pending) WITHOUT cancelling. A stuck body is left
     # behind and the loop tears it down at exit; shutdown proceeds either way.
     # Marked AFTER the fact, and only for bodies whose write_eof landed.
-    tasks = [_asyncio.ensure_future(_terminate_stream_body(resp, *args))
+    tasks = [_asyncio.ensure_future(
+                 _terminate_stream_body(resp, *args,
+                                        notice=SHUTDOWN_INTERRUPTION_NOTICE))
              for resp, args in live]
     try:
         _done, pending = await _asyncio.wait(
@@ -475,7 +477,20 @@ async def _terminate_live_stream_bodies(app=None) -> None:
             pass
 
 
-async def _terminate_stream_body(response, completion_id, created, model, logger) -> bool:
+# What a user is told when a restart cuts their answer short. A terminal alone
+# is WORSE than the truncation it replaced: a truncated body at least looks
+# broken, while finish_reason=stop plus [DONE] tells the reader "this is your
+# complete answer". Proved on the current code -- VISIBLE_SHUTDOWN_NOTICE_COUNT=0,
+# FINISH_REASON_STOP_COUNT=1 -- so the notice is not optional decoration, it is
+# the difference between an honest ending and a confident lie.
+SHUTDOWN_INTERRUPTION_NOTICE = (
+    "\n\n\u26a0\ufe0f This answer was cut short because the service restarted. "
+    "It is incomplete \u2014 send `continue` to pick it up."
+)
+
+
+async def _terminate_stream_body(response, completion_id, created, model, logger,
+                                 notice: str = "") -> bool:
     """Close the HTTP conversation, one best-effort step at a time.
 
     Each step gets its own guard, in increasing order of importance, so a
@@ -497,6 +512,23 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
     # client received with NO finish reason and NO [DONE] was recorded as "the
     # user got a proper ending". The HTTP body was terminated; the SSE
     # conversation was not.
+    if notice:
+        # BEFORE the terminal, so it lands inside the answer the user is
+        # reading rather than after the conversation has been closed.
+        #
+        # Encoded inline rather than via `_encode_content_delta`: that helper is
+        # a NESTED function inside the request handler, invisible from module
+        # scope. Calling it here raised NameError, which the per-step guard
+        # below swallowed -- so the notice silently never appeared and every
+        # structural check still passed. My own guard hid my own bug; the
+        # behavioural test is what caught it.
+        _notice_chunk = ("data: " + _json.dumps({
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"content": notice},
+                         "finish_reason": None}],
+        }) + "\n\n").encode()
+        steps = (lambda: response.write(_notice_chunk),) + steps
     _steps_ok = [False] * len(steps)
     for _i, step in enumerate(steps):
         try:
