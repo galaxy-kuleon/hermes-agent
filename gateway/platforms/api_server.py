@@ -547,13 +547,19 @@ async def _terminate_live_stream_bodies(app=None) -> None:
         # finished with a PARTIAL ending leaves `terminated` False, so this
         # still completes it -- the case where a failed notice write made an
         # incomplete answer look finished.
+        # ONE SET, counted once. `attempted` used to count the tasks we spawned
+        # while the outcomes were counted over the whole input batch, so a sweep
+        # that skipped an already-finished body reported `attempted=1
+        # complete=2` -- a summary that cannot be true, in the same log line
+        # this commit series exists to make trustworthy.
+        targets = [(r, lc) for r, lc in items
+                   if not lc.terminated and not lc.eof_sent]
         tasks = [_asyncio.ensure_future(
                      _terminate_stream_body(r, *lc.args,
                                             notice=SHUTDOWN_INTERRUPTION_NOTICE,
                                             shutdown_writer=True,
                                             lifecycle=lc))
-                 for r, lc in items
-                 if not lc.terminated and not lc.eof_sent]
+                 for r, lc in targets]
         if not tasks:
             return {"attempted": 0, "complete": 0, "closed_bare": 0,
                     "still_open": 0}
@@ -575,7 +581,7 @@ async def _terminate_live_stream_bodies(app=None) -> None:
                 _drained, _stuck = await _asyncio.wait(
                     pending, timeout=STREAM_SHUTDOWN_WRITER_DRAIN_SECONDS)
                 if _stuck:
-                    _lg = next((lc.args[-1] for _r, lc in items
+                    _lg = next((lc.args[-1] for _r, lc in targets
                                 if lc.args[-1] is not None), None)
                     if _lg is not None:
                         try:
@@ -594,7 +600,7 @@ async def _terminate_live_stream_bodies(app=None) -> None:
         # of them is good.
         outcome = {"attempted": len(tasks), "complete": 0,
                    "closed_bare": 0, "still_open": 0}
-        for _r, _lc in items:
+        for _r, _lc in targets:
             if _lc.terminated:
                 outcome["complete"] += 1
             elif _lc.eof_sent:

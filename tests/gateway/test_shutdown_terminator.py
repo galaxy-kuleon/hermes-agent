@@ -1002,6 +1002,64 @@ class BoundedWriterTests(unittest.TestCase):
         self.assertIn("write_eof", seen["attempts"],
                       "a cancellation on one step cost the client its EOF")
 
+    def test_the_sweep_summary_cannot_report_more_outcomes_than_attempts(self):
+        """Round 13 C. `attempted` counted the tasks spawned; the outcomes were
+        counted over the whole input batch. A body that finishes DURING the
+        handover is in the batch and not in the tasks, so the summary read
+        `attempted=1 complete=2` — describing a set that does not exist.
+
+        The drain loop filters already-finished bodies before the sweep sees
+        them, so the mixed batch only arises in that handover window: the owner
+        is cancelled, ends its own body honestly, and the sweep then has one
+        body left to write and two to account for.
+        """
+        m, seen = self.m, {}
+
+        class _Log:
+            def __init__(self): self.lines = []
+            def info(self, fmt, *args): self.lines.append(fmt % args if args else fmt)
+            def warning(self, *a, **k): pass
+            def error(self, *a, **k): pass
+
+        async def scenario():
+            log = _Log()
+
+            # Body A: an owner that ends its own body when cancelled, exactly
+            # as the handler's CancelledError branch does.
+            a_resp = _FakeResponse()
+
+            async def a_owner():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    await m._terminate_stream_body(
+                        a_resp, "id", 1, "model", log,
+                        notice=m.SHUTDOWN_INTERRUPTION_NOTICE)
+                    raise
+
+            a_task = asyncio.ensure_future(a_owner())
+            await asyncio.sleep(0)
+            m._register_stream_body(a_resp, ("id", 1, "model", log), a_task)
+
+            # Body B: nobody to finish it, so the sweep must write this one.
+            b_resp = _FakeResponse()
+            m._register_stream_body(b_resp, ("id", 1, "model", log), None)
+
+            await m._terminate_live_stream_bodies()
+            seen["lines"] = [l for l in log.lines if "stream_shutdown_sweep" in l]
+
+        asyncio.run(scenario())
+        self.assertTrue(seen["lines"], "the sweep logged no summary at all")
+        line = seen["lines"][0]
+        nums = {k: int(v) for k, v in
+                (kv.split("=") for kv in line.split() if "=" in kv)
+                if v.isdigit()}
+        outcomes = nums["complete"] + nums["closed_bare"] + nums["still_open"]
+        self.assertEqual(
+            outcomes, nums["attempted"],
+            f"the summary reports {outcomes} outcomes for {nums['attempted']} "
+            f"attempts — a set that does not exist: {line}")
+
     def test_a_body_the_owner_ALREADY_ended_gets_no_second_attempt(self):
         """Found by deploying the previous commit to the live 8083 gateway.
 
