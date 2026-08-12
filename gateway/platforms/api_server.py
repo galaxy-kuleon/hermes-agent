@@ -32,6 +32,7 @@ Requires:
 """
 
 import asyncio
+import weakref
 import contextvars
 import hashlib
 import html
@@ -373,19 +374,25 @@ _LIVE_STREAM_BODIES: "dict" = {}
 # running and will discover the closed transport moments later; without this it
 # reports that discovery as `stream_aborted`, i.e. a blank-screen failure, for a
 # user who actually received a clean ending.
-_SHUTDOWN_TERMINATED: "set" = set()
+_SHUTDOWN_TERMINATED: "weakref.WeakSet" = weakref.WeakSet()
 
 # Responses whose owner was cancelled BY SHUTDOWN. The owner's own cancellation
 # path terminates the body correctly -- but it does not know WHY it was
 # cancelled, so it wrote a clean ending with no notice and the user got an
 # incomplete answer presented as complete. Handing over to the owner without
 # telling it the reason reintroduced the very defect the notice exists to close.
-_SHUTDOWN_CANCELLED: "set" = set()
+# WEAK, all three. The mark has to outlive the callback -- a backpressured
+# owner terminates later and still needs the reason -- so it cannot simply be
+# cleared at the end. A plain set would then pin every StreamResponse it ever
+# touched for the life of the process, and would misfire if an object were
+# reused. A WeakSet forgets an entry the moment the response itself is gone,
+# which is exactly the lifetime the mark should have.
+_SHUTDOWN_CANCELLED: "weakref.WeakSet" = weakref.WeakSet()
 
 # Responses the callback has taken over because the owner did not finish inside
 # the handover. The owner may still be alive and backpressured; if its write
 # later completes, it must not append a SECOND finish chunk, [DONE] and EOF.
-_SHUTDOWN_TAKEOVER: "set" = set()
+_SHUTDOWN_TAKEOVER: "weakref.WeakSet" = weakref.WeakSet()
 
 # A hung write must not hold shutdown open past the orchestrator's grace; a
 # truncated body is bad, a container that will not stop is worse.

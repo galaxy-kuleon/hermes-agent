@@ -403,6 +403,30 @@ class ShutdownTerminatorTests(unittest.TestCase):
         self.assertEqual(r.writes, [], "a second ending was appended")
         self.assertEqual(r.eof_calls, 0)
 
+    def test_the_marks_do_not_pin_responses(self):
+        """The mark must outlive the callback but not the response.
+
+        A backpressured owner terminates after the callback returns and still
+        needs the reason, so the marks cannot be cleared at the end. With plain
+        sets that meant every StreamResponse ever marked stayed reachable for
+        the life of the process — and a reused object would inherit a stale
+        mark. WeakSets forget an entry exactly when the response does.
+        """
+        import gc
+        m = _mod()
+        r = _FakeResponse()
+        m._SHUTDOWN_CANCELLED.add(r)
+        m._SHUTDOWN_TAKEOVER.add(r)
+        m._SHUTDOWN_TERMINATED.add(r)
+        self.assertEqual(len(m._SHUTDOWN_CANCELLED), 1)
+        del r
+        gc.collect()
+        for name in ("_SHUTDOWN_CANCELLED", "_SHUTDOWN_TAKEOVER",
+                     "_SHUTDOWN_TERMINATED"):
+            self.assertEqual(
+                len(getattr(m, name)), 0,
+                f"{name} still holds a response nobody else references")
+
     def test_no_open_bodies_is_a_quiet_no_op(self):
         asyncio.run(_mod()._terminate_live_stream_bodies(None))
 
