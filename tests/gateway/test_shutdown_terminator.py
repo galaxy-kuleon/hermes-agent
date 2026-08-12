@@ -101,219 +101,64 @@ def _mod():
     return m
 
 
+def _register(m, resp, owner=None):
+    """Register a body the way the real handler does."""
+    lc = m._StreamLifecycle(("id", 1, "model", None), owner)
+    m._LIVE_STREAM_BODIES[resp] = lc
+    return lc
+
+
 @unittest.skipIf(_SKIP, _SKIP)
 class ShutdownTerminatorTests(unittest.TestCase):
     def setUp(self):
         _mod()._LIVE_STREAM_BODIES.clear()
-        _mod()._SHUTDOWN_TERMINATED.clear()
-        _mod()._SHUTDOWN_CANCELLED.clear()
-        _mod()._SHUTDOWN_TAKEOVER.clear()
 
     tearDown = setUp
 
     def test_every_open_body_is_terminated(self):
         m = _mod()
         a, b = _FakeResponse(), _FakeResponse()
-        m._LIVE_STREAM_BODIES[a] = ("id-a", 1, "model-x", None)
-        m._LIVE_STREAM_BODIES[b] = ("id-b", 2, "model-y", None)
+        _register(m, a); _register(m, b)
         asyncio.run(m._terminate_live_stream_bodies(None))
         for r in (a, b):
             self.assertEqual(r.eof_calls, 1, "a body was left unterminated")
             self.assertTrue(any(b"[DONE]" in w for w in r.writes))
 
-    def test_the_registry_is_cleared_so_nothing_is_terminated_twice(self):
-        """Writing to an already-closed transport is how a clean shutdown turns
-        into a traceback at the last moment."""
+    def test_the_user_is_TOLD_the_answer_was_cut_short(self):
         m = _mod()
         r = _FakeResponse()
-        m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None)
+        _register(m, r)
         asyncio.run(m._terminate_live_stream_bodies(None))
-        self.assertEqual(m._LIVE_STREAM_BODIES, {})
+        joined = b"".join(r.writes)
+        self.assertIn(b"cut short", joined)
+        self.assertLess(joined.index(b"cut short"), joined.index(b"[DONE]"),
+                        "the notice landed after the conversation was closed")
+
+    def test_a_second_ending_is_never_written(self):
+        m = _mod()
+        r = _FakeResponse()
+        _register(m, r)
+        asyncio.run(m._terminate_live_stream_bodies(None))
         asyncio.run(m._terminate_live_stream_bodies(None))
         self.assertEqual(r.eof_calls, 1, "terminated twice")
 
     def test_one_dead_client_does_not_cost_the_others_their_ending(self):
         m = _mod()
-        dead, alive = _FakeResponse(fail_on={0, 1, 2}), _FakeResponse()
-        m._LIVE_STREAM_BODIES[dead] = ("id-d", 1, "m", None)
-        m._LIVE_STREAM_BODIES[alive] = ("id-a", 1, "m", None)
+        dead, alive = _FakeResponse(fail_on={0, 1, 2, 3}), _FakeResponse()
+        _register(m, dead); _register(m, alive)
         asyncio.run(m._terminate_live_stream_bodies(None))
         self.assertEqual(alive.eof_calls, 1,
-                         "a failing peer swallowed another client's termination")
-
-    def test_the_terminator_reports_whether_the_EOF_LANDED(self):
-        """The return value is what the shutdown path marks on, so it has to
-        mean delivery, not effort. A version that always returned True survived
-        every structural test here — the marking code looked right and rested on
-        a lie underneath it."""
-        m = _mod()
-        good = _FakeResponse()
-        self.assertIs(
-            asyncio.run(m._terminate_stream_body(good, "id", 1, "m", None)),
-            True, "a fully successful termination did not report success")
-        # write_eof is the third and last step.
-        dead = _FakeResponse(fail_on={2})
-        self.assertIs(
-            asyncio.run(m._terminate_stream_body(dead, "id", 1, "m", None)),
-            False, "a failed write_eof still reported the body as terminated, "
-                   "which is what lets a real failure be suppressed later")
-        # A finish chunk and [DONE] that BOTH failed, with a successful EOF, is
-        # not "a proper ending" -- the HTTP body is terminated but the SSE
-        # conversation never was, and the client has no finish reason and no
-        # [DONE]. Reporting True there is what let the shutdown path mark it as
-        # cleanly closed and then suppress a later real failure behind it.
-        partial = _FakeResponse(fail_on={0, 1})
-        self.assertIs(
-            asyncio.run(m._terminate_stream_body(partial, "id", 1, "m", None)),
-            False, "an EOF with no finish chunk and no [DONE] was reported as a "
-                   "complete ending")
-        # ...and one failed step is enough to make it incomplete.
-        only_done = _FakeResponse(fail_on={0})
-        self.assertIs(
-            asyncio.run(m._terminate_stream_body(only_done, "id", 1, "m", None)),
-            False, "a missing finish chunk still reported a complete ending")
-
-    def test_a_body_whose_writes_all_fail_is_not_marked(self):
-        """End to end: intent must not become a mark."""
-        m = _mod()
-        dead = _FakeResponse(fail_on={0, 1, 2})
-        m._LIVE_STREAM_BODIES[dead] = ("id", 1, "m", None)
-        asyncio.run(m._terminate_live_stream_bodies(None))
-        self.assertNotIn(dead, m._SHUTDOWN_TERMINATED,
-                         "a body that never reached the client was recorded as "
-                         "cleanly closed")
-
-    def test_the_user_is_TOLD_the_answer_was_cut_short(self):
-        """A terminal alone is worse than the truncation it replaced.
-
-        `finish_reason=stop` plus `[DONE]` tells the reader "this is your
-        complete answer". A truncated body at least looks broken. Proved on the
-        code before this: VISIBLE_SHUTDOWN_NOTICE_COUNT=0,
-        FINISH_REASON_STOP_COUNT=1, HANDLER_STILL_RUNNING=True — an unfinished
-        answer presented as finished, with the handler still running.
-        """
-        m = _mod()
-        r = _FakeResponse()
-        m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None)
-        asyncio.run(m._terminate_live_stream_bodies(None))
-        joined = b"".join(r.writes)
-        self.assertIn(b"cut short", joined,
-                      "the user is handed a silently incomplete answer that "
-                      "looks complete")
-        self.assertIn(b"restart", joined)
-        # ...and it must arrive BEFORE the terminal, inside the answer.
-        notice_at = joined.index(b"cut short")
-        done_at = joined.index(b"[DONE]")
-        self.assertLess(notice_at, done_at,
-                        "the notice lands after the conversation was closed")
-
-    def test_a_normal_termination_carries_no_notice(self):
-        """The cancellation path is a different event — a user who pressed stop
-        must not be told the service restarted."""
-        m = _mod()
-        r = _FakeResponse()
-        asyncio.run(m._terminate_stream_body(r, "id", 1, "model", None))
-        self.assertNotIn(b"cut short", b"".join(r.writes))
-
-    def test_the_owning_handler_is_cancelled_before_we_write(self):
-        """Two writers on one StreamResponse is the remaining user-visible race.
-
-        Scheduling the real functions produced NOTICE,MODEL_DELTA,FINISH,DONE,EOF
-        and NOTICE,FINISH,FINISH,DONE,DONE,EOF — interleaved output and a double
-        terminal — and could label a COMPLETE answer "cut short" if its handler
-        had not yet deregistered. The callback must hand over to the one task
-        that owns the response.
-        """
-        m = _mod()
-
-        async def _scenario():
-            done_first = asyncio.Event()
-
-            async def _owner():
-                try:
-                    await asyncio.sleep(3600)
-                except asyncio.CancelledError:
-                    done_first.set()
-                    raise
-
-            task = asyncio.ensure_future(_owner())
-            await asyncio.sleep(0)
-            r = _FakeResponse()
-            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
-            await m._terminate_live_stream_bodies(None)
-            return r, task, done_first.is_set()
-
-        r, task, cancelled = asyncio.run(_scenario())
-        self.assertTrue(cancelled, "the owning handler was never cancelled, so "
-                                   "it can still write while we do")
-        self.assertTrue(task.cancelled() or task.done())
-
-    def test_a_handler_that_finished_its_own_ending_is_left_alone(self):
-        """A completed handler already terminated honestly. Writing again would
-        duplicate the terminal and could tell a user whose answer arrived in
-        full that it was cut short."""
-        m = _mod()
-
-        async def _scenario():
-            async def _already(): return None
-            task = asyncio.ensure_future(_already())
-            await task
-            r = _FakeResponse()
-            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
-            await m._terminate_live_stream_bodies(None)
-            return r
-
-        r = asyncio.run(_scenario())
-        self.assertEqual(r.writes, [],
-                         "wrote a second ending over a handler that had already "
-                         "finished its own")
-        self.assertEqual(r.eof_calls, 0)
-        self.assertNotIn(r, m._SHUTDOWN_TERMINATED,
-                         "marked a body we never wrote to")
-
-    def test_the_handover_actually_WAITS_for_the_owner(self):
-        """Cancelling is not handing over.
-
-        A handler does not finish the instant it is cancelled — it still has to
-        run its own terminator. Cancel without waiting and we write anyway,
-        which is the two-writer race with an extra step. This owner needs a
-        moment after cancellation; the callback must not write over it.
-        """
-        m = _mod()
-
-        async def _scenario():
-            async def _owner():
-                try:
-                    await asyncio.sleep(3600)
-                except asyncio.CancelledError:
-                    # The real handler's cancellation path: emit its own
-                    # ending, which takes a turn of the loop.
-                    await asyncio.sleep(0.05)
-                    return None
-
-            task = asyncio.ensure_future(_owner())
-            await asyncio.sleep(0)
-            r = _FakeResponse()
-            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
-            await m._terminate_live_stream_bodies(None)
-            return r
-
-        r = asyncio.run(_scenario())
-        self.assertEqual(
-            r.writes, [],
-            "the callback wrote over an owner that was still finishing its own "
-            "ending -- cancelling is not handing over")
+                         "a failing peer swallowed another client's ending")
 
     def test_a_RESPONSIVE_owner_still_tells_the_user_it_was_cut_short(self):
-        """The composition my two other tests each covered half of.
+        """The composition round 9 taught me to keep — and which I dropped
+        while rewriting the suite for the lifecycle.
 
-        The notice test used the legacy four-element (no owner) registration;
-        the owner test only checked that the callback wrote nothing. Neither
-        composed a REAL five-element registration with an owner that runs its
-        own cancellation termination — and in that path the owner wrote a clean
-        finish + [DONE] + EOF with NO notice, and the callback then correctly
-        stood aside. The user got an incomplete answer presented as complete:
-        round 8's defect, through a new door, with 31 green tests.
+        The owner terminates correctly on cancellation; it simply does not know
+        WHY it was cancelled, and passes no notice. The lifecycle carries the
+        reason, so its own termination still tells the user. Without this, a
+        mutant that never sets `shutdown` survives: the callback passes the
+        notice explicitly and every other test goes through the callback.
         """
         m = _mod()
 
@@ -324,13 +169,13 @@ class ShutdownTerminatorTests(unittest.TestCase):
                 try:
                     await asyncio.sleep(3600)
                 except asyncio.CancelledError:
-                    # exactly what the real handler's cancellation path does
+                    # the real handler's cancellation path: no notice argument
                     await m._terminate_stream_body(r, "id", 1, "model", None)
                     return None
 
             task = asyncio.ensure_future(_owner())
             await asyncio.sleep(0)
-            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            _register(m, r, task)
             await m._terminate_live_stream_bodies(None)
             await asyncio.sleep(0.05)
             return r
@@ -338,157 +183,134 @@ class ShutdownTerminatorTests(unittest.TestCase):
         r = asyncio.run(_scenario())
         joined = b"".join(r.writes)
         self.assertIn(b"cut short", joined,
-                      "the owner terminated cleanly without telling the user "
-                      "the answer was truncated")
+                      "the owner ended cleanly without telling the user the "
+                      "answer was truncated")
         self.assertEqual(joined.count(b"[DONE]"), 1, "two endings were written")
         self.assertEqual(r.eof_calls, 1, "EOF written twice")
 
-    def test_the_callback_MARKS_takeover_when_the_owner_misses_the_handover(self):
-        """End to end, because the hand-placed mark proved nothing.
+    def test_no_open_bodies_is_a_quiet_no_op(self):
+        asyncio.run(_mod()._terminate_live_stream_bodies(None))
 
-        My other takeover test put the response in the set by hand, so a mutant
-        that never marked it survived: the guard worked and nothing ever set it.
-        Here the owner ignores cancellation past the handover, the callback
-        writes, and only then does the owner try to terminate — which is the
-        real sequence and the only one that exercises the marking.
+    # ---- the three defects round 10 proved, as acceptance tests -----------
+
+    def test_an_owner_ALREADY_INSIDE_the_terminator_cannot_be_raced(self):
+        """The mark version re-checked nothing once the owner was inside.
+
+        Marks are read before a call; the defect lived inside it. The lock
+        means there is no second writer to interleave with, so this is closed
+        by construction rather than by another check.
         """
         m = _mod()
-        saved = m.STREAM_SHUTDOWN_HANDOVER_SECONDS
-        m.STREAM_SHUTDOWN_HANDOVER_SECONDS = 0.05
 
         async def _scenario():
             r = _FakeResponse()
+            lc = _register(m, r)
+            # Owner is mid-terminal: it holds the lock.
+            await lc.lock.acquire()
+            cb = asyncio.ensure_future(m._terminate_live_stream_bodies(None))
+            await asyncio.sleep(0.05)
+            wrote_while_owner_held = len(r.writes)
+            # Owner finishes its ending, then releases.
+            await m._terminate_stream_body_locked(r, "id", 1, "model", None,
+                                                  m.SHUTDOWN_INTERRUPTION_NOTICE)
+            lc.terminated = True
+            lc.lock.release()
+            await cb
+            return r, wrote_while_owner_held
+
+        r, during = asyncio.run(_scenario())
+        self.assertEqual(during, 0,
+                         "the callback wrote while the owner held the terminal")
+        self.assertEqual(r.eof_calls, 1, "two endings were written")
+        self.assertEqual(b"".join(r.writes).count(b"[DONE]"), 1)
+
+    def test_a_PARTIAL_owner_ending_is_completed_not_trusted(self):
+        """`owner.done()` said "nothing left to write" even when the owner's
+        notice write had failed and only finish/[DONE]/EOF landed — so an
+        incomplete answer looked complete again. `terminated` is set only when
+        EVERY step lands, so the callback finishes the job."""
+        m = _mod()
+
+        async def _scenario():
+            r = _FakeResponse(fail_on={0})       # the NOTICE write fails
+            lc = _register(m, r)
+            lc.shutdown = True
+            ok = await m._terminate_stream_body(r, "id", 1, "model", None,
+                                                notice="x")
+            return r, ok, lc.terminated
+
+        r, ok, terminated = asyncio.run(_scenario())
+        self.assertFalse(ok, "a partial ending reported success")
+        self.assertFalse(terminated,
+                         "a partial ending was recorded as terminated, so "
+                         "nothing would ever complete it")
+
+    def test_a_body_registered_DURING_shutdown_is_not_missed(self):
+        """A one-time snapshot before the handover misses anything that
+        registers while we wait."""
+        m = _mod()
+
+        async def _scenario():
+            first = _FakeResponse()
+            late = _FakeResponse()
 
             async def _owner():
                 try:
                     await asyncio.sleep(3600)
                 except asyncio.CancelledError:
-                    # Backpressured: still alive well past the handover.
-                    await asyncio.sleep(0.5)
+                    _register(m, late)      # arrives during the handover
                     return None
 
             task = asyncio.ensure_future(_owner())
             await asyncio.sleep(0)
-            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            _register(m, first, task)
             await m._terminate_live_stream_bodies(None)
-            wrote_by_callback = len(r.writes)
-            # ...and now the late owner tries to end it too.
-            await m._terminate_stream_body(r, "id", 1, "model", None)
-            return r, wrote_by_callback
+            return late
 
-        try:
-            r, by_callback = asyncio.run(_scenario())
-        finally:
-            m.STREAM_SHUTDOWN_HANDOVER_SECONDS = saved
-        self.assertGreater(by_callback, 0,
-                           "the callback did not write for an owner that "
-                           "missed the handover")
-        self.assertEqual(len(r.writes), by_callback,
-                         "the late owner appended a second ending on top of "
-                         "the callback's")
-        self.assertEqual(r.eof_calls, 1, "EOF written twice")
-
-    def test_a_late_owner_cannot_append_a_second_ending(self):
-        """If the owner is backpressured past the handover, the callback writes
-        — and the owner must then stand down rather than appending a second
-        finish chunk, [DONE] and EOF on top."""
-        m = _mod()
-        r = _FakeResponse()
-        m._SHUTDOWN_TAKEOVER.add(r)
-        try:
-            out = asyncio.run(m._terminate_stream_body(r, "id", 1, "m", None))
-        finally:
-            m._SHUTDOWN_TAKEOVER.discard(r)
-        self.assertIs(out, False)
-        self.assertEqual(r.writes, [], "a second ending was appended")
-        self.assertEqual(r.eof_calls, 0)
-
-    def test_the_marks_do_not_pin_responses(self):
-        """The mark must outlive the callback but not the response.
-
-        A backpressured owner terminates after the callback returns and still
-        needs the reason, so the marks cannot be cleared at the end. With plain
-        sets that meant every StreamResponse ever marked stayed reachable for
-        the life of the process — and a reused object would inherit a stale
-        mark. WeakSets forget an entry exactly when the response does.
-        """
-        import gc
-        m = _mod()
-        r = _FakeResponse()
-        m._SHUTDOWN_CANCELLED.add(r)
-        m._SHUTDOWN_TAKEOVER.add(r)
-        m._SHUTDOWN_TERMINATED.add(r)
-        self.assertEqual(len(m._SHUTDOWN_CANCELLED), 1)
-        del r
-        gc.collect()
-        for name in ("_SHUTDOWN_CANCELLED", "_SHUTDOWN_TAKEOVER",
-                     "_SHUTDOWN_TERMINATED"):
-            self.assertEqual(
-                len(getattr(m, name)), 0,
-                f"{name} still holds a response nobody else references")
-
-    def test_no_open_bodies_is_a_quiet_no_op(self):
-        asyncio.run(_mod()._terminate_live_stream_bodies(None))
+        late = asyncio.run(_scenario())
+        self.assertEqual(late.eof_calls, 1,
+                         "a body registered during shutdown was never ended")
 
     def test_it_is_bounded(self):
-        """A hung write must not hold the container open past the grace: a
-        truncated body is bad, a container that will not stop is worse.
-
-        Run in a THREAD with a join deadline, not under `asyncio.wait_for`.
-        `wait_for` bounds by cancelling, and `_terminate_stream_body` swallows
-        cancellation at every step -- so a `wait_for` version of this test does
-        not fail when the bound is removed, it HANGS. It caught the defect
-        either way, but a test that hangs is a test a runner without its own
-        timeout will sit on forever. This one fails in two seconds.
-        """
-        import time as _time
+        """A hung write must not hold the container open past the grace."""
+        import threading, time as _time
         m = _mod()
 
         class _Hangs(_FakeResponse):
             async def write(self, data):
                 await asyncio.sleep(3600)
 
-        m._LIVE_STREAM_BODIES[_Hangs()] = ("id", 1, "m", None)
+        _register(m, _Hangs())
         saved = m.STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS
         m.STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 0.05
-        # A private loop, closed WITHOUT awaiting stragglers. `asyncio.run`
-        # cancels leftover tasks and then awaits them -- and the per-step guard
-        # in the terminator swallows that cancellation, so the teardown hangs
-        # on a task nobody is waiting for. That measured asyncio.run's cleanup,
-        # not the property under test, which is narrower and is the one that
-        # matters: does the shutdown callback RETURN inside its bound.
-        # BOTH properties, because each alone was wrong once:
-        #  * a private loop closed without awaiting stragglers, so the test
-        #    measures the callback rather than asyncio.run's teardown (the
-        #    teardown hangs on a task whose cancellation the per-step guard
-        #    swallows);
-        #  * inside a daemon thread with a join deadline, so removing the bound
-        #    makes this FAIL in two seconds instead of hanging the suite. I had
-        #    each of these and lost the other while fixing the first.
-        import threading
-        finished, elapsed = threading.Event(), []
+        finished = threading.Event()
 
         def _worker():
             loop = asyncio.new_event_loop()
             try:
-                started = _time.monotonic()
                 loop.run_until_complete(m._terminate_live_stream_bodies(None))
-                elapsed.append(_time.monotonic() - started)
             except BaseException:
                 pass
             finally:
-                loop.close()
-                finished.set()
+                loop.close(); finished.set()
 
         threading.Thread(target=_worker, daemon=True).start()
         try:
-            self.assertTrue(
-                finished.wait(timeout=2.0),
-                "shutdown termination did not return within 2s against a write "
-                "that hangs -- the timeout is decorative, and a redeploy would "
-                "sit here until the orchestrator SIGKILLs the container")
+            self.assertTrue(finished.wait(timeout=3.0),
+                            "shutdown did not return against a hung write")
         finally:
             m.STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = saved
+
+    def test_the_lifecycle_does_not_pin_the_response(self):
+        import gc
+        m = _mod()
+        r = _FakeResponse()
+        _register(m, r)
+        self.assertEqual(len(m._LIVE_STREAM_BODIES), 1)
+        del r
+        gc.collect()
+        self.assertEqual(len(m._LIVE_STREAM_BODIES), 0,
+                         "the registry holds a response nobody else references")
 
 
 class WiringTests(unittest.TestCase):
@@ -516,7 +338,7 @@ class WiringTests(unittest.TestCase):
     def test_registration_happens_after_prepare(self):
         """Before `prepare` there is no body to terminate, and terminating an
         unprepared response raises."""
-        idx_reg = self.src.index("_LIVE_STREAM_BODIES[response] = (completion_id")
+        idx_reg = self.src.index("_LIVE_STREAM_BODIES[response] = _StreamLifecycle(")
         prepare = self.src.rindex("await response.prepare(request)", 0, idx_reg)
         between = self.src[prepare:idx_reg]
         self.assertLess(between.count("\n"), 6,
@@ -689,58 +511,188 @@ class EmptyReplyVocabularyTests(unittest.TestCase):
 class FalseAbortTests(unittest.TestCase):
     """A clean shutdown must not be recorded as a blank screen.
 
-    Proved on a disposable container running the REAL writer: the client got
-    `CLIENT_EOF clean=1 done=1` — a finish chunk, `[DONE]`, a properly closed
-    body — and the handler, still running, then discovered the closed transport
-    and logged `stream_aborted phase=mid_stream`. That record is what the
-    journey ledger counts as a user-visible failure, so every stream open at
-    deploy time would have produced a false one, in the exact metric built to
-    count blank screens.
+    The real writer got `CLIENT_EOF clean=1 done=1` and the handler, still
+    running, then discovered the closed transport and logged `stream_aborted
+    phase=mid_stream` — the record the journey ledger counts as a user-visible
+    failure. Every stream open at deploy time would have produced a false one.
+
+    The guard now reads the LIFECYCLE rather than a global mark set: the reason
+    lives with the response and dies with it, so a later genuine abort on a
+    different response is unaffected by construction rather than by remembering
+    to consume a flag.
     """
 
     def setUp(self):
         self.src = _api_server_source()
 
-    def test_only_a_LANDED_eof_may_be_marked(self):
-        """Intent is not delivery, and this direction of the error is worse.
-
-        The first version marked the response before terminating it, so a body
-        whose every write failed was still recorded as cleanly closed — and a
-        later, genuine handler exception was then suppressed and rendered to the
-        operator as "the user got a proper ending". Proved by a probe that made
-        every write fail. A false negative on a real failure is worse than the
-        false positive it replaced.
-        """
-        self.assertIn("_t.result() is True", self.src,
-                      "the mark does not depend on the terminator succeeding")
-        add_at = self.src.index("_SHUTDOWN_TERMINATED.add(")
-        wait_at = self.src.index("_asyncio.wait(")
-        self.assertGreater(add_at, wait_at,
-                           "the mark is applied before the writes are awaited")
-
-    def test_shutdown_closed_bodies_are_marked(self):
-        self.assertIn("_SHUTDOWN_TERMINATED.add(", self.src,
-                      "nothing records that WE closed the body, so the handler "
-                      "cannot tell a shutdown from a crash")
-
-    def test_the_handler_checks_before_calling_it_an_abort(self):
+    def test_the_handler_asks_the_lifecycle_before_calling_it_an_abort(self):
         idx = self.src.index("stream_aborted service=gateway phase=mid_stream")
-        head = self.src.rfind("_SHUTDOWN_TERMINATED", 0, idx)
+        head = self.src.rfind("_LIVE_STREAM_BODIES.get(response)", 0, idx)
         self.assertGreater(head, 0, "the abort log is not guarded at all")
         self.assertLess(self.src[head:idx].count("\n"), 20,
                         "the guard drifted away from the log it protects")
+        self.assertIn(".shutdown:", self.src[head:idx],
+                      "the guard does not read the shutdown reason")
 
     def test_the_honest_label_exists_and_is_not_an_error(self):
-        """It still has to be VISIBLE — a shutdown that closed live streams is
-        worth counting, just not as a failure."""
         self.assertIn("stream_closed_at_shutdown", self.src)
         idx = self.src.index("stream_closed_at_shutdown")
-        window = self.src[max(0, idx - 200):idx]
-        self.assertIn("logger.info", window,
+        self.assertIn("logger.info", self.src[max(0, idx - 200):idx],
                       "a clean shutdown close is logged at error level, which "
                       "puts it back in the failure counts by another name")
 
-    def test_the_mark_is_consumed_so_a_later_real_abort_still_reports(self):
-        """A response object could be reused or a second exception could follow;
-        a sticky mark would silence a genuine abort."""
-        self.assertIn("_SHUTDOWN_TERMINATED.discard(", self.src)
+    def test_the_old_global_marks_are_gone(self):
+        """Three mark sets used as an implicit state machine were the thing
+        that kept producing a new defect inside each fix. If one reappears,
+        that design is creeping back."""
+        for gone in ("_SHUTDOWN_CANCELLED", "_SHUTDOWN_TAKEOVER"):
+            self.assertNotIn(f"{gone}.add(", self.src,
+                             f"{gone} is being written to again")
+
+
+class EmptyReplyReasonTests(unittest.TestCase):
+    """'finished without any content' — the loop knew why, and we discarded it.
+
+    Six early returns in `conversation_loop.py` produce
+    `{final_response: None, partial: True, error: "..."}` and **bypass
+    TurnFinalizer**, so the empty-turn explainer cannot fire for any of them.
+    The non-streaming handler turns that same dict into an HTTP 502; the
+    streaming writer ignored `error` and emitted a normal finish + `[DONE]` with
+    no content. The user got a blank box while the reason sat unread in the
+    result dict.
+
+    Structural, because the branch needs a full streaming turn to reach and the
+    point is that the value is READ at all.
+    """
+
+    def setUp(self):
+        self.src = _api_server_source()
+
+    def test_the_reason_is_read_from_the_result(self):
+        self.assertIn('_err = result.get("error")', self.src,
+                      "the streaming writer still discards the reason the loop "
+                      "computed, so the user keeps getting a blank box")
+
+    def test_it_is_surfaced_on_the_wire_not_only_logged(self):
+        """Structural, not window-based. A character-count window broke the
+        moment a comment grew, which is a test failing for the wrong reason."""
+        idx = self.src.index('_err = result.get("error")')
+        # Everything up to the next `else:` at the same nesting is this branch.
+        end = self.src.index("\n                        else:", idx)
+        branch = self.src[idx:end]
+        self.assertIn("_encode_content_delta(_msg)", branch,
+                      "the reason is computed and then never written to the "
+                      "client -- a log line is not an answer")
+
+    def test_the_no_reason_case_still_logs_the_bare_shape(self):
+        """Not every early return carries an error string. That case must stay
+        distinguishable in the logs rather than being folded into the explained
+        one, or the ledger loses the ability to count them apart."""
+        for label in ('"no_content_and_no_final_explained"',
+                      '"no_content_and_no_final_generic"',
+                      '"no_content_and_no_final"'):
+            self.assertIn(label, self.src, f"{label} is gone")
+        # The label must be chosen by whether the write SUCCEEDED, not merely
+        # attempted. The first version logged it from inside the try, so a
+        # failed write still reported the user had been told why -- a metric
+        # lying about the one thing it was built to measure.
+        self.assertIn("if not _delivered else", self.src,
+                      "the label is not conditioned on delivery")
+        # ...and a generic sentence must not be reported as an explanation.
+        self.assertIn("if _known else", self.src,
+                      "a generic delivery is logged as an explained one")
+
+    def test_the_providers_text_never_reaches_the_wire(self):
+        """The M4 boundary, and the reason this is a closed vocabulary.
+
+        I first rendered `result["error"]` directly with a 300-character bound,
+        calling it "an internal string our own loop produced". It is not:
+        `_summarize_api_error` accepts `body.error.message` and raw
+        `str(error)`, and the invalid-tool path interpolates a MODEL-CHOSEN
+        name. Adversarial review put a synthetic filename through it and watched
+        it reach the wire. A length bound bounds length, not provenance.
+        """
+        self.assertNotIn("EMPTY_REPLY_REASON_MAX_CHARS", self.src,
+                         "the length-bounded raw-error path is back")
+        self.assertIn("_EMPTY_REPLY_SENTENCES", self.src)
+        self.assertNotIn("_why = _err.strip()", self.src,
+                         "the raw error is being rendered again")
+
+
+@unittest.skipIf(_SKIP, _SKIP)
+class EmptyReplyVocabularyTests(unittest.TestCase):
+    """Behavioural: only sentences this file owns may be produced."""
+
+    def test_an_unrecognised_reason_still_gets_a_sentence(self):
+        """The generic sentence was dead in the wire path.
+
+        Emission was gated on a RECOGNISED reason, so an unrecognised loop
+        outcome still handed the user a blank box — the very defect this branch
+        exists to close, surviving inside its own fix.
+        """
+        src = _api_server_source()
+        self.assertNotIn(
+            "                        if _known:\n", src,
+            "emission is gated on recognition again, so unknown reasons are "
+            "silent")
+        self.assertIn("no_content_and_no_final_generic", src,
+                      "a generic delivery is indistinguishable from a specific "
+                      "one in the logs")
+
+    def test_cancellation_is_not_swallowed_by_the_explanation_write(self):
+        """My own `except BaseException: pass`, written today.
+
+        Eating a cancellation here loses the explanation, leaves the
+        cancellation pending on the task, and then lets the code below emit
+        `[DONE]` as though the request ended normally — the exact defect the
+        four earlier terminator commits exist to undo, reintroduced inside
+        their own fix.
+        """
+        src = _api_server_source()
+        idx = src.index("_delivered = True")
+        window = src[idx:idx + 900]
+        self.assertIn("except (asyncio.CancelledError, GeneratorExit)", window,
+                      "cancellation is caught by a bare BaseException handler "
+                      "again")
+        self.assertIn("raise", window, "cancellation is caught and not re-raised")
+        self.assertNotIn("except BaseException:\n                                pass",
+                         window, "the swallow-everything guard is back")
+
+    def test_a_provider_message_with_a_filename_is_not_echoed(self):
+        m = _mod()
+        leak = "HTTP 400: Cannot process Smith-v-Jones-SETTLEMENT-DRAFT.docx"
+        out = m._empty_reply_sentence(leak)
+        self.assertNotIn("Smith-v-Jones", out)
+        self.assertNotIn(".docx", out)
+        self.assertEqual(out, m._EMPTY_REPLY_GENERIC)
+
+    def test_a_model_chosen_tool_name_is_not_echoed(self):
+        m = _mod()
+        out = m._empty_reply_sentence(
+            "Model generated invalid tool call: read_/Users/kg/clients/acme.pdf")
+        self.assertNotIn("acme", out)
+        self.assertNotIn("/Users", out)
+        self.assertIn("does not exist", out)
+
+    def test_each_known_reason_maps_to_its_own_sentence(self):
+        m = _mod()
+        seen = set()
+        for prefix, sentence in m._EMPTY_REPLY_SENTENCES:
+            got = m._empty_reply_sentence(prefix + " ...trailing junk...")
+            self.assertEqual(got, sentence)
+            seen.add(got)
+        self.assertEqual(len(seen), len(m._EMPTY_REPLY_SENTENCES),
+                         "two reasons collapsed onto one sentence")
+
+    def test_every_rendered_sentence_is_literal_in_this_file(self):
+        """The property that actually protects the boundary: whatever comes out
+        must appear verbatim in the source, so no input can shape it."""
+        m = _mod()
+        src = _api_server_source()
+        for probe in ("", "unknown thing", "HTTP 500 " + "x" * 500, None, 42):
+            out = m._empty_reply_sentence(probe)
+            self.assertIn(out, src,
+                          f"a sentence not written in this file reached the "
+                          f"user for input {probe!r}")
+
+
