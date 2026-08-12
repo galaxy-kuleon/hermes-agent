@@ -213,6 +213,95 @@ class ShutdownTerminatorTests(unittest.TestCase):
         asyncio.run(m._terminate_stream_body(r, "id", 1, "model", None))
         self.assertNotIn(b"cut short", b"".join(r.writes))
 
+    def test_the_owning_handler_is_cancelled_before_we_write(self):
+        """Two writers on one StreamResponse is the remaining user-visible race.
+
+        Scheduling the real functions produced NOTICE,MODEL_DELTA,FINISH,DONE,EOF
+        and NOTICE,FINISH,FINISH,DONE,DONE,EOF — interleaved output and a double
+        terminal — and could label a COMPLETE answer "cut short" if its handler
+        had not yet deregistered. The callback must hand over to the one task
+        that owns the response.
+        """
+        m = _mod()
+
+        async def _scenario():
+            done_first = asyncio.Event()
+
+            async def _owner():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    done_first.set()
+                    raise
+
+            task = asyncio.ensure_future(_owner())
+            await asyncio.sleep(0)
+            r = _FakeResponse()
+            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            await m._terminate_live_stream_bodies(None)
+            return r, task, done_first.is_set()
+
+        r, task, cancelled = asyncio.run(_scenario())
+        self.assertTrue(cancelled, "the owning handler was never cancelled, so "
+                                   "it can still write while we do")
+        self.assertTrue(task.cancelled() or task.done())
+
+    def test_a_handler_that_finished_its_own_ending_is_left_alone(self):
+        """A completed handler already terminated honestly. Writing again would
+        duplicate the terminal and could tell a user whose answer arrived in
+        full that it was cut short."""
+        m = _mod()
+
+        async def _scenario():
+            async def _already(): return None
+            task = asyncio.ensure_future(_already())
+            await task
+            r = _FakeResponse()
+            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            await m._terminate_live_stream_bodies(None)
+            return r
+
+        r = asyncio.run(_scenario())
+        self.assertEqual(r.writes, [],
+                         "wrote a second ending over a handler that had already "
+                         "finished its own")
+        self.assertEqual(r.eof_calls, 0)
+        self.assertNotIn(r, m._SHUTDOWN_TERMINATED,
+                         "marked a body we never wrote to")
+
+    def test_the_handover_actually_WAITS_for_the_owner(self):
+        """Cancelling is not handing over.
+
+        A handler does not finish the instant it is cancelled — it still has to
+        run its own terminator. Cancel without waiting and we write anyway,
+        which is the two-writer race with an extra step. This owner needs a
+        moment after cancellation; the callback must not write over it.
+        """
+        m = _mod()
+
+        async def _scenario():
+            async def _owner():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    # The real handler's cancellation path: emit its own
+                    # ending, which takes a turn of the loop.
+                    await asyncio.sleep(0.05)
+                    return None
+
+            task = asyncio.ensure_future(_owner())
+            await asyncio.sleep(0)
+            r = _FakeResponse()
+            m._LIVE_STREAM_BODIES[r] = ("id", 1, "model", None, task)
+            await m._terminate_live_stream_bodies(None)
+            return r
+
+        r = asyncio.run(_scenario())
+        self.assertEqual(
+            r.writes, [],
+            "the callback wrote over an owner that was still finishing its own "
+            "ending -- cancelling is not handing over")
+
     def test_no_open_bodies_is_a_quiet_no_op(self):
         asyncio.run(_mod()._terminate_live_stream_bodies(None))
 

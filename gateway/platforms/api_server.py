@@ -378,6 +378,11 @@ _SHUTDOWN_TERMINATED: "set" = set()
 # A hung write must not hold shutdown open past the orchestrator's grace; a
 # truncated body is bad, a container that will not stop is worse.
 STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS = 5.0
+# How long the owning handler gets to finish its own termination after being
+# cancelled, before the callback writes instead. Short: this runs inside the
+# orchestrator's stop grace, and a handler that has not reacted in this long is
+# not going to.
+STREAM_SHUTDOWN_HANDOVER_SECONDS = 1.0
 
 # CLOSED VOCABULARY, and the reason it has to be closed.
 #
@@ -456,14 +461,43 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     # `wait` returns (done, pending) WITHOUT cancelling. A stuck body is left
     # behind and the loop tears it down at exit; shutdown proceeds either way.
     # Marked AFTER the fact, and only for bodies whose write_eof landed.
+    # ONE WRITER. The callback and the request handler are both able to write to
+    # the same StreamResponse, and adversarial review scheduled the real
+    # functions to produce NOTICE,MODEL_DELTA,FINISH,DONE,EOF and
+    # NOTICE,FINISH,FINISH,DONE,DONE,EOF -- interleaved output and a double
+    # terminal. Worse, a turn whose answer had fully arrived but whose handler
+    # had not yet deregistered could be labelled "cut short" when it was not.
+    #
+    # So: cancel the owning handler and give it a moment to finish its own
+    # termination (its cancellation path already does this correctly). Only a
+    # handler that does NOT finish leaves us writing, and by then it is the sole
+    # writer left.
+    _owners = [a[4] if len(a) > 4 else None for _r, a in live]
+    for _own in _owners:
+        if _own is not None and not _own.done():
+            _own.cancel()
+    if any(_own is not None for _own in _owners):
+        try:
+            await _asyncio.wait(
+                [o for o in _owners if o is not None],
+                timeout=STREAM_SHUTDOWN_HANDOVER_SECONDS)
+        except BaseException:
+            pass
     tasks = [_asyncio.ensure_future(
-                 _terminate_stream_body(resp, *args,
+                 _terminate_stream_body(resp, *args[:4],
                                         notice=SHUTDOWN_INTERRUPTION_NOTICE))
-             for resp, args in live]
+             for resp, args in live
+             if (len(args) < 5 or args[4] is None or not args[4].done())]
+    if not tasks:
+        # Every handler finished its own ending. Nothing left to write, and
+        # nothing to mark: the handler's own path already terminated honestly.
+        return
     try:
         _done, pending = await _asyncio.wait(
             tasks, timeout=STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS)
-        for _resp, _t in zip([r for r, _a in live], tasks):
+        _wrote = [r for r, a in live
+                  if (len(a) < 5 or a[4] is None or not a[4].done())]
+        for _resp, _t in zip(_wrote, tasks):
             if _t in _done and _t.exception() is None and _t.result() is True:
                 _SHUTDOWN_TERMINATED.add(_resp)
         for _t in pending:
@@ -3604,7 +3638,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Registered AFTER prepare (before it, there is no body to terminate)
         # and removed in `finally` (a normal return terminates its own body, so
         # a stale entry would make shutdown write to a closed transport).
-        _LIVE_STREAM_BODIES[response] = (completion_id, created, model, logger)
+        _LIVE_STREAM_BODIES[response] = (completion_id, created, model, logger,
+                                         asyncio.current_task())
 
         try:
             last_activity = time.monotonic()
