@@ -455,13 +455,15 @@ async def _terminate_live_stream_bodies(app=None) -> None:
     #
     # `wait` returns (done, pending) WITHOUT cancelling. A stuck body is left
     # behind and the loop tears it down at exit; shutdown proceeds either way.
-    for _resp, _args in live:
-        _SHUTDOWN_TERMINATED.add(_resp)
+    # Marked AFTER the fact, and only for bodies whose write_eof landed.
     tasks = [_asyncio.ensure_future(_terminate_stream_body(resp, *args))
              for resp, args in live]
     try:
         _done, pending = await _asyncio.wait(
             tasks, timeout=STREAM_SHUTDOWN_TERMINATE_TIMEOUT_SECONDS)
+        for _resp, _t in zip([r for r, _a in live], tasks):
+            if _t in _done and _t.exception() is None and _t.result() is True:
+                _SHUTDOWN_TERMINATED.add(_resp)
         for _t in pending:
             _t.cancel()          # best effort; it may be swallowed, and that is fine
     except BaseException:
@@ -473,7 +475,7 @@ async def _terminate_live_stream_bodies(app=None) -> None:
             pass
 
 
-async def _terminate_stream_body(response, completion_id, created, model, logger) -> None:
+async def _terminate_stream_body(response, completion_id, created, model, logger) -> bool:
     """Close the HTTP conversation, one best-effort step at a time.
 
     Each step gets its own guard, in increasing order of importance, so a
@@ -489,13 +491,24 @@ async def _terminate_stream_body(response, completion_id, created, model, logger
         lambda: response.write(b"data: [DONE]\n\n"),
         lambda: response.write_eof(),
     )
-    for step in steps:
+    _eof_ok = False
+    for _i, step in enumerate(steps):
         try:
             await step()
         except BaseException:
             # Keep going: the next step may still succeed, and write_eof is the
             # one the client is waiting for.
             continue
+        else:
+            if _i == len(steps) - 1:
+                _eof_ok = True
+    # Whether the CLIENT actually got a terminated body, not whether we tried.
+    # The shutdown path used to mark a response as cleanly closed on intent
+    # alone, so a body whose every write failed was still recorded as "the user
+    # got a proper ending" -- and a later, real handler exception was suppressed
+    # behind that. A false negative on a genuine failure is worse than the false
+    # positive it replaced.
+    return _eof_ok
 
 
 def _journey_suffix_safe() -> str:
@@ -3935,7 +3948,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         _known = any(
                             isinstance(_err, str) and _err.strip().startswith(_p)
                             for _p, _ in _EMPTY_REPLY_SENTENCES)
-                        if _known:
+                        # ALWAYS say something. Gating emission on a recognised
+                        # reason left the generic sentence dead in this path,
+                        # so an unrecognised loop outcome still handed the user
+                        # a blank box -- the exact defect this branch exists to
+                        # close, surviving inside its own fix. `_known` now only
+                        # decides HOW specific the sentence is, never whether
+                        # there is one.
+                        if True:
                             _msg = ("\u26a0\ufe0f No reply: "
                                     + _empty_reply_sentence(_err)
                                     + " Send `continue` to retry.")
@@ -3952,10 +3972,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             except BaseException:
                                 pass
                             from tools.journey_context import journey_suffix as _js1
+                            # Three states, because they mean different things:
+                            # a specific sentence delivered, a generic one
+                            # delivered, and nothing delivered at all.
                             logger.warning(
                                 "empty_reply service=gateway reason="
-                                + ("no_content_and_no_final_explained"
-                                   if _delivered else "no_content_and_no_final")
+                                + ("no_content_and_no_final"
+                                   if not _delivered else
+                                   "no_content_and_no_final_explained"
+                                   if _known else
+                                   "no_content_and_no_final_generic")
                                 + _js1())
                         else:
                             from tools.journey_context import journey_suffix as _js1

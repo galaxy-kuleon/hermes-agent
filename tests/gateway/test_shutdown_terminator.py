@@ -105,6 +105,7 @@ def _mod():
 class ShutdownTerminatorTests(unittest.TestCase):
     def setUp(self):
         _mod()._LIVE_STREAM_BODIES.clear()
+        _mod()._SHUTDOWN_TERMINATED.clear()
 
     tearDown = setUp
 
@@ -137,6 +138,38 @@ class ShutdownTerminatorTests(unittest.TestCase):
         asyncio.run(m._terminate_live_stream_bodies(None))
         self.assertEqual(alive.eof_calls, 1,
                          "a failing peer swallowed another client's termination")
+
+    def test_the_terminator_reports_whether_the_EOF_LANDED(self):
+        """The return value is what the shutdown path marks on, so it has to
+        mean delivery, not effort. A version that always returned True survived
+        every structural test here — the marking code looked right and rested on
+        a lie underneath it."""
+        m = _mod()
+        good = _FakeResponse()
+        self.assertIs(
+            asyncio.run(m._terminate_stream_body(good, "id", 1, "m", None)),
+            True, "a fully successful termination did not report success")
+        # write_eof is the third and last step.
+        dead = _FakeResponse(fail_on={2})
+        self.assertIs(
+            asyncio.run(m._terminate_stream_body(dead, "id", 1, "m", None)),
+            False, "a failed write_eof still reported the body as terminated, "
+                   "which is what lets a real failure be suppressed later")
+        # ...and a failure EARLIER must not cost the EOF its truthful report.
+        partial = _FakeResponse(fail_on={0, 1})
+        self.assertIs(
+            asyncio.run(m._terminate_stream_body(partial, "id", 1, "m", None)),
+            True, "the EOF landed but was reported as failed")
+
+    def test_a_body_whose_writes_all_fail_is_not_marked(self):
+        """End to end: intent must not become a mark."""
+        m = _mod()
+        dead = _FakeResponse(fail_on={0, 1, 2})
+        m._LIVE_STREAM_BODIES[dead] = ("id", 1, "m", None)
+        asyncio.run(m._terminate_live_stream_bodies(None))
+        self.assertNotIn(dead, m._SHUTDOWN_TERMINATED,
+                         "a body that never reached the client was recorded as "
+                         "cleanly closed")
 
     def test_no_open_bodies_is_a_quiet_no_op(self):
         asyncio.run(_mod()._terminate_live_stream_bodies(None))
@@ -255,9 +288,13 @@ class EmptyReplyReasonTests(unittest.TestCase):
                       "computed, so the user keeps getting a blank box")
 
     def test_it_is_surfaced_on_the_wire_not_only_logged(self):
+        """Structural, not window-based. A character-count window broke the
+        moment a comment grew, which is a test failing for the wrong reason."""
         idx = self.src.index('_err = result.get("error")')
-        window = self.src[idx:idx + 1400]
-        self.assertIn("_encode_content_delta(_msg)", window,
+        # Everything up to the next `else:` at the same nesting is this branch.
+        end = self.src.index("\n                        else:", idx)
+        branch = self.src[idx:end]
+        self.assertIn("_encode_content_delta(_msg)", branch,
                       "the reason is computed and then never written to the "
                       "client -- a log line is not an answer")
 
@@ -265,15 +302,19 @@ class EmptyReplyReasonTests(unittest.TestCase):
         """Not every early return carries an error string. That case must stay
         distinguishable in the logs rather than being folded into the explained
         one, or the ledger loses the ability to count them apart."""
-        self.assertIn('"no_content_and_no_final_explained"', self.src)
-        self.assertIn("no_content_and_no_final", self.src)
-        # ...and the explained label must be chosen by whether the write
-        # SUCCEEDED, not merely attempted. The first version logged it from
-        # inside the try, so a failed write still reported the user had been
-        # told why -- a metric lying about the one thing it was built to
-        # measure.
-        self.assertIn("if _delivered else", self.src,
-                      "the explained label is not conditioned on delivery")
+        for label in ('"no_content_and_no_final_explained"',
+                      '"no_content_and_no_final_generic"',
+                      '"no_content_and_no_final"'):
+            self.assertIn(label, self.src, f"{label} is gone")
+        # The label must be chosen by whether the write SUCCEEDED, not merely
+        # attempted. The first version logged it from inside the try, so a
+        # failed write still reported the user had been told why -- a metric
+        # lying about the one thing it was built to measure.
+        self.assertIn("if not _delivered else", self.src,
+                      "the label is not conditioned on delivery")
+        # ...and a generic sentence must not be reported as an explanation.
+        self.assertIn("if _known else", self.src,
+                      "a generic delivery is logged as an explained one")
 
     def test_the_providers_text_never_reaches_the_wire(self):
         """The M4 boundary, and the reason this is a closed vocabulary.
@@ -295,6 +336,22 @@ class EmptyReplyReasonTests(unittest.TestCase):
 @unittest.skipIf(_SKIP, _SKIP)
 class EmptyReplyVocabularyTests(unittest.TestCase):
     """Behavioural: only sentences this file owns may be produced."""
+
+    def test_an_unrecognised_reason_still_gets_a_sentence(self):
+        """The generic sentence was dead in the wire path.
+
+        Emission was gated on a RECOGNISED reason, so an unrecognised loop
+        outcome still handed the user a blank box — the very defect this branch
+        exists to close, surviving inside its own fix.
+        """
+        src = _api_server_source()
+        self.assertNotIn(
+            "                        if _known:\n", src,
+            "emission is gated on recognition again, so unknown reasons are "
+            "silent")
+        self.assertIn("no_content_and_no_final_generic", src,
+                      "a generic delivery is indistinguishable from a specific "
+                      "one in the logs")
 
     def test_a_provider_message_with_a_filename_is_not_echoed(self):
         m = _mod()
@@ -348,6 +405,23 @@ class FalseAbortTests(unittest.TestCase):
 
     def setUp(self):
         self.src = _api_server_source()
+
+    def test_only_a_LANDED_eof_may_be_marked(self):
+        """Intent is not delivery, and this direction of the error is worse.
+
+        The first version marked the response before terminating it, so a body
+        whose every write failed was still recorded as cleanly closed — and a
+        later, genuine handler exception was then suppressed and rendered to the
+        operator as "the user got a proper ending". Proved by a probe that made
+        every write fail. A false negative on a real failure is worse than the
+        false positive it replaced.
+        """
+        self.assertIn("_t.result() is True", self.src,
+                      "the mark does not depend on the terminator succeeding")
+        add_at = self.src.index("_SHUTDOWN_TERMINATED.add(")
+        wait_at = self.src.index("_asyncio.wait(")
+        self.assertGreater(add_at, wait_at,
+                           "the mark is applied before the writes are awaited")
 
     def test_shutdown_closed_bodies_are_marked(self):
         self.assertIn("_SHUTDOWN_TERMINATED.add(", self.src,
