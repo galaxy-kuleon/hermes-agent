@@ -151,9 +151,33 @@ def test_is_malformed_db_error_discriminates():
     assert is_malformed_db_error(
         sqlite3.DatabaseError("malformed database schema (messages_fts) - ...")
     )
-    assert is_malformed_db_error(sqlite3.DatabaseError("database disk image is malformed"))
+    assert not is_malformed_db_error(
+        sqlite3.DatabaseError("database disk image is malformed")
+    )
     assert not is_malformed_db_error(sqlite3.OperationalError("database is locked"))
     assert not is_malformed_db_error(ValueError("nope"))
+
+
+def test_disk_image_corruption_fails_closed_without_schema_surgery(tmp_path, monkeypatch):
+    """Physical page corruption must never enter writable_schema repair."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
+
+    def physical_corruption(_conn, **_kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    repair_calls = {"n": 0}
+
+    def forbidden_repair(*_args, **_kwargs):
+        repair_calls["n"] += 1
+        raise AssertionError("physical corruption must not trigger schema repair")
+
+    monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", physical_corruption)
+    monkeypatch.setattr(hermes_state, "repair_state_db_schema", forbidden_repair)
+
+    with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+        SessionDB(db_path=db_path)
+    assert repair_calls["n"] == 0
 
 
 def test_strategy_b_rebuild_when_dedup_insufficient(tmp_path, monkeypatch):

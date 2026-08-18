@@ -324,7 +324,6 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
 # and merely rebuilds the FTS layer.
 _MALFORMED_SCHEMA_MARKERS = (
     "malformed database schema",
-    "database disk image is malformed",
 )
 
 # Process-global guard so auto-repair is attempted at most once per DB path
@@ -335,11 +334,17 @@ _repair_attempt_lock = threading.Lock()
 
 
 def is_malformed_db_error(exc: BaseException) -> bool:
-    """True if *exc* is a SQLite 'malformed schema / disk image' error.
+    """True only for SQLite's malformed-*schema* error class.
 
-    These are the corruption classes where the schema fails to parse, so
-    targeted ``sqlite_master`` surgery (not an ordinary FTS rebuild) is the
-    only recovery path.
+    ``database disk image is malformed`` means physical B-tree/page
+    corruption. Treating it like a duplicate ``sqlite_master`` definition is
+    unsafe: writable-schema deletion plus VACUUM can destroy the remaining
+    recoverable pages. Physical corruption must fail closed for an operator
+    to quiesce the writer and recover from exact bytes.
+
+    Malformed *schema* is narrower: SQLite cannot parse duplicate object
+    definitions while canonical table pages remain intact, so the guarded
+    sqlite_master repair below is appropriate for that class only.
     """
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
