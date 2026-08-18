@@ -29,6 +29,19 @@ inserting their plugin dir on ``sys.path[0]`` race for
 first wins; the other fails with ``ImportError``, and the polluted
 ``sys.path`` cascades into unrelated tests. See PR #17764 for the
 incident.
+
+Collection-time module-isolation guard
+--------------------------------------
+Each gateway test module may import dependencies, but it must not leave an
+already-loaded ``sys.modules`` entry deleted or bound to a different object.
+The collection hooks below compare object identity immediately before and
+after importing each test module and turn any leak into a collection error
+that names the polluter and changed keys.
+
+Normal imports add new entries, so additions are deliberately not failures.
+This bounded guard detects cross-test corruption of shared, pre-existing
+module identities; it does not claim to detect every possible global-state
+mutation.
 """
 
 import ast
@@ -37,6 +50,40 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+
+def _preexisting_module_identity_changes(
+    before: dict[str, object], after: dict[str, object]
+) -> list[str]:
+    """Name pre-existing module keys deleted or replaced in ``after``."""
+    changes: list[str] = []
+    for name, original in before.items():
+        if name not in after:
+            changes.append(f"deleted:{name}")
+        elif after[name] is not original:
+            changes.append(f"replaced:{name}")
+    return changes
+
+
+class _SysModulesGuardedModule(pytest.Module):
+    """A test-module collector that checks the actual import boundary."""
+
+    def _getobj(self):
+        before = dict(sys.modules)
+        module = super()._getobj()
+        changes = _preexisting_module_identity_changes(before, dict(sys.modules))
+        if changes:
+            raise self.CollectError(
+                f"{self.nodeid} polluted pre-existing sys.modules entries "
+                f"during collection: {', '.join(changes)}. Restore every "
+                "replaced/deleted entry before module import returns."
+            )
+        return module
+
+
+def pytest_pycollect_makemodule(module_path, parent):
+    """Use the guarded collector for every test module in this subtree."""
+    return _SysModulesGuardedModule.from_parent(parent, path=module_path)
 
 
 def _ensure_telegram_mock() -> None:
@@ -448,4 +495,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

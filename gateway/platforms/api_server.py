@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /v1/owner-observation       — authenticated process-local agent-owner count
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -394,6 +395,96 @@ class _StreamLifecycle:
 # response it describes, and the reason must stay readable for as long as it
 # does -- a backpressured owner terminates after the callback has returned.
 _LIVE_STREAM_BODIES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+# Owner observation is deliberately separate from `_LIVE_STREAM_BODIES`.
+# That mapping begins only after Chat Completions has prepared an SSE body; it
+# excludes every non-streaming execution, Responses, session chat and /v1/runs.
+# The owner of work dispatched through this adapter is the executor thread.
+API_OWNER_OBSERVATION_SCHEMA = 1
+API_OWNER_STATUS_OBSERVED = "observed"
+API_OWNER_STATUS_UNKNOWN = "unknown"
+API_OWNER_SCOPE = "api_agent_executions"
+API_OWNER_UNKNOWN_ADMISSION = "admission_unobserved"
+API_OWNER_UNKNOWN_RECORD_LOST = "owner_record_lost"
+API_OWNER_UNKNOWN_INSTRUMENTATION = "instrumentation_failure"
+API_OWNER_UNKNOWN_REASONS = frozenset({
+    API_OWNER_UNKNOWN_ADMISSION,
+    API_OWNER_UNKNOWN_RECORD_LOST,
+    API_OWNER_UNKNOWN_INSTRUMENTATION,
+})
+
+
+class _APIAgentOwnerRegistry:
+    """Thread-owned executions; unknown is monotonic until process restart."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owners: set[object] = set()
+        self._unknown_reason: Optional[str] = None
+
+    def admit(self) -> Optional[object]:
+        """Claim an owner before executor submission, without breaking work."""
+        try:
+            token = object()
+            with self._lock:
+                if self._unknown_reason is not None:
+                    return None
+                try:
+                    self._owners.add(token)
+                except Exception:
+                    self._unknown_reason = API_OWNER_UNKNOWN_ADMISSION
+                    return None
+            return token
+        except Exception:
+            self.invalidate(API_OWNER_UNKNOWN_ADMISSION)
+            return None
+
+    def finish(self, token: Optional[object]) -> None:
+        """Release exactly the token admitted for this executor thread."""
+        if token is None:
+            return
+        try:
+            with self._lock:
+                if token not in self._owners:
+                    if self._unknown_reason is None:
+                        self._unknown_reason = API_OWNER_UNKNOWN_RECORD_LOST
+                    return
+                self._owners.remove(token)
+        except Exception:
+            self.invalidate(API_OWNER_UNKNOWN_INSTRUMENTATION)
+
+    def invalidate(self, reason: str) -> None:
+        if reason not in API_OWNER_UNKNOWN_REASONS:
+            reason = API_OWNER_UNKNOWN_INSTRUMENTATION
+        try:
+            with self._lock:
+                if self._unknown_reason is None:
+                    self._unknown_reason = reason
+        except Exception:
+            # A standard threading.Lock has no ordinary failure mode. If an
+            # injected/broken lock does fail, no count can be produced; the
+            # observer below independently returns instrumentation_failure.
+            self._unknown_reason = API_OWNER_UNKNOWN_INSTRUMENTATION
+
+    def observe(self) -> Dict[str, Any]:
+        try:
+            with self._lock:
+                reason = self._unknown_reason
+                active = len(self._owners) if reason is None else None
+        except Exception:
+            reason = API_OWNER_UNKNOWN_INSTRUMENTATION
+            active = None
+        return {
+            "schema": API_OWNER_OBSERVATION_SCHEMA,
+            "status": (
+                API_OWNER_STATUS_OBSERVED
+                if reason is None
+                else API_OWNER_STATUS_UNKNOWN
+            ),
+            "active": active,
+            "reason": reason,
+            "scope": API_OWNER_SCOPE,
+        }
 
 # Set the instant shutdown begins, and never cleared -- the process is dying.
 # Without it there is a hole no sweep can close: the sweep snapshots what is
@@ -2132,6 +2223,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        self._api_agent_owners = _APIAgentOwnerRegistry()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -2756,6 +2848,15 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
         })
+
+    async def _handle_owner_observation(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Authenticated observation, not health, drain, or deploy authority."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(self._api_agent_owners.observe())
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
@@ -6090,7 +6191,34 @@ class APIServerAdapter(BasePlatformAdapter):
         # later copy_context() faithfully copied an empty one. Proved by
         # adversarial review round 11 on the real _run_agent worker.
         _journey_ctx = contextvars.copy_context()
-        return await loop.run_in_executor(None, lambda: _journey_ctx.run(_run))
+        return await self._run_owned_in_executor(
+            loop, lambda: _journey_ctx.run(_run)
+        )
+
+    async def _run_owned_in_executor(self, loop, func):
+        """Keep ownership with the worker, even if its asyncio waiter dies.
+
+        Cancelling an asyncio Future cannot stop a Python executor thread. A
+        coroutine-level `finally` would therefore unregister early and expose a
+        false zero while `run_conversation` kept running. The worker's own
+        `finally` is the first boundary that observes real completion.
+        """
+        token = self._api_agent_owners.admit()
+
+        def _owned():
+            try:
+                return func()
+            finally:
+                self._api_agent_owners.finish(token)
+
+        try:
+            future = loop.run_in_executor(None, _owned)
+        except BaseException:
+            # Submission did not return an owner. Avoid a false positive while
+            # preserving process-control propagation.
+            self._api_agent_owners.finish(token)
+            raise
+        return await future
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -6429,8 +6557,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the deployed worker still observed ('', '') -- my round-12 edit
                 # never applied and I claimed it had without checking.
                 _runs_ctx = contextvars.copy_context()
-                result, usage = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: _runs_ctx.run(_run_sync))
+                result, usage = await self._run_owned_in_executor(
+                    asyncio.get_running_loop(), lambda: _runs_ctx.run(_run_sync))
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -7101,6 +7229,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get(
+                "/v1/owner-observation", self._handle_owner_observation
+            )
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
