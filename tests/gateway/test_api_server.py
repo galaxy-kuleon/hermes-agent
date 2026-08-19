@@ -378,6 +378,9 @@ class TestAgentExecution:
                 requested_model="MiniMax-M3",
                 requested_provider="minimax",
                 model_options=model_options,
+                user_id="owui-user-123",
+                user_role="admin",
+                user_groups="legal,reviewers",
             )
 
         # _run_agent annotates result with the effective agent.session_id
@@ -391,6 +394,9 @@ class TestAgentExecution:
         assert create_kwargs["requested_model"] == "MiniMax-M3"
         assert create_kwargs["requested_provider"] == "minimax"
         assert create_kwargs["model_options"] == model_options
+        assert create_kwargs["user_id"] == "owui-user-123"
+        assert create_kwargs["user_role"] == "admin"
+        assert create_kwargs["user_groups"] == "legal,reviewers"
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
