@@ -148,6 +148,31 @@ def test_skill_view_exact_name_denied_without_leak(acl_enabled):
         clear_session_vars(tokens)
 
 
+def test_owner_can_read_explicit_private_skill_without_shared_read_grant(
+    acl_enabled, tmp_path, monkeypatch
+):
+    user_root = tmp_path / "user-skills" / "alice" / "private"
+    user_root.mkdir(parents=True)
+    (user_root / "SKILL.md").write_text(
+        "---\nname: private\ndescription: Private skill.\n---\n\nPRIVATE-CANARY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tokens = set_session_vars(
+        platform="api_server", user_id="alice", user_role="user", user_groups=""
+    )
+    try:
+        private = json.loads(skills_tool.skill_view("user:private"))
+        assert private["success"] is True
+        assert private["namespace"] == "user"
+        assert "PRIVATE-CANARY" in private["content"]
+
+        platform = skills_tool.skill_view("platform:private")
+        assert _denied(platform)
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_reader_group_passes_gate_into_tool(acl_enabled):
     # Reader gets PAST the ACL gate; result is normal tool output, not an ACL denial.
     tokens = _scope(role="user", groups=G_READERS)

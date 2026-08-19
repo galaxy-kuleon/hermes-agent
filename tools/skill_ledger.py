@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,6 +51,9 @@ _VALID_ACTORS = {ACTOR_CURATOR, ACTOR_AGENT, ACTOR_USER}
 _actor_override: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "skill_ledger_actor", default=None
 )
+_ledger_root_override: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
+    "skill_ledger_root", default=None
+)
 
 
 def set_ledger_actor(actor: Optional[str]) -> contextvars.Token:
@@ -62,6 +66,19 @@ def set_ledger_actor(actor: Optional[str]) -> contextvars.Token:
 
 def reset_ledger_actor(token: contextvars.Token) -> None:
     _actor_override.reset(token)
+
+
+@contextmanager
+def ledger_scope(skills_root: Optional[Path]):
+    """Bind audit files to the namespace root being mutated."""
+    if skills_root is None:
+        yield
+        return
+    token = _ledger_root_override.set(Path(skills_root))
+    try:
+        yield
+    finally:
+        _ledger_root_override.reset(token)
 
 
 def derive_actor() -> str:
@@ -88,10 +105,16 @@ def derive_actor() -> str:
 # ---------------------------------------------------------------------------
 
 def ledger_path() -> Path:
+    root = _ledger_root_override.get()
+    if root is not None:
+        return root / ".curator_ledger.jsonl"
     return get_hermes_home() / "skills" / ".curator_ledger.jsonl"
 
 
 def blobs_dir() -> Path:
+    root = _ledger_root_override.get()
+    if root is not None:
+        return root / ".curator_backups" / "blobs"
     return get_hermes_home() / ".curator_backups" / "blobs"
 
 

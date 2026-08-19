@@ -1851,11 +1851,23 @@ def skill_manage(
     # error, and record_mutation below swallows everything).
     _ledger_before = None
     _ledger_before_dir = None
+    _ledger_root = None
     try:
         from tools import skill_ledger as _ledger
         _pre = _find_skill(bare_name, target_namespace)
         _ledger_before_dir = _pre["path"] if _pre else None
-        _ledger_before = _ledger.capture_before(_ledger_before_dir)
+        target_root = _root_for_namespace(target_namespace)
+        # Preserve the long-standing platform ledger/blob locations so
+        # existing rollback entries stay readable. Only private user skills
+        # need a namespace-local ledger: the platform root is deliberately
+        # read-only for ordinary API users.
+        _ledger_root = (
+            target_root.path
+            if target_namespace == "user" and target_root is not None
+            else None
+        )
+        with _ledger.ledger_scope(_ledger_root):
+            _ledger_before = _ledger.capture_before(_ledger_before_dir)
     except Exception:
         pass
 
@@ -1941,13 +1953,14 @@ def skill_manage(
                 _evidence["session_id"] = session_id
             if file_path:
                 _evidence["file_path"] = file_path
-            _ledger.record_mutation(
-                action,
-                bare_name,
-                before=_ledger_before if _ledger_before is not None else [],
-                after_root=_after_dir,
-                evidence=_evidence,
-            )
+            with _ledger.ledger_scope(_ledger_root):
+                _ledger.record_mutation(
+                    action,
+                    bare_name,
+                    before=_ledger_before if _ledger_before is not None else [],
+                    after_root=_after_dir,
+                    evidence=_evidence,
+                )
         except Exception:
             pass
         try:

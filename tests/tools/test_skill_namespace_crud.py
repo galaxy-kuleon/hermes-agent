@@ -99,6 +99,8 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
         skill_md = user_root / "alice-skill" / "SKILL.md"
         assert skill_md.exists()
         assert stat.S_IMODE(user_root.stat().st_mode) == 0o700
+        assert (user_root / ".curator_ledger.jsonl").exists()
+        assert not (home / "skills" / ".curator_ledger.jsonl").exists()
 
         edited = json.loads(
             manager.skill_manage(

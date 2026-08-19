@@ -186,6 +186,20 @@ def _acl_read_block(action: str) -> Optional[str]:
         return _ACL_READ_DENY
 
 
+def _owned_user_skill_read(name: str) -> bool:
+    """Whether this API caller explicitly addressed its own private skill."""
+    try:
+        from agent.skill_namespaces import (
+            current_skill_namespace_user_id,
+            split_builtin_qualified_name,
+        )
+
+        namespace, _ = split_builtin_qualified_name(name)
+        return namespace == "user" and current_skill_namespace_user_id() is not None
+    except (ImportError, ValueError):
+        return False
+
+
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -1128,6 +1142,11 @@ def skill_view(
     """
     # Gate before name resolution so denied callers cannot probe existence.
     blocked = _acl_read_block("skill_view")
+    if blocked and _owned_user_skill_read(name):
+        # Shared-skill ACL protects platform/plugin knowledge. It must not
+        # prevent an authenticated caller from reading the private namespace
+        # that skill_manage already lets that same caller own and mutate.
+        blocked = None
     if blocked:
         return tool_error(blocked, success=False)
     try:
