@@ -78,10 +78,9 @@ if [ ! -x "$S6_SUID" ]; then
     exit 126
 fi
 
-# Reset HOME to the hermes user's home before dropping privileges. Without
-# this, $HOME stays /root and any library that resolves paths off $HOME
-# (XDG caches, lockfiles, .config writes) will try to write to /root and
-# fail with EACCES. Mirrors main-wrapper.sh.
-export HOME=/opt/data
+# Restore the deployment's OS/library home before dropping privileges.
+# HERMES_HOME may point at a profile-specific state root; agent cwd is a
+# separate contract again. Mirrors main-wrapper.sh.
+export HOME="${HERMES_CONTAINER_HOME:-/opt/data}"
 
 exec "$S6_SUID" hermes "$REAL" "$@"

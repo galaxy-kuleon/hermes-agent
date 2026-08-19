@@ -18,7 +18,16 @@
 set -eu
 
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
+HERMES_CONTAINER_HOME="${HERMES_CONTAINER_HOME:-/opt/data}"
 INSTALL_DIR="/opt/hermes"
+
+case "$HERMES_CONTAINER_HOME" in
+    /*) ;;
+    *)
+        echo "[stage2] ERROR: HERMES_CONTAINER_HOME must be an absolute path" >&2
+        exit 78
+        ;;
+esac
 
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
 as_hermes() { [ "$(id -u)" = 0 ] || { "$@"; return; }; s6-setuidgid hermes "$@"; }
@@ -83,7 +92,7 @@ fi
 # fail on first boot with `mkdir: cannot create directory '/...': Permission
 # denied` and the cont-init hook exits non-zero. Idempotent — `mkdir -p`
 # is a no-op if the dir already exists. (#18482, salvages #18488)
-mkdir -p "$HERMES_HOME"
+mkdir -p "$HERMES_HOME" "$HERMES_CONTAINER_HOME"
 
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
@@ -113,6 +122,13 @@ if [ -n "${HERMES_GID:-}" ] && validate_uid_gid "$HERMES_GID" && [ "$HERMES_GID"
     # -o allows non-unique GID (e.g. macOS GID 20 "staff" may already
     # exist as "dialout" in the Debian-based container image).
     groupmod -o -g "$HERMES_GID" hermes 2>/dev/null || true
+fi
+
+# Keep libc/passwd home lookup aligned with HOME. HERMES_HOME may later be
+# profile-scoped, while agent tools use their own workspace/cwd contract.
+current_container_home="$(getent passwd hermes | cut -d: -f6)"
+if [ "$current_container_home" != "$HERMES_CONTAINER_HOME" ]; then
+    usermod -d "$HERMES_CONTAINER_HOME" hermes
 fi
 
 # --- Docker socket group membership (docker-in-docker / DooD) ---

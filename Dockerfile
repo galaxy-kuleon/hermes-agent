@@ -378,6 +378,10 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # 502 / "[session ended]". Pointing at the prebuilt bundle sidesteps the whole
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
+# OS/library home, intentionally distinct from the active Hermes state root
+# and from an agent's working directory. Deployments with legacy state paths
+# can override this without changing profile-scoped HERMES_HOME.
+ENV HERMES_CONTAINER_HOME=/opt/data
 ENV HERMES_HOME=/opt/data
 ENV HERMES_WRITE_SAFE_ROOT=/opt/data
 ENV HERMES_DISABLE_LAZY_INSTALLS=1

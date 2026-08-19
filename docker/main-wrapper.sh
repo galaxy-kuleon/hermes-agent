@@ -58,18 +58,17 @@ EOF
     exit 1
 fi
 
-# HOME comes through with-contenv as /root (the /init context). Override
-# to the hermes user's home before dropping privileges so libraries that
-# resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
-# don't try to write to /root.
-export HOME=/opt/data
+# HOME comes through with-contenv as /root (the /init context). Restore the
+# deployment's explicit OS/library home before dropping privileges. This is
+# not necessarily the active profile's HERMES_HOME and is never the agent cwd.
+export HOME="${HERMES_CONTAINER_HOME:-/opt/data}"
 
 # Save the Docker -w (or default) working directory before init
 # scripts cd to /opt/data, so the container starts in the
 # directory the user requested.
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
-cd /opt/data
+cd "$HOME"
 # shellcheck disable=SC1091
 . /opt/hermes/.venv/bin/activate
 

@@ -276,6 +276,13 @@ def test_render_run_script_uses_replace_to_take_over_stale_holder() -> None:
     )
 
 
+def test_render_run_script_keeps_container_home_distinct_from_profile_state() -> None:
+    text = S6ServiceManager._render_run_script("coder", {})
+    assert 'HOME="${HERMES_CONTAINER_HOME:-/opt/data}"' in text
+    assert 'cd "$HOME"' in text
+    assert "export HOME=/opt/data" not in text
+
+
 def test_render_finish_script_exits_125_on_ex_config() -> None:
     """The finish script must translate exit 78 (EX_CONFIG) into exit 125
     (permanent failure) so s6 stops restarting on fatal config errors.
@@ -509,5 +516,4 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
 
