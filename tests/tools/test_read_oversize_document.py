@@ -34,6 +34,7 @@ from tools.file_grants import file_grant_scope, make_file_handles  # noqa: E402
 from tools.attachment_ledger import OUTCOME_READ, get_outcome, record_outcome  # noqa: E402
 from tools.attachments_tool import attachments_tool  # noqa: E402
 from tools.file_tools import read_file_tool  # noqa: E402
+from tools.read_extract import extract_document_text as _extract_document_text  # noqa: E402
 
 _BUDGET = 2_000  # small so the fixture stays fast; the behaviour is the same
 
@@ -97,6 +98,29 @@ class OversizeExtractedDocumentTests(unittest.TestCase):
             int(first_of_second.split("|", 1)[0]),
             int(last_of_first.split("|", 1)[0]) + 1,
             "no skipped line between the two reads",
+        )
+
+    def test_pagination_extracts_the_document_only_once_per_request(self):
+        paths = [str(self.path)]
+        handles = make_file_handles(paths)
+        with file_grant_scope("cached-doc", paths, handles=handles), (
+            request_file_cache.request_file_cache_scope("cached-doc")
+        ), patch(
+            "tools.read_extract.extract_document_text",
+            wraps=_extract_document_text,
+        ) as extract:
+            with patch("tools.file_tools._get_max_read_chars", return_value=_BUDGET):
+                first = json.loads(read_file_tool("F01", task_id="cached-doc"))
+                second = json.loads(
+                    read_file_tool(
+                        "F01", task_id="cached-doc", offset=first["next_offset"]
+                    )
+                )
+        self.assertTrue(second.get("content"))
+        self.assertEqual(
+            extract.call_count,
+            1,
+            "offset pagination must slice one cached extraction, not rerun it",
         )
 
     def test_reading_the_rest_clears_the_truncation_gap(self):

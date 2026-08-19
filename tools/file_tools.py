@@ -2523,8 +2523,17 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             binary = None
             document_bytes = b""
             document_gaps: list[str] = []
+            from tools import request_file_cache
+
+            cached_document = request_file_cache.lookup_document(
+                resolved_path, task_id=task_id
+            )
             try:
-                if (
+                if cached_document is not None:
+                    extracted_text = str(cached_document.get("text") or "")
+                    file_size = int(cached_document.get("file_size") or 0)
+                    document_gaps = list(cached_document.get("gaps") or [])
+                elif (
                     _file_ops_uses_host_paths(file_ops)
                     and os.path.isfile(resolved_path)
                 ):
@@ -2540,6 +2549,13 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     extracted_text = extract_document_text(
                         resolved_path, gaps_out=document_gaps
                     )
+                    request_file_cache.remember_document(
+                        resolved_path,
+                        task_id=task_id,
+                        text=extracted_text,
+                        file_size=file_size,
+                        gaps=document_gaps,
+                    )
                 else:
                     binary = file_ops.read_file_bytes(
                         resolved_path, max_bytes=MAX_DOCUMENT_BYTES
@@ -2554,6 +2570,13 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     file_size = getattr(binary, "file_size", len(document_bytes))
                     extracted_text = extract_document_bytes(
                         document_bytes, resolved_path, gaps_out=document_gaps
+                    )
+                    request_file_cache.remember_document(
+                        resolved_path,
+                        task_id=task_id,
+                        text=extracted_text,
+                        file_size=file_size,
+                        gaps=document_gaps,
                     )
             except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 reason = str(exc).strip() or type(exc).__name__

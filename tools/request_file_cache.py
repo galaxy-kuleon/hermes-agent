@@ -45,10 +45,15 @@ from typing import Iterator, Optional
 _CACHE: ContextVar[dict[str, dict[tuple[str, int, int], dict[str, object]]] | None] = (
     ContextVar("request_file_read_cache", default=None)
 )
+_DOCUMENT_CACHE: ContextVar[dict[str, dict[str, dict[str, object]]] | None] = (
+    ContextVar("request_document_extract_cache", default=None)
+)
 
 # A memo is metadata only (never content), so this bound exists to stop a
 # pathological turn from growing the dict without limit, not to save memory.
 MAX_MEMOS_PER_REQUEST = 512
+MAX_DOCUMENTS_PER_REQUEST = 64
+MAX_DOCUMENT_CACHE_CHARS_PER_REQUEST = 16_000_000
 
 
 def _task_key(task_id: str) -> str:
@@ -71,9 +76,14 @@ def request_file_cache_scope(task_id: str) -> Iterator[None]:
     updated = dict(current)
     updated[key] = {}
     token = _CACHE.set(updated)
+    current_documents = _DOCUMENT_CACHE.get() or {}
+    updated_documents = dict(current_documents)
+    updated_documents[key] = {}
+    document_token = _DOCUMENT_CACHE.set(updated_documents)
     try:
         yield
     finally:
+        _DOCUMENT_CACHE.reset(document_token)
         _CACHE.reset(token)
 
 
@@ -88,15 +98,21 @@ def invalidate(task_id: str) -> int:
     which is the correct price for not lying about what is in context.
     """
     memos = _memos(task_id)
-    if not memos:
-        return 0
-    dropped = len(memos)
-    memos.clear()
+    documents = _documents(task_id)
+    dropped = len(memos or {}) + len(documents or {})
+    if memos:
+        memos.clear()
+    if documents:
+        documents.clear()
     return dropped
 
 
 def _memos(task_id: str) -> Optional[dict[tuple[str, int, int], dict[str, object]]]:
     return (_CACHE.get() or {}).get(_task_key(task_id))
+
+
+def _documents(task_id: str) -> Optional[dict[str, dict[str, object]]]:
+    return (_DOCUMENT_CACHE.get() or {}).get(_task_key(task_id))
 
 
 def is_active(task_id: str) -> bool:
@@ -110,6 +126,42 @@ def lookup(path: str, offset: int, limit: int, *, task_id: str) -> Optional[dict
     if memos is None:
         return None
     return memos.get((_path_key(path), int(offset), int(limit)))
+
+
+def lookup_document(path: str, *, task_id: str) -> Optional[dict[str, object]]:
+    """Return a request-local full document extraction for pagination."""
+    documents = _documents(task_id)
+    if documents is None:
+        return None
+    return documents.get(_path_key(path))
+
+
+def remember_document(
+    path: str,
+    *,
+    task_id: str,
+    text: str,
+    file_size: int,
+    gaps: list[str] | None = None,
+) -> bool:
+    """Cache one extraction so later offsets do not rerun Docling/anydoc."""
+    documents = _documents(task_id)
+    if documents is None:
+        return False
+    key = _path_key(path)
+    if key in documents:
+        return True
+    if len(documents) >= MAX_DOCUMENTS_PER_REQUEST:
+        return False
+    used_chars = sum(len(str(row.get("text") or "")) for row in documents.values())
+    if used_chars + len(text) > MAX_DOCUMENT_CACHE_CHARS_PER_REQUEST:
+        return False
+    documents[key] = {
+        "text": text,
+        "file_size": int(file_size),
+        "gaps": list(gaps or []),
+    }
+    return True
 
 
 def remember(
@@ -156,11 +208,15 @@ def repeat_notice(memo: dict, *, handle: str = "") -> dict:
 
 
 __all__ = [
+    "MAX_DOCUMENTS_PER_REQUEST",
+    "MAX_DOCUMENT_CACHE_CHARS_PER_REQUEST",
     "MAX_MEMOS_PER_REQUEST",
     "invalidate",
     "is_active",
     "lookup",
+    "lookup_document",
     "remember",
+    "remember_document",
     "repeat_notice",
     "request_file_cache_scope",
 ]
