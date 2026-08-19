@@ -2472,6 +2472,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             MAX_DOCUMENT_BYTES,
             ExtractionError,
             extract_document_bytes,
+            extract_document_text,
             is_extractable_document,
         )
 
@@ -2520,16 +2521,37 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
         if is_extractable_document(resolved_path):
             file_ops = _get_file_ops(task_id)
             binary = None
+            document_bytes = b""
             try:
-                binary = file_ops.read_file_bytes(
-                    resolved_path, max_bytes=MAX_DOCUMENT_BYTES
-                )
-                if binary.error or binary.base64_content is None:
-                    raise ExtractionError(binary.error or "Document bytes unavailable")
-                document_bytes = base64.b64decode(
-                    binary.base64_content, validate=True
-                )
-                extracted_text = extract_document_bytes(document_bytes, resolved_path)
+                if (
+                    _file_ops_uses_host_paths(file_ops)
+                    and os.path.isfile(resolved_path)
+                ):
+                    file_size = os.path.getsize(resolved_path)
+                    if file_size > MAX_DOCUMENT_BYTES:
+                        raise ExtractionError(
+                            "Document too large to convert "
+                            f"({file_size:,} bytes, limit is "
+                            f"{MAX_DOCUMENT_BYTES:,})"
+                        )
+                    # Avoid the old 4/3 base64 transport expansion for local
+                    # 80+ MB PDFs. anydoc reads the path directly.
+                    extracted_text = extract_document_text(resolved_path)
+                else:
+                    binary = file_ops.read_file_bytes(
+                        resolved_path, max_bytes=MAX_DOCUMENT_BYTES
+                    )
+                    if binary.error or binary.base64_content is None:
+                        raise ExtractionError(
+                            binary.error or "Document bytes unavailable"
+                        )
+                    document_bytes = base64.b64decode(
+                        binary.base64_content, validate=True
+                    )
+                    file_size = getattr(binary, "file_size", len(document_bytes))
+                    extracted_text = extract_document_bytes(
+                        document_bytes, resolved_path
+                    )
             except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 reason = str(exc).strip() or type(exc).__name__
                 logger.warning(
@@ -2548,7 +2570,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         {
                             "error": (
                                 f"Cannot extract readable text from '{display}' "
-                                f"({ext}): {reason}. "
+                                f"({ext}): document extraction failed — {reason}. "
                                 f"{UNREADABLE_REPORT_INSTRUCTION}"
                             ),
                             "readable": False,
@@ -2585,7 +2607,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         if page_text else ""
                     ),
                     "total_lines": total_lines,
-                    "file_size": getattr(binary, "file_size", len(document_bytes)),
+                    "file_size": file_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                     "readable": report_as == "read",

@@ -234,4 +234,6 @@ def extract_pdf_text(path) -> str:
         raise ExtractionError(
             "PDF produced no extractable text (image-only scan without OCR text?)"
         )
-    return text
+    from tools.document_text_safety import strip_inline_base64_images
+
+    return strip_inline_base64_images(text, source=p)

@@ -48,8 +48,11 @@ MAX_XLSX_BYTES = 50 * 1024 * 1024
 # Refuse to convert huge documents. anydoc loads the whole file through its
 # Rust core with no streaming, and the read_file char budget only applies
 # after conversion, so an unbounded input can pin a tool turn and spike RAM.
-MAX_ANYDOC_BYTES = 50 * 1024 * 1024
-MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_DOCUMENT_BYTES = 256 * 1024 * 1024
+MAX_DOCUMENT_BYTES = int(
+    os.environ.get("HERMES_DOCUMENT_MAX_BYTES", str(DEFAULT_MAX_DOCUMENT_BYTES))
+)
+MAX_ANYDOC_BYTES = MAX_DOCUMENT_BYTES
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
 
@@ -122,27 +125,35 @@ def is_extractable_document(path: str) -> bool:
 
 
 def extract_document_text(path: str) -> str:
+    from tools.document_text_safety import strip_inline_base64_images
+
     ext = _extension(path)
     if ext == ".ipynb":
-        return _extract_notebook(path)
-    if ext == ".docx":
-        return _extract_docx(path)
-    if ext == ".xlsx":
-        return _extract_xlsx(path)
-    if ext in ANYDOC_EXTENSIONS:
-        return _extract_anydoc(path)
-    raise ExtractionError(f"Unsupported document type: {path!r}")
+        text = _extract_notebook(path)
+    elif ext == ".docx":
+        text = _extract_docx(path)
+    elif ext == ".xlsx":
+        text = _extract_xlsx(path)
+    elif ext in ANYDOC_EXTENSIONS:
+        text = _extract_anydoc(path)
+    else:
+        raise ExtractionError(f"Unsupported document type: {path!r}")
+    return strip_inline_base64_images(text, source=path)
 
 
 def extract_document_bytes(data: bytes, path: str) -> str:
     """Extract a document already fetched across a file backend boundary."""
+    from tools.document_text_safety import strip_inline_base64_images
+
     if len(data) > MAX_DOCUMENT_BYTES:
         raise ExtractionError(
             f"Document too large to convert ({len(data):,} bytes, limit is {MAX_DOCUMENT_BYTES:,})"
         )
     ext = _extension(path)
     if ext in ANYDOC_EXTENSIONS:
-        return _extract_anydoc_bytes(data, path)
+        return strip_inline_base64_images(
+            _extract_anydoc_bytes(data, path), source=path
+        )
     if ext not in EXTRACTABLE_EXTENSIONS:
         raise ExtractionError(f"Unsupported document type: {path!r}")
 
@@ -153,7 +164,9 @@ def extract_document_bytes(data: bytes, path: str) -> str:
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as fh:
             fh.write(data)
             temp_path = fh.name
-        return extract_document_text(temp_path)
+        return strip_inline_base64_images(
+            extract_document_text(temp_path), source=path
+        )
     finally:
         if temp_path:
             try:

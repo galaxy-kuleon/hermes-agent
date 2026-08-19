@@ -20,6 +20,7 @@ Run with:  python -m pytest tests/tools/test_pdf_extract_request.py -v
 """
 
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -64,6 +65,40 @@ class PdfExtractRequestTests(unittest.TestCase):
                     with self.assertRaisesRegex(ExtractionError, "too large"):
                         pdf_extract.extract_pdf_text(path)
                     urlopen.assert_not_called()
+        finally:
+            os.unlink(path)
+
+    def test_docling_response_inline_base64_is_removed_before_return(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                payload = "A" * 2_000_000
+                return json.dumps({
+                    "status": "success",
+                    "document": {
+                        "md_content": (
+                            "before\n![page](data:image/png;base64,"
+                            + payload
+                            + ")\nafter"
+                        )
+                    },
+                }).encode()
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+            fh.write(b"%PDF-1.4\n")
+            path = fh.name
+        try:
+            with patch("urllib.request.urlopen", return_value=Response()):
+                text = pdf_extract.extract_pdf_text(path)
+            self.assertIn("before", text)
+            self.assertIn("after", text)
+            self.assertNotIn("base64,", text)
+            self.assertNotIn("A" * 100, text)
         finally:
             os.unlink(path)
 
