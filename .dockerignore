@@ -79,6 +79,7 @@ tests/
 # Documentation site (Docusaurus) and supplementary docs
 website/
 docs/
+contributors/
 
 # Assets only used by the GitHub README
 assets/
