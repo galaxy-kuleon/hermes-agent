@@ -72,7 +72,7 @@ def attachments_tool(task_id: str = "default") -> str:
         if request_file_cache.is_active(task_id):
             # Whole-file reads are the default shape; a paged read still counts
             # as "started" but is reported by its own range, not as complete.
-            memo = request_file_cache.lookup(path, 1, 500, task_id=task_id)
+            memo = request_file_cache.lookup_latest(path, task_id=task_id)
         entry = {
             "id": handle,
             "name": _display_name(path),

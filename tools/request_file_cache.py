@@ -128,6 +128,20 @@ def lookup(path: str, offset: int, limit: int, *, task_id: str) -> Optional[dict
     return memos.get((_path_key(path), int(offset), int(limit)))
 
 
+def lookup_latest(path: str, *, task_id: str) -> Optional[dict]:
+    """Return metadata for the most recent read of *path*, at any range.
+
+    The attachment ledger reports progress independent of the caller's chosen
+    pagination. Exact repeat suppression still uses :func:`lookup`.
+    """
+    memos = _memos(task_id)
+    if memos is None:
+        return None
+    canonical = _path_key(path)
+    matches = [memo for (memo_path, _offset, _limit), memo in memos.items() if memo_path == canonical]
+    return max(matches, key=lambda memo: int(memo.get("sequence") or 0), default=None)
+
+
 def lookup_document(path: str, *, task_id: str) -> Optional[dict[str, object]]:
     """Return a request-local full document extraction for pagination."""
     documents = _documents(task_id)
@@ -214,6 +228,7 @@ __all__ = [
     "invalidate",
     "is_active",
     "lookup",
+    "lookup_latest",
     "lookup_document",
     "remember",
     "remember_document",
