@@ -10250,8 +10250,14 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["X-API-Key"] = api_key
         url = f"{endpoint}/api/v1/sessions/{session_id}/commit"
         try:
+            from plugins.memory.openviking import hermes_session_commit_payload
+
             with httpx.Client(timeout=60.0) as client:
-                resp = client.post(url, headers=headers, json={})
+                resp = client.post(
+                    url,
+                    headers=headers,
+                    json=hermes_session_commit_payload(),
+                )
                 if resp.status_code == 404:
                     # Session never reached OpenViking (no sync_turn fired).
                     # Not an error — just nothing to commit.

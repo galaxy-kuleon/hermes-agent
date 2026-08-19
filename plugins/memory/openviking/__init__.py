@@ -16,7 +16,7 @@ or a linked OpenViking CLI config:
   OPENVIKING_AGENT     — Hermes peer ID in OpenViking (default: hermes)
 
 Capabilities:
-  - Automatic memory extraction on session commit (6 categories)
+  - Automatic user profile and preference extraction on session commit
   - Tiered context: L0 (~100 tokens), L1 (~2k), L2 (full)
   - Semantic search with hierarchical directory retrieval
   - Filesystem-style browsing via viking:// URIs
@@ -80,12 +80,7 @@ _TIMEOUT = 30.0
 _SESSION_DRAIN_TIMEOUT = 10.0
 _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
-_SESSION_COMMIT_MEMORY_POLICY = {
-    "self": {"enabled": True},
-    "peer": {"enabled": False},
-    "memory_types": ["profile", "preferences"],
-    "working_memory": {"enabled": False},
-}
+_SESSION_COMMIT_MEMORY_TYPES = ("profile", "preferences")
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 _SYNC_TRACE_ENV = "HERMES_OPENVIKING_SYNC_TRACE"
 _DEFAULT_RECALL_LIMIT = 6
@@ -238,6 +233,19 @@ def _derive_openviking_user_text(content: Any) -> str:
 
 def _sync_trace_enabled() -> bool:
     return env_var_enabled(_SYNC_TRACE_ENV)
+
+
+def hermes_session_commit_payload() -> Dict[str, Any]:
+    """Return the shared bounded-memory policy for every Hermes commit path."""
+    return {
+        "keep_recent_count": 0,
+        "memory_policy": {
+            "self": {"enabled": True},
+            "peer": {"enabled": False},
+            "memory_types": list(_SESSION_COMMIT_MEMORY_TYPES),
+            "working_memory": {"enabled": False},
+        },
+    }
 
 
 def _preview(value: Any, limit: int = 160) -> str:
@@ -3521,10 +3529,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         try:
             self._client.post(
                 f"/api/v1/sessions/{sid}/commit",
-                {
-                    "keep_recent_count": 0,
-                    "memory_policy": _SESSION_COMMIT_MEMORY_POLICY,
-                },
+                hermes_session_commit_payload(),
             )
             self._mark_session_committed(sid)
             self._clear_pending_session(sid)

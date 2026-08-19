@@ -361,6 +361,48 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_idle_commit_uses_bounded_hermes_memory_policy(
+        self, adapter, monkeypatch
+    ):
+        captured = {}
+
+        class _Response:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+        class _Client:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def post(self, url, *, headers, json):
+                captured.update(url=url, headers=headers, json=json)
+                return _Response()
+
+        monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://openviking.test")
+        monkeypatch.setenv("OPENVIKING_ACCOUNT", "org")
+        monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+        monkeypatch.setattr("httpx.Client", _Client)
+
+        assert adapter._commit_openviking_session_sync("session-a", "user-a") is True
+        assert captured["json"] == {
+            "keep_recent_count": 0,
+            "memory_policy": {
+                "self": {"enabled": True},
+                "peer": {"enabled": False},
+                "memory_types": ["profile", "preferences"],
+                "working_memory": {"enabled": False},
+            },
+        }
+
     @pytest.mark.asyncio
     async def test_run_agent_starts_idle_window_only_after_turn_finishes(
         self, adapter, monkeypatch
