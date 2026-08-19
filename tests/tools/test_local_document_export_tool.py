@@ -148,6 +148,22 @@ def test_artifact_url_uses_path_style_signature_without_query_or_amp(monkeypatch
     assert "%3A" not in url
 
 
+def test_artifact_url_supports_same_origin_proxy_base(monkeypatch):
+    monkeypatch.setenv("LOCAL_EXPORT_PUBLIC_BASE_URL", "/api/hermes")
+
+    url = tool._artifact_url(
+        "a" * 32,
+        "memo 中文.pdf",
+        "2026-06-06T15:20:04Z",
+        "b" * 64,
+    )
+
+    assert url == (
+        "/api/hermes/v1/artifacts/"
+        f"{'a' * 32}/memo%20%E4%B8%AD%E6%96%87.pdf/download/1780759204/{'b' * 64}"
+    )
+
+
 def test_export_success_uses_path_style_artifact_links(monkeypatch, tmp_path):
     monkeypatch.setenv("LOCAL_EXPORT_DIR", str(tmp_path))
     monkeypatch.setenv("LOCAL_EXPORT_ARTIFACT_SIGNING_KEY", "secret")
