@@ -1287,6 +1287,20 @@ def handle_function_call(
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
+            _catalog_names = sorted(
+                str((tool_def.get("function") or {}).get("name") or "")
+                for tool_def in current_defs
+                if (tool_def.get("function") or {}).get("name")
+            )
+            logger.info(
+                "tool_search request catalog: enabled_toolsets=%s "
+                "disabled_toolsets=%s count=%d names=%s",
+                sorted(enabled_toolsets) if enabled_toolsets is not None else None,
+                sorted(disabled_toolsets) if disabled_toolsets else [],
+                len(_catalog_names),
+                ",".join(_catalog_names),
+            )
+        if function_name == _ts_mod.TOOL_SEARCH_NAME:
             return _return_bridge_result(
                 _ts_mod.dispatch_tool_search(
                     function_args or {},
