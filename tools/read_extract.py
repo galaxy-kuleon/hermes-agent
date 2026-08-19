@@ -36,7 +36,10 @@ __all__ = [
     "take_last_eml_gaps",
 ]
 
-EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".msg", ".eml"})
+_LEGACY_EXTENSIONS = frozenset({".doc", ".xls", ".rtf"})
+EXTRACTABLE_EXTENSIONS = frozenset(
+    {".ipynb", ".docx", ".xlsx", ".msg", ".eml"} | _LEGACY_EXTENSIONS
+)
 # Formats handled only when the optional anydoc converter is installed.
 ANYDOC_EXTENSIONS = frozenset({
     ".doc", ".docm",
@@ -130,7 +133,18 @@ def extract_document_text(path: str, *, gaps_out: list[str] | None = None) -> st
     from tools.document_text_safety import strip_inline_base64_images
 
     ext = _extension(path)
-    if ext == ".ipynb":
+    if ext in _LEGACY_EXTENSIONS:
+        from tools.legacy_office import convert_to_ooxml
+
+        converted, _target = convert_to_ooxml(path)
+        try:
+            text = extract_document_text(converted, gaps_out=gaps_out)
+        finally:
+            try:
+                os.unlink(converted)
+            except OSError:
+                pass
+    elif ext == ".ipynb":
         text = _extract_notebook(path)
     elif ext == ".docx":
         text = _extract_docx(path)
@@ -165,6 +179,21 @@ def extract_document_bytes(
             f"Document too large to convert ({len(data):,} bytes, limit is {MAX_DOCUMENT_BYTES:,})"
         )
     ext = _extension(path)
+    if ext in _LEGACY_EXTENSIONS:
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as fh:
+                fh.write(data)
+                temp_path = fh.name
+            return strip_inline_base64_images(
+                extract_document_text(temp_path, gaps_out=gaps_out), source=path
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
     if ext in ANYDOC_EXTENSIONS:
         return strip_inline_base64_images(
             _extract_anydoc_bytes(data, path), source=path
