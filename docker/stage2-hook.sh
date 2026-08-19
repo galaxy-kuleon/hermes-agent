@@ -459,9 +459,17 @@ seed_one "SOUL.md" "docker/SOUL.md"
 # volume), never overwrite an operator-provided value. Loopback-only: the
 # default bind host is 127.0.0.1 and the Fly service only exposes the
 # dashboard's port, so this listener is never publicly reachable.
-if [ -f "$HERMES_HOME/.env" ] && ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+#
+# An orchestrator may inject API_SERVER_KEY directly while mounting .env
+# read-only.  In that contract the process environment is authoritative and
+# stage2 must not try to mutate the operator-owned config file.
+if [ -z "${API_SERVER_KEY:-}" ] \
+    && [ -f "$HERMES_HOME/.env" ] \
+    && ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
     if refuse_symlinked_path "append" "$HERMES_HOME/.env"; then
         :
+    elif [ ! -w "$HERMES_HOME/.env" ]; then
+        echo "[stage2] Warning: API_SERVER_KEY is absent and $HERMES_HOME/.env is read-only; not generating a key" >&2
     else
         _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
         if [ -n "$_gen_key" ]; then

@@ -34,6 +34,12 @@ def _path_guard_functions(text: str) -> str:
     return text[start:end]
 
 
+def _api_server_key_block(text: str) -> str:
+    start = text.index('if [ -z "${API_SERVER_KEY:-}" ]')
+    end = text.index("\n\n# .env holds API keys", start)
+    return text[start:end]
+
+
 def test_seed_one_refuses_symlinked_destinations(
     stage2_text: str,
     tmp_path: Path,
@@ -108,3 +114,37 @@ def test_seed_one_is_quiet_for_existing_symlinked_files(
     assert proc.returncode == 0, proc.stderr
     assert outside_env.read_text() == "EXISTING=1\n"
     assert proc.stdout == ""
+
+
+def test_injected_api_server_key_never_mutates_operator_env(
+    stage2_text: str,
+    tmp_path: Path,
+) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("sh not available")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = home / ".env"
+    original = "OPENAI_API_KEY=operator-owned\n"
+    env_file.write_text(original)
+
+    script = (
+        "set -eu\n"
+        f'HERMES_HOME="{home}"\n'
+        "API_SERVER_KEY=orchestrator-injected-key-0123456789\n"
+        "refuse_symlinked_path() { return 1; }\n"
+        f"{_api_server_key_block(stage2_text)}\n"
+    )
+    proc = subprocess.run([shell, "-c", script], capture_output=True, text=True)
+
+    assert proc.returncode == 0, proc.stderr
+    assert env_file.read_text() == original
+    assert "Generated API_SERVER_KEY" not in proc.stdout
+
+
+def test_api_server_key_generation_checks_writability(stage2_text: str) -> None:
+    block = _api_server_key_block(stage2_text)
+    assert 'elif [ ! -w "$HERMES_HOME/.env" ]; then' in block
+    assert "API_SERVER_KEY is absent" in block
