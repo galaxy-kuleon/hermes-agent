@@ -292,9 +292,10 @@ class _VikingClient:
                  agent: Optional[str] = None):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
-        # Account/user are local/trusted-mode tenant identity. API-key requests
-        # omit these headers by default; trusted-mode retry may send them only
-        # after OpenViking explicitly asks for asserted tenant identity.
+        # Account/user are the data-plane tenant identity. They accompany API
+        # keys on ordinary requests so trusted mode cannot accept a session
+        # write under the configured fallback user before asking for identity.
+        # Health identity probes remain explicitly anonymous below.
         self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
         self._user = user or os.environ.get("OPENVIKING_USER", "default")
         self._agent = agent if agent is not None else os.environ.get("OPENVIKING_AGENT", _DEFAULT_AGENT)
@@ -304,7 +305,7 @@ class _VikingClient:
 
     def _headers(self, *, include_tenant: bool | None = None) -> dict:
         if include_tenant is None:
-            include_tenant = not bool(self._api_key)
+            include_tenant = True
 
         # The gateway serves many OpenWebUI users from one long-lived provider
         # instance. The request-bound identity is authoritative; the configured

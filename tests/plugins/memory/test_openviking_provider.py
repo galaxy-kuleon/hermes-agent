@@ -767,6 +767,23 @@ def test_viking_client_delete_uses_identity_headers(monkeypatch):
     assert captured["kwargs"]["params"] == {"uri": "viking://user/memories/x.md"}
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer test-key"
     assert captured["kwargs"]["headers"]["X-OpenViking-Actor-Peer"] == "hermes"
+    assert captured["kwargs"]["headers"]["X-OpenViking-Account"] == "acct"
+    assert captured["kwargs"]["headers"]["X-OpenViking-User"] == "alice"
+
+
+def test_viking_client_data_headers_keep_provider_user_outside_request_context():
+    client = _VikingClient(
+        "https://example.com",
+        api_key="root-key",
+        account="acct",
+        user="background-writer-user",
+        agent="hermes",
+    )
+
+    headers = client._headers()
+
+    assert headers["X-OpenViking-Account"] == "acct"
+    assert headers["X-OpenViking-User"] == "background-writer-user"
 
 
 def test_viking_client_prefers_request_scoped_gateway_user():
