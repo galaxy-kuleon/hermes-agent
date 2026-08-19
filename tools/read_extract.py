@@ -33,9 +33,10 @@ __all__ = [
     "extract_document_bytes",
     "extract_document_text",
     "is_extractable_document",
+    "take_last_eml_gaps",
 ]
 
-EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
+EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx", ".msg", ".eml"})
 # Formats handled only when the optional anydoc converter is installed.
 ANYDOC_EXTENSIONS = frozenset({
     ".doc", ".docm",
@@ -124,7 +125,8 @@ def is_extractable_document(path: str) -> bool:
     return bool(_extension(path))
 
 
-def extract_document_text(path: str) -> str:
+def extract_document_text(path: str, *, gaps_out: list[str] | None = None) -> str:
+    """Extract text and report format-specific coverage gaps to the caller."""
     from tools.document_text_safety import strip_inline_base64_images
 
     ext = _extension(path)
@@ -134,6 +136,17 @@ def extract_document_text(path: str) -> str:
         text = _extract_docx(path)
     elif ext == ".xlsx":
         text = _extract_xlsx(path)
+    elif ext == ".msg":
+        from tools.msg_extract import MsgExtractionError, extract_msg_text
+
+        try:
+            text = extract_msg_text(path)
+        except MsgExtractionError as exc:
+            raise ExtractionError(str(exc)) from exc
+    elif ext == ".eml":
+        text, gaps = _extract_eml_body(path)
+        if gaps_out is not None:
+            gaps_out.extend(gaps)
     elif ext in ANYDOC_EXTENSIONS:
         text = _extract_anydoc(path)
     else:
@@ -141,7 +154,9 @@ def extract_document_text(path: str) -> str:
     return strip_inline_base64_images(text, source=path)
 
 
-def extract_document_bytes(data: bytes, path: str) -> str:
+def extract_document_bytes(
+    data: bytes, path: str, *, gaps_out: list[str] | None = None
+) -> str:
     """Extract a document already fetched across a file backend boundary."""
     from tools.document_text_safety import strip_inline_base64_images
 
@@ -165,7 +180,7 @@ def extract_document_bytes(data: bytes, path: str) -> str:
             fh.write(data)
             temp_path = fh.name
         return strip_inline_base64_images(
-            extract_document_text(temp_path), source=path
+            extract_document_text(temp_path, gaps_out=gaps_out), source=path
         )
     finally:
         if temp_path:
@@ -173,6 +188,62 @@ def extract_document_bytes(data: bytes, path: str) -> str:
                 os.unlink(temp_path)
             except OSError:
                 pass
+
+
+def _extract_eml_body(path: str) -> tuple[str, list[str]]:
+    """Extract EML body text while honestly reporting omitted MIME parts."""
+    import email
+    from email import policy
+
+    try:
+        raw = Path(path).read_bytes()
+        msg = email.message_from_bytes(raw, policy=policy.default)
+    except (OSError, ValueError, email.errors.MessageError) as exc:
+        raise ExtractionError(f"Not a valid EML: {exc}") from exc
+
+    subject = str(msg.get("subject") or "").strip()
+    bodies: list[str] = []
+    attachment_names: list[str] = []
+    for part in msg.walk():
+        disposition = str(part.get_content_disposition() or "").lower()
+        filename = part.get_filename()
+        if disposition == "attachment" or filename:
+            attachment_names.append(
+                str(filename or part.get_content_type() or "attachment")
+            )
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            try:
+                bodies.append(str(part.get_content()))
+            except (LookupError, ValueError, AttributeError):
+                pass
+        elif ctype == "text/html" and not bodies:
+            try:
+                bodies.append(re.sub(r"<[^>]+>", " ", str(part.get_content())))
+            except (LookupError, ValueError, AttributeError):
+                pass
+
+    text = "\n".join(body.strip() for body in bodies if body.strip()).strip()
+    header = f"Subject: {subject}\n" if subject else ""
+    if attachment_names:
+        header += (
+            "Attachments present but not extracted: "
+            + ", ".join(attachment_names[:20])
+            + (" …" if len(attachment_names) > 20 else "")
+            + "\n"
+        )
+    if not text and not header:
+        raise ExtractionError("EML contains no extractable text body")
+    gaps = ["body_only_extraction"]
+    if attachment_names:
+        gaps.append("embedded_attachments_not_extracted")
+    return (header + "\n" + text).rstrip() + "\n", gaps
+
+
+def take_last_eml_gaps() -> list[str]:
+    """Deprecated compatibility alias; coverage is now request-scoped."""
+    return []
 
 
 def _extract_anydoc(path: str) -> str:

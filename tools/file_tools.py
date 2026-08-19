@@ -108,11 +108,10 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
     overflow this handles is the *accumulation* of many lines under the
     line-count limit (logs, wide CSV rows, minified data).
 
-    Returns ``(kept_text, lines_kept, truncated)``. When ``content`` already
-    fits, returns it unchanged with ``truncated=False``. If not even the
+    Returns ``(kept_text, lines_kept, clamped_mid_line)``. If not even the
     first line fits, that single line is clamped on a code-point boundary
-    (Python ``str`` slicing never splits a code point) so the read never
-    returns empty and the cursor can still advance.
+    (Python ``str`` slicing never splits a code point). The third value lets
+    callers report the resulting non-recoverable line tail honestly.
     """
     if len(content) <= max_chars:
         return content, (content.count("\n") + 1 if content else 0), False
@@ -132,8 +131,9 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
         # First line alone exceeds the budget. Clamp on a code-point
         # boundary rather than emitting nothing.
         kept.append(lines[0][:max_chars])
+        return "\n".join(kept), len(kept), True
 
-    return "\n".join(kept), len(kept), True
+    return "\n".join(kept), len(kept), False
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
@@ -2522,6 +2522,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             file_ops = _get_file_ops(task_id)
             binary = None
             document_bytes = b""
+            document_gaps: list[str] = []
             try:
                 if (
                     _file_ops_uses_host_paths(file_ops)
@@ -2536,7 +2537,9 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         )
                     # Avoid the old 4/3 base64 transport expansion for local
                     # 80+ MB PDFs. anydoc reads the path directly.
-                    extracted_text = extract_document_text(resolved_path)
+                    extracted_text = extract_document_text(
+                        resolved_path, gaps_out=document_gaps
+                    )
                 else:
                     binary = file_ops.read_file_bytes(
                         resolved_path, max_bytes=MAX_DOCUMENT_BYTES
@@ -2550,7 +2553,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     )
                     file_size = getattr(binary, "file_size", len(document_bytes))
                     extracted_text = extract_document_bytes(
-                        document_bytes, resolved_path
+                        document_bytes, resolved_path, gaps_out=document_gaps
                     )
             except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 reason = str(exc).strip() or type(exc).__name__
@@ -2582,33 +2585,60 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         ensure_ascii=False,
                     )
             else:
+                if ext == ".msg":
+                    from tools.msg_extract import inspect_msg_capability_gaps
+
+                    document_gaps = inspect_msg_capability_gaps(resolved_path)
+                elif ext == ".eml" and not document_gaps:
+                    document_gaps = ["body_only_extraction"]
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
                 page_end = min(end_line, total_lines) if total_lines else end_line
                 page_text = "\n".join(lines[offset - 1:end_line])
+                rendered = (
+                    file_ops._add_line_numbers(page_text, offset)
+                    if page_text else ""
+                )
+                max_chars = _get_max_read_chars()
+                char_limited = len(rendered) > max_chars
+                clamped_mid_line = False
+                lines_kept = len(page_text.splitlines()) if page_text else 0
+                if char_limited:
+                    rendered, lines_kept, clamped_mid_line = (
+                        _truncate_to_char_budget(rendered, max_chars)
+                    )
+                consumed_end = (
+                    offset + lines_kept - 1 if lines_kept else offset - 1
+                )
+                has_more = bool(total_lines and consumed_end < total_lines)
+                format_gaps = list(document_gaps)
+                if clamped_mid_line:
+                    format_gaps.append("single_line_exceeded_char_budget")
                 settled = record_read_extent(
                     resolved_path,
                     task_id=task_id,
                     start=offset,
-                    end=page_end if total_lines else end_line,
+                    end=consumed_end,
                     total=total_lines if total_lines else None,
-                    reason="anydoc_extracted",
+                    format_gaps=format_gaps or None,
+                    reason=(
+                        "extraction incomplete for this format"
+                        if format_gaps
+                        else "document_extracted"
+                    ),
                     display_name=display,
                     handle=handle_for_ledger,
                     reader="read_file",
                 )
                 report_as = settled if settled in {"read", "partial"} else (
-                    "partial" if total_lines > end_line else "read"
+                    "partial" if has_more or format_gaps else "read"
                 )
                 result_dict = {
-                    "content": (
-                        file_ops._add_line_numbers(page_text, offset)
-                        if page_text else ""
-                    ),
+                    "content": rendered,
                     "total_lines": total_lines,
                     "file_size": file_size,
-                    "truncated": total_lines > end_line,
+                    "truncated": has_more,
                     "extracted_document": True,
                     "readable": report_as == "read",
                     "report_as": report_as,
@@ -2617,56 +2647,37 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     "consumed": {
                         "unit": "lines",
                         "start": offset,
-                        "end": page_end if total_lines else end_line,
+                        "end": consumed_end,
                         "total": total_lines,
                     },
                 }
-                if result_dict["truncated"]:
-                    result_dict["gaps"] = [
-                        f"uncovered_lines={page_end + 1}-{total_lines}"
-                    ]
+                result_gaps = list(format_gaps)
+                if has_more:
+                    result_gaps.append(
+                        f"uncovered_lines={consumed_end + 1}-{total_lines}"
+                    )
+                if result_gaps:
+                    result_dict["gaps"] = result_gaps
                     result_dict["coverage_note"] = (
-                        "Partial extraction only; continue until every line range "
-                        "has been consumed before claiming full coverage."
+                        "Partial extraction only; continue every uncovered line "
+                        "range and preserve any named format gaps."
                     )
+                if has_more:
+                    next_offset = consumed_end + 1
+                    result_dict["next_offset"] = next_offset
                     result_dict["hint"] = (
-                        f"Use offset={end_line + 1} to continue reading "
-                        f"(showing {offset}-{page_end} of {total_lines} lines)."
+                        f"Use offset={next_offset} to continue reading "
+                        f"(showing {offset}-{consumed_end} of {total_lines} lines). "
+                        "Do not claim full coverage yet."
                     )
-
-                content_len = len(result_dict["content"])
-                max_chars = _get_max_read_chars()
-                if content_len > max_chars:
-                    trimmed, lines_kept, clamped_mid_line = _truncate_to_char_budget(
-                        result_dict["content"], max_chars
+                if char_limited:
+                    result_dict["truncated_reason"] = "char_limit"
+                    result_dict["hint"] = (
+                        f"Output truncated at the {max_chars:,}-char read budget "
+                        f"(lines {offset}-{consumed_end} of {total_lines}). Use "
+                        f"offset={consumed_end + 1} to continue; Do not claim full "
+                        "coverage yet."
                     )
-                    next_offset = offset + lines_kept
-                    shown_end = max(offset, next_offset - 1)
-                    _ledger(
-                        OUTCOME_PARTIAL,
-                        reason="read_truncated_to_char_limit",
-                        gaps=["oversize_truncated"],
-                    )
-                    result_dict.update(
-                        {
-                            "content": trimmed,
-                            "truncated": True,
-                            "truncated_reason": "char_limit",
-                            "report_as": "partial",
-                            "coverage": "partial",
-                            "next_offset": next_offset,
-                            "hint": (
-                                f"Output truncated at the {max_chars:,}-char read "
-                                f"budget (lines {offset}-{shown_end} of "
-                                f"{total_lines}). Use offset={next_offset} to "
-                                "continue; do not claim full coverage yet."
-                            ),
-                        }
-                    )
-                    if clamped_mid_line:
-                        result_dict["gaps"] = list(result_dict.get("gaps") or []) + [
-                            "single_line_exceeded_char_budget"
-                        ]
                 if result_dict["content"]:
                     result_dict["content"] = redact_sensitive_text(
                         result_dict["content"], file_read=True

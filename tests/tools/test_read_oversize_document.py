@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from tools import request_file_cache  # noqa: E402
 from tools.file_grants import file_grant_scope, make_file_handles  # noqa: E402
-from tools.attachment_ledger import OUTCOME_READ, record_outcome  # noqa: E402
+from tools.attachment_ledger import OUTCOME_READ, get_outcome, record_outcome  # noqa: E402
 from tools.attachments_tool import attachments_tool  # noqa: E402
 from tools.file_tools import read_file_tool  # noqa: E402
 
@@ -119,6 +119,12 @@ class OversizeExtractedDocumentTests(unittest.TestCase):
                 mid = json.loads(attachments_tool("oversize-doc"))
                 self.assertEqual(mid["files"][0]["status"], "partial",
                                  "a half-read document is honestly partial")
+                self.assertEqual(
+                    get_outcome(str(self.path), task_id="oversize-doc")["ranges"],
+                    [[1, first["next_offset"] - 1]],
+                    "ledger must record only bytes shown to the model, not the "
+                    "larger pre-truncation request range",
+                )
                 offset = first["next_offset"]
                 while True:
                     nxt = json.loads(read_file_tool("F01", task_id="oversize-doc",
