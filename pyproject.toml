@@ -404,7 +404,8 @@ exclude-newer = "14 days"
 # risk — their newest releases are years old — and unbricks resolvers that
 # cannot see upload dates.
 #
-# setuptools, pillow, mcp: exact-pinned bricks (#78227, #75992, #76020). uv
+# setuptools, pillow, mcp, firecrawl-anydoc: exact-pinned bricks (#78227,
+# #75992, #76020). uv
 # applies exclude-newer to build-system.requires and core deps too; when a
 # resolver cannot see an upload date (old uv, mirror index, stale HTTP cache)
 # it filters the pinned version and the package cannot even BUILD
@@ -414,7 +415,7 @@ exclude-newer = "14 days"
 # cutoff can still brick installs. Exempting exact pins is pure brick-risk
 # removal at no supply-chain cost. Guarded by
 # tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, firecrawl-anydoc = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

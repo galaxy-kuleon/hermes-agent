@@ -286,6 +286,38 @@ def test_build_system_requires_exempt_from_exclude_newer():
     )
 
 
+def test_dockerfile_uv_exact_pins_exempt_from_exclude_newer():
+    """Exact pins installed outside the lock must not be age-filtered away.
+
+    The image installs a small number of runtime packages with ``uv pip``
+    after the frozen project sync. A newly published exact pin is otherwise
+    guaranteed to resolve as "no version" until the relative quarantine
+    expires, even though its reviewed version cannot float.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    uv_cfg = data.get("tool", {}).get("uv", {})
+    if "exclude-newer" not in uv_cfg:
+        pytest.skip("no exclude-newer cutoff configured — nothing to exempt")
+    whitelist = {
+        _canonical(name)
+        for name, enabled in uv_cfg.get("exclude-newer-package", {}).items()
+        if enabled is False
+    }
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    docker_pins = {
+        _canonical(name)
+        for name in re.findall(
+            r'["\']([A-Za-z0-9][A-Za-z0-9._-]*)==[^"\']+["\']',
+            dockerfile,
+        )
+    }
+    missing = sorted(docker_pins - whitelist)
+    assert not missing, (
+        "Dockerfile uv exact pins are subject to the exclude-newer cutoff "
+        f"but missing from exclude-newer-package: {missing}"
+    )
+
+
 
 
 def _lazy_deps_by_feature():
