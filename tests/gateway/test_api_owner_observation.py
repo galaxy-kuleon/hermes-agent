@@ -231,21 +231,12 @@ async def test_wire_keeps_zero_unknown_and_public_health_disjoint():
 async def test_real_connect_registers_the_authenticated_route(monkeypatch):
     adapter = APIServerAdapter(PlatformConfig(
         enabled=True,
-        extra={"key": "sk-owner-secret", "host": "127.0.0.1", "port": 8642},
+        extra={
+            "key": "sk-owner-observation-secret-20260820",
+            "host": "127.0.0.1",
+            "port": 8642,
+        },
     ))
-
-    class RefusedSocket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def settimeout(self, _value):
-            return None
-
-        def connect(self, _address):
-            raise ConnectionRefusedError()
 
     class FakeRunner:
         def __init__(self, app):
@@ -267,7 +258,6 @@ async def test_real_connect_registers_the_authenticated_route(monkeypatch):
         async def stop(self):
             return None
 
-    monkeypatch.setattr(subject._socket, "socket", lambda *_a, **_k: RefusedSocket())
     monkeypatch.setattr(subject.web, "AppRunner", FakeRunner)
     monkeypatch.setattr(subject.web, "TCPSite", FakeSite)
     monkeypatch.setattr(adapter, "_load_session_activity", lambda: None)

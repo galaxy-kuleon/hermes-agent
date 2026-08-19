@@ -152,10 +152,15 @@ def _ensure_telegram_mock() -> None:
     ``setdefault`` so it wins even if a partial/broken import
     already cached a module with ``ChatType = None``.
     """
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return  # Real library is installed — nothing to mock
+    existing = sys.modules.get("telegram")
+    if existing is not None and (
+        hasattr(existing, "__file__")
+        or existing.__dict__.get("_hermes_shared_test_mock") is True
+    ):
+        return  # Real library or our complete shared mock is already installed
 
     mod = MagicMock()
+    mod.__dict__["_hermes_shared_test_mock"] = True
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
     # One shared PTB-faithful enum namespace per constant, attached to BOTH
     # access paths: ``sys.modules["telegram.constants"]`` is registered as

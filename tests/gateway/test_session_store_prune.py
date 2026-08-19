@@ -35,6 +35,14 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
     fake_home = tmp_path / "alt_hermes_home"
     fake_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    # The suite-wide isolation fixture deliberately pins DEFAULT_DB_PATH to
+    # its own per-test home. Restore the production resolution path so this
+    # test actually exercises the runtime HERMES_HOME contract.
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
 
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
@@ -258,4 +266,3 @@ class TestReadmeSentinel:
         # The note points users at the real store and command.
         assert "state.db" in raw["_README"]
         assert "hermes sessions list" in raw["_README"]
-

@@ -911,16 +911,33 @@ async def _terminate_stream_body_locked(response, completion_id, created, model,
 
     async def _bounded(coro_factory) -> bool:
         nonlocal cancelled
+
+        async def _guarded_write() -> bool:
+            # wait_for() wraps its input in a Task. A SystemExit or
+            # KeyboardInterrupt escaping that child Task is special-cased by
+            # asyncio and can tear down the loop before the parent's
+            # ``except BaseException`` runs. Catch the wire operation while it
+            # is still a directly-awaited coroutine, then let wait_for see an
+            # ordinary boolean result.
+            try:
+                await coro_factory()
+                return True
+            except _asyncio_mod.CancelledError:
+                raise
+            except BaseException:
+                return False
+
         try:
-            await _asyncio_mod.wait_for(coro_factory(),
-                                        STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS)
+            return await _asyncio_mod.wait_for(
+                _guarded_write(), STREAM_SHUTDOWN_STEP_TIMEOUT_SECONDS
+            )
         except _asyncio_mod.CancelledError:
             # OUR timeout raises TimeoutError; this is somebody cancelling us.
             cancelled = True
             return False
         except BaseException:
             return False
-        return True
+        return False
 
     async def _write_eof() -> bool:
         return await _bounded(lambda: response.write_eof())
@@ -6194,7 +6211,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     return
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
-                label = build_tool_preview(function_name, function_args) or function_name
+                try:
+                    label = (
+                        build_tool_preview(function_name, function_args)
+                        or function_name
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    # Tool implementations normally send an argument mapping,
+                    # but the transport boundary must remain valid for legacy
+                    # or hostile scalar payloads too.
+                    label = function_name
                 payload = _bounded_tool_progress_payload({
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
