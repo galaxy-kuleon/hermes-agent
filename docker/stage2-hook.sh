@@ -263,7 +263,7 @@ if [ "$needs_chown" = true ]; then
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skills skins plans workspace home profiles pairing platforms/pairing user-skills skill-state lazy-packages; do
+    for sub in cron sessions logs hooks memories skins plans workspace home profiles pairing platforms/pairing user-skills skill-state lazy-packages; do
         if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then
             chown_hermes_tree "$HERMES_HOME/$sub"
         fi
@@ -588,17 +588,24 @@ fi
 # the python binary's own bin-stub already sets up (sys.path is rooted
 # at the venv's site-packages by virtue of running .venv/bin/python).
 if [ -d "$INSTALL_DIR/skills" ]; then
-    if ! as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" --startup; then
-        case "${HERMES_SKILLS_SYNC_ON_START:-auto}" in
-            1|true|TRUE|True|yes|YES|Yes|on|ON|On)
-                echo "[stage2] ERROR: explicit startup skill sync failed" >&2
-                exit 1
-                ;;
-            *)
-                echo "[stage2] Warning: startup skills sync failed; continuing"
-                ;;
-        esac
-    fi
+    case "${HERMES_SKILLS_SYNC_ON_START:-auto}" in
+        0|false|FALSE|False|no|NO|No|off|OFF|Off)
+            echo "[stage2] Startup skills sync disabled by deployment policy"
+            ;;
+        *)
+            if ! as_hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" --startup; then
+                case "${HERMES_SKILLS_SYNC_ON_START:-auto}" in
+                    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+                        echo "[stage2] ERROR: explicit startup skill sync failed" >&2
+                        exit 1
+                        ;;
+                    *)
+                        echo "[stage2] Warning: startup skills sync failed; continuing"
+                        ;;
+                esac
+            fi
+            ;;
+    esac
 fi
 
 # --- Discover agent-browser's Chromium binary ---

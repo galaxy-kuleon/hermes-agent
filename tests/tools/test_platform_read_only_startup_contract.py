@@ -26,3 +26,16 @@ def test_stage2_does_not_chown_or_seed_platform_content():
     assert '"$HERMES_HOME/skill-state/platform"' in seed_block
     assert 'skills_sync.py" --startup' in script
     assert "explicit startup skill sync failed" in script
+
+
+def test_stage2_honours_explicit_startup_sync_disable_before_invocation():
+    script = (REPO_ROOT / "docker" / "stage2-hook.sh").read_text()
+    policy_gate = script.index(
+        'case "${HERMES_SKILLS_SYNC_ON_START:-auto}" in',
+        script.index("# --- Sync bundled skills ---"),
+    )
+    disabled = script.index("Startup skills sync disabled by deployment policy", policy_gate)
+    invocation = script.index('skills_sync.py" --startup', policy_gate)
+
+    assert disabled < invocation
+    assert "0|false|FALSE|False|no|NO|No|off|OFF|Off)" in script[policy_gate:invocation]
