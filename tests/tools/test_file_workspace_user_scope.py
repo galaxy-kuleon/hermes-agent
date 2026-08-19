@@ -13,6 +13,7 @@ import pytest
 
 from gateway import session_context
 from tools import file_tools as ft
+from tools import terminal_tool
 from tools.environments.local import LocalEnvironment
 from tools.file_operations import ShellFileOperations
 
@@ -34,11 +35,7 @@ def workspace(tmp_path, monkeypatch):
     root = tmp_path / "workspace"
     root.mkdir()
     monkeypatch.setenv("TERMINAL_CWD", str(root))
-    monkeypatch.setattr(
-        ft,
-        "_get_live_tracking_cwd",
-        lambda task_id="default": None,
-    )
+    monkeypatch.setattr(terminal_tool, "get_session_cwd", lambda task_id="default": None)
     monkeypatch.setattr(
         ft,
         "_registered_task_cwd_override",
@@ -84,7 +81,7 @@ def test_no_user_id_preserves_legacy_base_and_real_read_argument(
         )
 
     assert "legacy-shared-content" in result["content"]
-    recording_operations.read_file.assert_called_once_with("legacy.txt", 1, 500)
+    recording_operations.read_file.assert_called_once_with("legacy.txt", 1, 2000)
     assert not (workspace / "user").exists()
 
 
@@ -417,17 +414,11 @@ def test_user_scoped_v4a_patch_dispatches_resolved_operation_paths(
     workspace,
     monkeypatch,
 ):
-    from tools import patch_parser
-
     operations = Mock()
+    operations.env = LocalEnvironment(cwd=str(workspace), timeout=15)
     patch_result = Mock()
     patch_result.to_dict.return_value = {"success": True}
-    captured = {}
-
-    def apply_operations(parsed_operations, file_ops):
-        captured["operations"] = parsed_operations
-        captured["file_ops"] = file_ops
-        return patch_result
+    operations.patch_v4a.return_value = patch_result
 
     monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": operations)
     monkeypatch.setattr(ft, "_check_sensitive_path", lambda *args, **kwargs: None)
@@ -437,8 +428,6 @@ def test_user_scoped_v4a_patch_dispatches_resolved_operation_paths(
         "_acl_protected_path_block",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(patch_parser, "apply_v4a_operations", apply_operations)
-
     patch = "*** Begin Patch\n*** Add File: note.txt\n+private\n*** End Patch\n"
     with _session(user_id="alice"):
         result = json.loads(
@@ -446,11 +435,8 @@ def test_user_scoped_v4a_patch_dispatches_resolved_operation_paths(
         )
 
     assert result.get("success") is True, result
-    assert captured["file_ops"] is operations
-    assert captured["operations"][0].file_path == str(
-        workspace / "user" / "alice" / "note.txt"
-    )
-    operations.patch_v4a.assert_not_called()
+    rewritten = operations.patch_v4a.call_args.args[0]
+    assert f"*** Add File: {workspace / 'user' / 'alice' / 'note.txt'}" in rewritten
 
 
 @pytest.mark.parametrize(
@@ -485,8 +471,8 @@ def test_live_cwd_outside_workspace_is_not_rewritten(workspace, tmp_path, monkey
         "explicit-worktree-content\n", encoding="utf-8"
     )
     monkeypatch.setattr(
-        ft,
-        "_get_live_tracking_cwd",
+        terminal_tool,
+        "get_session_cwd",
         lambda task_id="default": str(worktree),
     )
     operations = ShellFileOperations(
@@ -505,7 +491,7 @@ def test_live_cwd_outside_workspace_is_not_rewritten(workspace, tmp_path, monkey
         )
 
     assert "explicit-worktree-content" in result["content"]
-    recording_operations.read_file.assert_called_once_with("target.txt", 1, 500)
+    recording_operations.read_file.assert_called_once_with("target.txt", 1, 2000)
     assert not (workspace / "user" / "alice").exists()
 
 
@@ -534,7 +520,7 @@ def test_api_user_absolute_path_outside_configured_workspace_is_unchanged(
         )
 
     assert "EXTERNAL-HANDOFF-CONTENT" in result["content"]
-    recording_operations.read_file.assert_called_once_with(str(handoff), 1, 500)
+    recording_operations.read_file.assert_called_once_with(str(handoff), 1, 2000)
     assert not (workspace / "user" / "alice-uuid").exists()
 
 
@@ -566,7 +552,7 @@ def test_cli_without_user_id_keeps_legacy_parent_traversal_behavior(
     recording_operations.read_file.assert_called_once_with(
         "../cli-parent-read-unique.txt",
         1,
-        500,
+        2000,
     )
     assert not (workspace / "user").exists()
 
