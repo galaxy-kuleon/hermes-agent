@@ -769,6 +769,69 @@ def test_viking_client_delete_uses_identity_headers(monkeypatch):
     assert captured["kwargs"]["headers"]["X-OpenViking-Actor-Peer"] == "hermes"
 
 
+def test_viking_client_prefers_request_scoped_gateway_user():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    client = _VikingClient(
+        "https://example.com",
+        api_key="root-key",
+        account="acct",
+        user="configured-default",
+        agent="hermes",
+    )
+    tokens = set_session_vars(
+        platform="api_server",
+        user_id="openwebui-user-a",
+        session_id="chat-a",
+        async_delivery=False,
+    )
+    try:
+        headers = client._headers(include_tenant=True)
+    finally:
+        clear_session_vars(tokens)
+
+    assert headers["X-OpenViking-Account"] == "acct"
+    assert headers["X-OpenViking-User"] == "openwebui-user-a"
+
+
+def test_viking_client_keeps_concurrent_gateway_users_isolated():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    client = _VikingClient(
+        "https://example.com",
+        api_key="root-key",
+        account="acct",
+        user="configured-default",
+        agent="hermes",
+    )
+    barrier = threading.Barrier(2)
+    observed = {}
+
+    def read_headers(user_id):
+        tokens = set_session_vars(
+            platform="api_server",
+            user_id=user_id,
+            session_id=f"chat-{user_id}",
+            async_delivery=False,
+        )
+        try:
+            barrier.wait(timeout=2)
+            observed[user_id] = client._headers(include_tenant=True)["X-OpenViking-User"]
+        finally:
+            clear_session_vars(tokens)
+
+    threads = [
+        threading.Thread(target=read_headers, args=("user-a",)),
+        threading.Thread(target=read_headers, args=("user-b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert observed == {"user-a": "user-a", "user-b": "user-b"}
+
+
 def test_openviking_identity_probes_are_anonymous_before_authenticated_requests(monkeypatch):
     calls = []
 

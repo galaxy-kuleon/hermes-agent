@@ -306,14 +306,26 @@ class _VikingClient:
         if include_tenant is None:
             include_tenant = not bool(self._api_key)
 
+        # The gateway serves many OpenWebUI users from one long-lived provider
+        # instance. The request-bound identity is authoritative; the configured
+        # user is only the CLI/single-user fallback. set_session_vars() is
+        # entered inside the executor thread, so this remains concurrency-safe.
+        try:
+            from gateway.session_context import get_session_env
+
+            scoped_user = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+        except Exception:
+            scoped_user = ""
+        effective_user = scoped_user or self._user
+
         h = {"Content-Type": "application/json"}
         if self._agent:
             h["X-OpenViking-Actor-Peer"] = self._agent
         if include_tenant:
             if self._account:
                 h["X-OpenViking-Account"] = self._account
-            if self._user:
-                h["X-OpenViking-User"] = self._user
+            if effective_user:
+                h["X-OpenViking-User"] = effective_user
         if self._api_key:
             h["X-API-Key"] = self._api_key
             h["Authorization"] = "Bearer " + self._api_key
