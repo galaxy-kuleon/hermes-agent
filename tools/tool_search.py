@@ -646,11 +646,10 @@ def bridge_tool_schemas(
     DOMAINS are reachable and that search is mandatory for tool discovery.
     """
     desc_search = (
-        f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Returns up to ``limit`` matches with name and description. Follow "
-        f"with `{TOOL_DESCRIBE_NAME}` to load a tool's full parameter schema, "
-        f"then `{TOOL_CALL_NAME}` to invoke it. Tools listed at the top of this "
-        "system prompt are already available and do not need to be searched."
+        f"Search all available tools by capability, including {deferred_count} "
+        "tools loaded on demand. Results marked `direct` must be called by "
+        "their returned name. Results marked `tool_call` must be loaded with "
+        f"`{TOOL_DESCRIBE_NAME}` and invoked through `{TOOL_CALL_NAME}`."
     )
     if listing and listing_form == "groups":
         desc_search += (
@@ -898,13 +897,22 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
-    catalog = build_catalog(deferrable)
+    visible, deferrable = classify_tools(current_tool_defs)
+    catalog = build_catalog(visible + deferrable)
+    direct_names = {
+        str((tool_def.get("function") or {}).get("name") or "")
+        for tool_def in visible
+    }
     hits = search_catalog(catalog, query, limit=limit)
+    formatted_hits = []
+    for hit in hits:
+        row = _format_search_hit(hit)
+        row["invocation"] = "direct" if hit.name in direct_names else "tool_call"
+        formatted_hits.append(row)
     result: Dict[str, Any] = {
         "query": query,
         "total_available": len(catalog),
-        "matches": [_format_search_hit(h) for h in hits],
+        "matches": formatted_hits,
     }
     if not hits and catalog:
         result["available_sources"] = _available_source_summary(catalog)

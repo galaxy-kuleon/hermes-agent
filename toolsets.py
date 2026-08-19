@@ -471,6 +471,7 @@ TOOLSETS = {
             "terminal", "process",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
+            "local_document_export",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # BFL FLUX 3 video generation

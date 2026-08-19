@@ -257,6 +257,23 @@ class TestBridgeDispatch:
         assert "remain available" in result["hint"]
         assert "before concluding" in result["hint"]
 
+    def test_search_finds_an_already_visible_direct_tool(self):
+        """A model that searches anyway must not be sent to the wrong MCP."""
+        from tools.tool_search import dispatch_tool_search
+
+        tool_def = _td(
+            "local_document_export",
+            "Export Markdown content to local DOCX and PDF artifacts.",
+        )
+        result = json.loads(dispatch_tool_search(
+            {"query": "document export create docx file", "limit": 10},
+            current_tool_defs=[tool_def],
+        ))
+
+        assert result["total_available"] == 1
+        assert result["matches"][0]["name"] == "local_document_export"
+        assert result["matches"][0]["invocation"] == "direct"
+
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
