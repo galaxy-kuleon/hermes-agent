@@ -55,7 +55,7 @@ class DockerfileVolumeTests(unittest.TestCase):
 
     def test_env_home_still_declared(self):
         # Removing VOLUME must not disturb the path configuration around it.
-        self.assertIn("ENV HERMES_HOME=/home/hermes", self.text)
+        self.assertIn("ENV HERMES_HOME=/opt/data", self.text)
         self.assertRegex(self.text, r"(?m)^ENTRYPOINT ")
         self.assertRegex(self.text, r"(?m)^CMD ")
 
