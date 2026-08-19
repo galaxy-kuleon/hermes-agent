@@ -547,7 +547,11 @@ LOCAL_DOCUMENT_EXPORT_SCHEMA = {
 
 registry.register(
     name="local_document_export",
-    toolset="file",
+    # The export writes only inside the request-owned artifact store and
+    # returns signed, expiring links. It is safe for API callers whose raw
+    # filesystem surface is projected from ``file`` to ``file_read`` by the
+    # shared-skill ACL; unlike write_file/patch it cannot mutate skills.
+    toolset="file_read",
     schema=LOCAL_DOCUMENT_EXPORT_SCHEMA,
     handler=lambda args, **kw: local_document_export(args, task_id=kw.get("task_id")),
     description=LOCAL_DOCUMENT_EXPORT_SCHEMA["description"],
