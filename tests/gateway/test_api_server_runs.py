@@ -196,6 +196,9 @@ class TestStartRun:
         assert captured.get("origin_session_id") == "runs-raw-sid", (
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
+        created_session_id = mock_create.call_args.kwargs["session_id"]
+        assert created_session_id.startswith("runs-raw-sid-user-")
+        assert TEST_USER_ID in created_session_id
 
 
     @pytest.mark.asyncio

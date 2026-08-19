@@ -362,6 +362,48 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
+    async def test_run_agent_starts_idle_window_only_after_turn_finishes(
+        self, adapter, monkeypatch
+    ):
+        session_id = "session-slow"
+        adapter._session_activity[session_id] = {
+            "user_id": "user-a",
+            "chat_id": "chat-a",
+            "last_seen": 1.0,
+            "committed": True,
+        }
+        monkeypatch.setattr(
+            "gateway.platforms.api_server.time.time", lambda: 500.0
+        )
+        monkeypatch.setattr(adapter, "_persist_session_activity", lambda: None)
+
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        def _slow_turn(**_kwargs):
+            assert adapter._active_session_runs[session_id] == 1
+            assert adapter._idle_commit_candidates(10_000.0) == []
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _slow_turn
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id=session_id,
+            )
+
+        assert session_id not in adapter._active_session_runs
+        assert adapter._session_activity[session_id]["last_seen"] == 500.0
+        assert adapter._session_activity[session_id]["committed"] is False
+        assert adapter._idle_commit_candidates(529.9) == []
+        assert adapter._idle_commit_candidates(530.0) == [
+            (session_id, adapter._session_activity[session_id])
+        ]
+
+    @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}

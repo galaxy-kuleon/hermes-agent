@@ -2896,6 +2896,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # `__setitem__` on existing keys + dict insertion, both atomic enough
         # against the single-coroutine watcher).
         self._session_activity: Dict[str, Dict[str, Any]] = {}
+        # Live request counts are intentionally process-local. Persisting
+        # them would strand sessions as "active" after a crash. The idle
+        # watcher must never commit a session while an agent turn is still
+        # producing the messages that the commit is supposed to extract.
+        self._active_session_runs: Dict[str, int] = {}
         self._idle_commit_task: Optional["asyncio.Task"] = None
         self._sweep_task: Optional["asyncio.Task"] = None
         # Disk-backed activity table — survives container/process restarts
@@ -9078,11 +9083,14 @@ class APIServerAdapter(BasePlatformAdapter):
         journey_context = contextvars.copy_context()
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
+        tracked_session_id = str(session_id or "")
+        self._mark_session_run_started(tracked_session_id)
         try:
             return await self._run_owned_in_executor(
                 loop, lambda: journey_context.run(_run)
             )
         finally:
+            self._mark_session_run_finished(tracked_session_id)
             self._inflight_agent_runs -= 1
 
     async def _run_owned_in_executor(self, loop, func):
@@ -9230,12 +9238,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if not scope["user_id"]:
             return _missing_user_id_error()
 
-        # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
-            return web.json_response(
-                _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
-                status=429,
-            )
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
         limited = self._concurrency_limited_response()
@@ -9332,10 +9334,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Always run user/chat scope through _scope_session_id so that whether
         # the base came from the client, a stored response, or the auto-generated
         # run_id, it ends with -user-<id>(-chat-<id>).
-        session_id = _scope_session_id(body_session_id or stored_session_id or run_id, scope)
+        raw_conversation_id = body_session_id or stored_session_id or run_id
+        session_id = _scope_session_id(raw_conversation_id, scope)
         approval_session_key = gateway_session_key or session_id or run_id
         self._touch_session_activity(session_id, scope)
-        session_id = body.get("session_id") or stored_session_id
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -9348,8 +9350,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -9400,6 +9400,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            self._mark_session_run_started(session_id)
             try:
                 self._set_run_status(run_id, "running")
                 with self._profile_scope(request_profile):
@@ -9494,7 +9495,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             })
                             session_tokens = set_session_vars(
                                 platform="api_server",
-                                chat_id=chat_id or session_id or "",
+                                # Delegation wake-up targets use the client's
+                                # stable conversation id; memory storage uses
+                                # the tenant-scoped session_id separately.
+                                chat_id=chat_id or raw_conversation_id or "",
                                 user_id=user_id or "",
                                 user_name=scope.get("user_name", ""),
                                 session_key=approval_session_key,
@@ -9661,6 +9665,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                self._mark_session_run_finished(session_id)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -10122,6 +10127,8 @@ class APIServerAdapter(BasePlatformAdapter):
         for sid, info in snapshot:
             if sid == session_id:
                 continue
+            if self._active_session_runs.get(sid, 0) > 0:
+                continue
             if info.get("committed"):
                 continue
             if info.get("user_id") != user_id:
@@ -10138,6 +10145,42 @@ class APIServerAdapter(BasePlatformAdapter):
                     "(prior chat=%s, current=%s)",
                     sid, info.get("chat_id", ""), chat_id,
                 )
+
+    def _mark_session_run_started(self, session_id: str) -> None:
+        """Prevent idle commit while a request is producing this session."""
+        if not session_id:
+            return
+        self._active_session_runs[session_id] = (
+            self._active_session_runs.get(session_id, 0) + 1
+        )
+
+    def _mark_session_run_finished(self, session_id: str) -> None:
+        """Start the idle window when the final concurrent turn finishes."""
+        if not session_id:
+            return
+        remaining = self._active_session_runs.get(session_id, 0) - 1
+        if remaining > 0:
+            self._active_session_runs[session_id] = remaining
+            return
+        self._active_session_runs.pop(session_id, None)
+        info = self._session_activity.get(session_id)
+        if info is None:
+            return
+        # sync_turn() is scheduled near the end of run_conversation(). Give
+        # it the full idle interval to land before commit reads the session.
+        info["last_seen"] = time.time()
+        info["committed"] = False
+        self._persist_session_activity()
+
+    def _idle_commit_candidates(self, now: float) -> list[tuple[str, Dict[str, Any]]]:
+        """Return inactive sessions whose post-turn idle window elapsed."""
+        return [
+            (sid, info)
+            for sid, info in list(self._session_activity.items())
+            if not info.get("committed")
+            and self._active_session_runs.get(sid, 0) == 0
+            and now - info.get("last_seen", now) >= self.IDLE_COMMIT_SECONDS
+        ]
 
     def _touch_session_activity(self, session_id: str, scope: Dict[str, str]) -> None:
         """Record (or refresh) per-session activity for the idle-commit watcher.
@@ -10244,11 +10287,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 now = time.time()
                 # Snapshot to avoid mutating during iteration.
                 snapshot = list(self._session_activity.items())
-                stale = [
-                    (sid, info) for sid, info in snapshot
-                    if not info.get("committed")
-                    and now - info.get("last_seen", now) >= self.IDLE_COMMIT_SECONDS
-                ]
+                stale = self._idle_commit_candidates(now)
                 # GC very old sessions so the dict doesn't grow unbounded
                 gc_keys = [
                     sid for sid, info in snapshot
