@@ -39,6 +39,40 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def _preexisting_module_identity_changes(
+    before: dict[str, object], after: dict[str, object]
+) -> list[str]:
+    """Name pre-existing module keys deleted or replaced in ``after``."""
+    changes: list[str] = []
+    for name, original in before.items():
+        if name not in after:
+            changes.append(f"deleted:{name}")
+        elif after[name] is not original:
+            changes.append(f"replaced:{name}")
+    return changes
+
+
+class _SysModulesGuardedModule(pytest.Module):
+    """Check that importing a test does not corrupt existing modules."""
+
+    def _getobj(self):
+        before = dict(sys.modules)
+        module = super()._getobj()
+        changes = _preexisting_module_identity_changes(before, dict(sys.modules))
+        if changes:
+            raise self.CollectError(
+                f"{self.nodeid} polluted pre-existing sys.modules entries "
+                f"during collection: {', '.join(changes)}. Restore every "
+                "replaced/deleted entry before module import returns."
+            )
+        return module
+
+
+def pytest_pycollect_makemodule(module_path, parent):
+    """Use the guarded collector for every gateway test module."""
+    return _SysModulesGuardedModule.from_parent(parent, path=module_path)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _bind_lark_sdk_globals_when_installed():
     """Bind the feishu adapter's lark SDK globals once per test session.
@@ -551,4 +585,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

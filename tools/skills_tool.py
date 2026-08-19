@@ -159,6 +159,33 @@ def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
+_ACL_READ_DENY = (
+    "Hermes skills ACL: read access could not be verified for the current "
+    "OpenWebUI role/group scope; denied."
+)
+
+
+def _acl_read_block(action: str) -> Optional[str]:
+    """Fail closed for skill reads on the multi-user OpenWebUI surface."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        return None
+    if platform != "api_server":
+        return None
+    try:
+        from tools.skill_acl import load_skill_acl_config, require_skill_permission
+
+        if not load_skill_acl_config().get("enabled"):
+            return None
+        allowed, reason = require_skill_permission(action)
+        return None if allowed else reason
+    except Exception:
+        return _ACL_READ_DENY
+
+
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -686,7 +713,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import (
-        get_external_skills_dirs,
+        get_skill_roots,
         get_project_skills_dirs,
         iter_project_skill_files,
         iter_skill_index_files,
@@ -705,10 +732,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # same-named local/external skills.
     project_dirs = list(get_project_skills_dirs())
     dirs_to_scan: list = list(project_dirs)
-    active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    roots_to_scan = get_skill_roots(platform_dir=_skills_dir())
+    dirs_to_scan.extend(
+        root.path
+        for root in roots_to_scan
+        if root.path.exists() and root.path not in dirs_to_scan
+    )
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -777,7 +806,15 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "namespace": next(
+                        (root.namespace for root in roots_to_scan if root.path == scan_dir),
+                        "project",
+                    ),
                 })
+                from agent.skill_namespaces import qualify_skill_name
+                skills[-1]["qualified_name"] = qualify_skill_name(
+                    skills[-1]["namespace"], name
+                )
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
@@ -815,11 +852,10 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     Returns:
         JSON string with minimal skill info: name, description, category
     """
+    blocked = _acl_read_block("skills_list")
+    if blocked:
+        return tool_error(blocked, success=False)
     try:
-        active_skills_dir = _skills_dir()
-        if not active_skills_dir.exists():
-            active_skills_dir.mkdir(parents=True, exist_ok=True)
-
         # Find all skills
         all_skills = _find_all_skills()
         try:
@@ -1090,6 +1126,10 @@ def skill_view(
     Returns:
         JSON string with skill content or error message
     """
+    # Gate before name resolution so denied callers cannot probe existence.
+    blocked = _acl_read_block("skill_view")
+    if blocked:
+        return tool_error(blocked, success=False)
     try:
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
@@ -1106,7 +1146,19 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        requested_name = name
+        lookup_name = name
+        root_namespace_filter: str | None = None
         local_category_name: str | None = None
+        if ":" in name:
+            from agent.skill_namespaces import PLATFORM_NAMESPACE, USER_NAMESPACE
+            from agent.skill_utils import parse_qualified_name
+
+            candidate_namespace, candidate_bare = parse_qualified_name(name)
+            if candidate_namespace in {PLATFORM_NAMESPACE, USER_NAMESPACE}:
+                root_namespace_filter = candidate_namespace
+                lookup_name = candidate_bare
+                name = candidate_bare
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
@@ -1209,7 +1261,7 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import get_project_skills_dirs, get_skill_roots
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1228,12 +1280,15 @@ def skill_view(
         # Build list of all skill directories to search. Project dirs first —
         # they're the highest-precedence tier and the collision resolver
         # below uses this ordering.
-        project_dirs = get_project_skills_dirs()
-        all_dirs = list(project_dirs)
         active_skills_dir = _skills_dir()
-        if active_skills_dir.exists():
-            all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        project_dirs = get_project_skills_dirs() if root_namespace_filter is None else []
+        all_roots = get_skill_roots(platform_dir=active_skills_dir)
+        if root_namespace_filter is not None:
+            all_roots = [r for r in all_roots if r.namespace == root_namespace_filter]
+        all_dirs = list(project_dirs)
+        all_dirs.extend(
+            root.path for root in all_roots if root.path.exists() and root.path not in all_dirs
+        )
 
         if not all_dirs:
             return json.dumps(
@@ -1378,6 +1433,16 @@ def skill_view(
 
         if candidates:
             skill_dir, skill_md = candidates[0]
+
+        selected_root = None
+        if skill_md is not None:
+            for candidate_root in all_roots:
+                try:
+                    skill_md.resolve().relative_to(candidate_root.path.resolve())
+                    selected_root = candidate_root
+                    break
+                except (OSError, ValueError):
+                    continue
 
         # Quarantine gate: a project-tier skill with a dangerous scan verdict
         # must not load even by explicit name (same chokepoint the index and
@@ -1845,6 +1910,7 @@ def skill_view(
         result = {
             "success": True,
             "name": skill_name,
+            "namespace": selected_root.namespace if selected_root else "project",
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
@@ -1870,6 +1936,10 @@ def skill_view(
             # fingerprint (mtime+size change detection).
             "_source_path": str(skill_md),
         }
+        from agent.skill_namespaces import qualify_skill_name
+        result["qualified_name"] = qualify_skill_name(
+            result["namespace"], skill_name
+        )
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
@@ -2148,16 +2218,28 @@ def _skill_view_with_bump(args, **kw):
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
             if resolved:
-                from tools.skill_usage import bump_use, bump_view
-                bump_view(str(resolved))
-                # A skill_view tool call is the agent actively loading the skill
-                # to act on it — that counts as use, not just a browse/view.
-                # Curator's stale timer keys off last_used_at (see agent/curator.py).
-                bump_use(
-                    str(resolved),
-                    task_id=kw.get("task_id"),
-                    session_id=kw.get("session_id"),
-                )
+                from tools.skill_usage import bump_use, bump_view, skill_usage_scope
+
+                skills_root = None
+                skill_dir = parsed.get("skill_dir")
+                if skill_dir:
+                    from agent.skill_utils import get_skill_roots
+
+                    resolved_dir = Path(str(skill_dir)).resolve()
+                    for root in get_skill_roots(platform_dir=SKILLS_DIR):
+                        try:
+                            resolved_dir.relative_to(root.path.resolve())
+                            skills_root = root.path
+                            break
+                        except (OSError, ValueError):
+                            continue
+                with skill_usage_scope(skills_root):
+                    bump_view(str(resolved))
+                    bump_use(
+                        str(resolved),
+                        task_id=kw.get("task_id"),
+                        session_id=kw.get("session_id"),
+                    )
     except Exception:
         pass
     return result

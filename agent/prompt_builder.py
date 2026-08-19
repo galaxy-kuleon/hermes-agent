@@ -1535,6 +1535,16 @@ def _skills_prompt_snapshot_path() -> Path:
     return get_hermes_home() / ".skills_prompt_snapshot.json"
 
 
+def _platform_skills_generation() -> int:
+    """Monotonic invalidator for platform-skill writer mutations."""
+    try:
+        from tools.platform_skill_store import read_generation
+
+        return int(read_generation())
+    except Exception:
+        return 0
+
+
 def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -1800,7 +1810,15 @@ def build_skills_system_prompt(
         skills_dir = get_skills_dir()
         _home_token = None
     try:
-        external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        # Keep external and caller-owned user roots explicit. The latter is
+        # context-bound and must participate in both discovery and cache keys.
+        from agent.skill_utils import get_skill_roots
+
+        external_dirs = [
+            root.path
+            for root in get_skill_roots(platform_dir=skills_dir)
+            if root.path != skills_dir
+        ]
         # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
         # the git root) — highest-precedence tier, scanned before local.
         # Resolved once here; cwd and trust are stable for the session, so
@@ -1839,6 +1857,7 @@ def _build_skills_system_prompt_inner(
     project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
+        _platform_skills_generation(),
         tuple(str(d) for d in external_dirs),
         tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),

@@ -275,14 +275,19 @@ def get_skills_directory_mount(
 
     # Mount external skill dirs
     try:
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
-        for idx, ext_dir in enumerate(get_external_skills_dirs()):
-            if ext_dir.is_dir():
-                host_path = _safe_skills_path(ext_dir)
-                mounts.append({
-                    "host_path": host_path,
-                    "container_path": f"{container_base.rstrip('/')}/external_skills/{idx}",
-                })
+        from agent.skill_utils import get_project_skills_dirs, get_skill_roots
+        from agent.skill_namespaces import PLATFORM_NAMESPACE, USER_NAMESPACE
+        for root in get_skill_roots():
+            if not root.path.is_dir() or root.namespace == PLATFORM_NAMESPACE:
+                continue
+            if root.namespace == USER_NAMESPACE:
+                suffix = f"user-skills/{root.owner_user_id}"
+            else:
+                suffix = f"external_skills/{root.namespace.rsplit('-', 1)[-1]}"
+            mounts.append({
+                "host_path": _safe_skills_path(root.path),
+                "container_path": f"{container_base.rstrip('/')}/{suffix}",
+            })
         # Trusted project-local skill dirs (repo checkouts). Separate
         # namespace so container paths stay stable if external_dirs change.
         for idx, proj_dir in enumerate(get_project_skills_dirs()):
@@ -356,30 +361,23 @@ def iter_skills_files(
     """
     result: List[Dict[str, str]] = []
 
-    hermes_home = _resolve_hermes_home()
-    skills_dir = hermes_home / "skills"
-    if skills_dir.is_dir():
-        container_root = f"{container_base.rstrip('/')}/skills"
-        for item in skills_dir.rglob("*"):
-            if item.is_symlink() or not item.is_file():
-                continue
-            rel = item.relative_to(skills_dir)
-            result.append({
-                "host_path": str(item),
-                "container_path": f"{container_root}/{rel}",
-            })
-
-    # Include external skill dirs
     try:
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
-        for idx, ext_dir in enumerate(get_external_skills_dirs()):
-            if not ext_dir.is_dir():
+        from agent.skill_utils import get_project_skills_dirs, get_skill_roots
+        from agent.skill_namespaces import PLATFORM_NAMESPACE, USER_NAMESPACE
+        for root in get_skill_roots():
+            if not root.path.is_dir():
                 continue
-            container_root = f"{container_base.rstrip('/')}/external_skills/{idx}"
-            for item in ext_dir.rglob("*"):
+            if root.namespace == PLATFORM_NAMESPACE:
+                suffix = "skills"
+            elif root.namespace == USER_NAMESPACE:
+                suffix = f"user-skills/{root.owner_user_id}"
+            else:
+                suffix = f"external_skills/{root.namespace.rsplit('-', 1)[-1]}"
+            container_root = f"{container_base.rstrip('/')}/{suffix}"
+            for item in root.path.rglob("*"):
                 if item.is_symlink() or not item.is_file():
                     continue
-                rel = item.relative_to(ext_dir)
+                rel = item.relative_to(root.path)
                 result.append({
                     "host_path": str(item),
                     "container_path": f"{container_root}/{rel}",
@@ -583,5 +581,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

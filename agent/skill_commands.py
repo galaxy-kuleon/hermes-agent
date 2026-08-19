@@ -232,9 +232,23 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
-        from agent.skill_utils import normalize_skill_lookup_name
+        from agent.skill_utils import get_skill_roots, normalize_skill_lookup_name
+        from agent.skill_namespaces import qualify_skill_name
 
-        normalized = normalize_skill_lookup_name(raw_identifier)
+        identifier_path = Path(raw_identifier).expanduser()
+        if identifier_path.is_absolute():
+            normalized = None
+            for root in get_skill_roots(platform_dir=SKILLS_DIR):
+                try:
+                    relative = str(identifier_path.relative_to(root.path))
+                    normalized = qualify_skill_name(root.namespace, relative)
+                    break
+                except ValueError:
+                    continue
+            if normalized is None:
+                normalized = normalize_skill_lookup_name(raw_identifier)
+        else:
+            normalized = normalize_skill_lookup_name(raw_identifier)
 
         loaded_skill = json.loads(
             skill_view(normalized, task_id=task_id, preprocess=False)
@@ -383,8 +397,11 @@ def _build_skill_message(
         try:
             skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
         except ValueError:
-            # Skill is from an external dir — use the skill name instead
-            skill_view_target = skill_dir.name
+            skill_view_target = str(
+                loaded_skill.get("qualified_name")
+                or loaded_skill.get("name")
+                or skill_dir.name
+            )
         parts.append("")
         parts.append("[This skill has supporting files:]")
         for sf in supporting:
@@ -429,7 +446,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
-            get_external_skills_dirs,
+            get_skill_roots,
             get_project_skills_dirs,
             iter_project_skill_files,
             iter_skill_index_files,
@@ -442,9 +459,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         # Project dirs iterate through the quarantine chokepoint.
         project_dirs = list(get_project_skills_dirs())
         dirs_to_scan = list(project_dirs)
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
-        dirs_to_scan.extend(get_external_skills_dirs())
+        dirs_to_scan.extend(
+            root.path
+            for root in get_skill_roots(platform_dir=SKILLS_DIR)
+            if root.path.exists() and root.path not in dirs_to_scan
+        )
 
         for scan_dir in dirs_to_scan:
             _iter = (

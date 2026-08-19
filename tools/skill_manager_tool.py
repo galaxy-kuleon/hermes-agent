@@ -37,6 +37,7 @@ import logging
 import re
 import shutil
 import contextvars as _ctxvars
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -635,14 +636,73 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
     return None
 
 
-def _resolve_skill_dir(name: str, category: str = None) -> Path:
-    """Build the directory path for a new skill, optionally under a category."""
-    if category:
-        return _skills_dir() / category / name
-    return _skills_dir() / name
+def _skill_roots():
+    from agent.skill_namespaces import EXTERNAL_NAMESPACE_PREFIX, SkillRoot
+    from agent.skill_utils import get_all_skills_dirs, get_skill_roots
+
+    roots = list(get_skill_roots(platform_dir=SKILLS_DIR))
+    seen = {
+        root.path.resolve() if root.path.exists() else root.path.absolute()
+        for root in roots
+    }
+    # Preserve the long-standing extension seam used by embedders and tests:
+    # callers may override get_all_skills_dirs() with extra writable roots.
+    for candidate in get_all_skills_dirs():
+        path = Path(candidate)
+        identity = path.resolve() if path.exists() else path.absolute()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        roots.append(SkillRoot(f"{EXTERNAL_NAMESPACE_PREFIX}-{len(roots)}", path))
+    return roots
 
 
-def _find_skill(name: str) -> Optional[Dict[str, Any]]:
+def _normalize_namespace_and_name(
+    name: str, namespace: Optional[str] = None
+) -> Tuple[Optional[str], str, Optional[str]]:
+    from agent.skill_namespaces import split_builtin_qualified_name
+
+    try:
+        resolved_namespace, bare_name = split_builtin_qualified_name(name, namespace)
+    except ValueError as exc:
+        return None, name, str(exc)
+    if resolved_namespace is not None and not bare_name:
+        return None, bare_name, "Skill name is required after the namespace qualifier."
+    return resolved_namespace, bare_name, None
+
+
+def _root_for_namespace(namespace: str):
+    return next((root for root in _skill_roots() if root.namespace == namespace), None)
+
+
+def _default_create_namespace() -> str:
+    return "user" if _root_for_namespace("user") is not None else "platform"
+
+
+def _namespace_relative(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except (ValueError, TypeError):
+        return path.name
+
+
+def _resolve_skill_dir(
+    name: str, category: str = None, namespace: Optional[str] = None
+) -> Tuple[Optional[Path], Optional[Any], Optional[str]]:
+    resolved_namespace, bare_name, error = _normalize_namespace_and_name(name, namespace)
+    if error:
+        return None, None, error
+    target_namespace = resolved_namespace or _default_create_namespace()
+    root = _root_for_namespace(target_namespace)
+    if root is None:
+        if target_namespace == "user":
+            return None, None, "A valid OpenWebUI user identity is required for the user skill namespace."
+        return None, None, f"Skill namespace '{target_namespace}' is not available."
+    relative = Path(category) / bare_name if category else Path(bare_name)
+    return root.path / relative, root, None
+
+
+def _find_skill(name: str, namespace: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
 
@@ -650,15 +710,74 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-    for skills_dir in get_all_skills_dirs():
+    from agent.skill_namespaces import qualify_skill_name
+    from agent.skill_utils import is_excluded_skill_path, parse_frontmatter
+
+    resolved_namespace, bare_name, error = _normalize_namespace_and_name(name, namespace)
+    if error:
+        return None
+    relative_name = Path(bare_name)
+    if relative_name.is_absolute() or ".." in relative_name.parts:
+        return None
+
+    def _found(root, skill_dir: Path, declared_name: Optional[str] = None):
+        if root.namespace == "user":
+            try:
+                if root.path.is_symlink() or root.path.parent.is_symlink():
+                    return None
+                skill_dir.resolve().relative_to(root.path.resolve())
+                cursor = root.path
+                for part in skill_dir.relative_to(root.path).parts:
+                    cursor = cursor / part
+                    if cursor.is_symlink():
+                        return None
+            except (OSError, ValueError):
+                return None
+        canonical_name = declared_name or skill_dir.name
+        return {
+            "path": skill_dir,
+            "root": root.path,
+            "namespace": root.namespace,
+            "owner_user_id": root.owner_user_id,
+            "qualified_name": qualify_skill_name(root.namespace, canonical_name),
+        }
+
+    for root in _skill_roots():
+        if resolved_namespace is not None and root.namespace != resolved_namespace:
+            continue
+        skills_dir = root.path
         if not skills_dir.exists():
             continue
+        direct = skills_dir / relative_name
+        if direct.is_dir() and (direct / "SKILL.md").is_file():
+            declared_name = None
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    (direct / "SKILL.md").read_text(encoding="utf-8")[:4000]
+                )
+                declared_name = str(frontmatter.get("name") or "") or None
+            except (OSError, UnicodeDecodeError):
+                pass
+            found = _found(root, direct, declared_name)
+            if found:
+                return found
         for skill_md in skills_dir.rglob("SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
-            if skill_md.parent.name == name:
-                return {"path": skill_md.parent}
+            declared_name = None
+            if skill_md.parent.name != bare_name:
+                try:
+                    frontmatter, _ = parse_frontmatter(
+                        skill_md.read_text(encoding="utf-8")[:4000]
+                    )
+                    declared_name = str(frontmatter.get("name") or "") or None
+                except (OSError, UnicodeDecodeError):
+                    pass
+                if declared_name != bare_name:
+                    continue
+            found = _found(root, skill_md.parent, declared_name)
+            if found:
+                return found
     return None
 
 
@@ -905,10 +1024,20 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+def _create_skill(
+    name: str,
+    content: str,
+    category: str = None,
+    namespace: Optional[str] = None,
+) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
+    resolved_namespace, bare_name, namespace_error = _normalize_namespace_and_name(
+        name, namespace
+    )
+    if namespace_error:
+        return {"success": False, "error": namespace_error}
     # Validate name
-    err = _validate_name(name)
+    err = _validate_name(bare_name)
     if err:
         return {"success": False, "error": err}
 
@@ -926,15 +1055,30 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         return {"success": False, "error": err}
 
     # Check for name collisions across all directories
-    existing = _find_skill(name)
+    existing = _find_skill(bare_name)
     if existing:
         return {
             "success": False,
-            "error": f"A skill named '{name}' already exists at {existing['path']}."
+            "error": (
+                f"A skill named '{bare_name}' already exists in the "
+                f"'{existing['namespace']}' namespace. User skills cannot shadow "
+                "a caller-visible platform or external skill."
+            ),
         }
 
     # Create the skill directory
-    skill_dir = _resolve_skill_dir(name, category)
+    skill_dir, root, resolve_error = _resolve_skill_dir(
+        bare_name, category, resolved_namespace
+    )
+    if resolve_error or skill_dir is None or root is None:
+        return {"success": False, "error": resolve_error or "Skill root unavailable."}
+    if root.path.is_symlink() or root.path.parent.is_symlink():
+        return {"success": False, "error": "Refusing to use a symlinked skill namespace root."}
+    if root.namespace == "user":
+        root_was_missing = not root.path.exists()
+        root.path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if root_was_missing:
+            root.path.chmod(0o700)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     # Write SKILL.md atomically
@@ -959,17 +1103,21 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
     result = {
         "success": True,
-        "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(_skills_dir())),
-        "skill_md": str(skill_md),
+        "message": f"Skill '{bare_name}' created.",
+        "path": str(skill_dir.relative_to(root.path)),
+        "skill_md": _namespace_relative(skill_md, root.path),
+        "namespace": root.namespace,
+        "_skills_root": str(root.path),
         "_change": {"description": _desc},
     }
     if category:
         result["category"] = category
     result["hint"] = (
         "To add reference files, templates, or scripts, use "
-        "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
+        "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(bare_name)
     )
+    from agent.skill_namespaces import qualify_skill_name
+    result["qualified_name"] = qualify_skill_name(root.namespace, bare_name)
     _add_description_prompt_preview(result, content)
     _attach_lint_findings(result, skill_md)
     return result
@@ -1003,7 +1151,9 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path) -> None:
     )
 
 
-def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+def _edit_skill(
+    name: str, content: str, namespace: Optional[str] = None
+) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     err = _validate_frontmatter(content)
     if err:
@@ -1013,7 +1163,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name)
+    existing = _find_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
@@ -1055,6 +1205,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "success": True,
         "message": f"Skill '{name}' updated (full rewrite).",
         "path": str(existing["path"]),
+        "namespace": existing["namespace"],
+        "qualified_name": existing["qualified_name"],
+        "_skills_root": str(existing["root"]),
         "_change": {"description": _desc},
     }
     org_note = _maybe_auto_propose_org_edit(name, existing["path"])
@@ -1071,6 +1224,7 @@ def _patch_skill(
     new_string: str,
     file_path: str = None,
     replace_all: bool = False,
+    namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
 
@@ -1082,7 +1236,7 @@ def _patch_skill(
     if new_string is None:
         return {"success": False, "error": "new_string is required for 'patch'. Use an empty string to delete matched text."}
 
-    existing = _find_skill(name)
+    existing = _find_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
@@ -1172,6 +1326,9 @@ def _patch_skill(
     result = {
         "success": True,
         "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
+        "namespace": existing["namespace"],
+        "qualified_name": existing["qualified_name"],
+        "_skills_root": str(existing["root"]),
     }
     # Include change previews for verbose notifications
     result["_change"] = {
@@ -1185,7 +1342,11 @@ def _patch_skill(
     return result
 
 
-def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
+def _delete_skill(
+    name: str,
+    absorbed_into: Optional[str] = None,
+    namespace: Optional[str] = None,
+) -> Dict[str, Any]:
     """Delete a skill.
 
     ``absorbed_into`` declares intent:
@@ -1197,7 +1358,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         target must exist on disk. Validated here so the model can't claim an
         umbrella that doesn't exist.
     """
-    existing = _find_skill(name)
+    existing = _find_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
@@ -1290,10 +1451,18 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     return {
         "success": True,
         "message": message,
+        "namespace": existing["namespace"],
+        "qualified_name": existing["qualified_name"],
+        "_skills_root": str(existing["root"]),
     }
 
 
-def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
+def _write_file(
+    name: str,
+    file_path: str,
+    file_content: str,
+    namespace: Optional[str] = None,
+) -> Dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
     err = _validate_file_path(file_path)
     if err:
@@ -1317,7 +1486,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name)
+    existing = _find_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
@@ -1355,6 +1524,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
         "path": str(target),
+        "namespace": existing["namespace"],
+        "qualified_name": existing["qualified_name"],
+        "_skills_root": str(existing["root"]),
     }
     org_note = _maybe_auto_propose_org_edit(name, existing["path"])
     if org_note:
@@ -1363,13 +1535,15 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     return result
 
 
-def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
+def _remove_file(
+    name: str, file_path: str, namespace: Optional[str] = None
+) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
     err = _validate_file_path(file_path)
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name)
+    existing = _find_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
@@ -1413,6 +1587,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     return {
         "success": True,
         "message": f"File '{file_path}' removed from skill '{name}'.",
+        "namespace": existing["namespace"],
+        "qualified_name": existing["qualified_name"],
+        "_skills_root": str(existing["root"]),
     }
 
 
@@ -1452,6 +1629,19 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
     payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
+    if payload.get("namespace") == "user":
+        try:
+            from agent.skill_namespaces import current_skill_namespace_user_id
+
+            subject_user_id = current_skill_namespace_user_id()
+        except Exception:
+            subject_user_id = None
+        if not subject_user_id:
+            return tool_error(
+                "A valid original subject is required for a staged user-skill write.",
+                success=False,
+            )
+        payload["subject_user_id"] = subject_user_id
     gist = wa.skill_gist(
         action, name,
         content=payload_kwargs.get("content") or "",
@@ -1471,20 +1661,36 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
     """Replay a staged skill write, bypassing the gate. Returns the tool result
     JSON string. Called by the /skills approve handler.
     """
+    namespace = str(payload.get("namespace") or "") or None
+    subject_user_id = str(payload.get("subject_user_id") or "")
+    if namespace == "user" and not subject_user_id:
+        return tool_error(
+            "Approved user-skill write is missing its original subject; denied.",
+            success=False,
+        )
+    from agent.skill_namespaces import bind_skill_namespace_user
+
+    replay_scope = (
+        bind_skill_namespace_user(subject_user_id)
+        if namespace == "user"
+        else nullcontext()
+    )
     token = _skill_gate_bypass.set(True)
     try:
-        return skill_manage(
-            action=payload.get("action", ""),
-            name=payload.get("name", ""),
-            content=payload.get("content"),
-            category=payload.get("category"),
-            file_path=payload.get("file_path"),
-            file_content=payload.get("file_content"),
-            old_string=payload.get("old_string"),
-            new_string=payload.get("new_string"),
-            replace_all=payload.get("replace_all", False),
-            absorbed_into=payload.get("absorbed_into"),
-        )
+        with replay_scope:
+            return skill_manage(
+                action=payload.get("action", ""),
+                name=payload.get("name", ""),
+                namespace=namespace,
+                content=payload.get("content"),
+                category=payload.get("category"),
+                file_path=payload.get("file_path"),
+                file_content=payload.get("file_content"),
+                old_string=payload.get("old_string"),
+                new_string=payload.get("new_string"),
+                replace_all=payload.get("replace_all", False),
+                absorbed_into=payload.get("absorbed_into"),
+            )
     finally:
         _skill_gate_bypass.reset(token)
 
@@ -1539,9 +1745,47 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
         _sync_push_timer.start()
 
 
+_ACL_MANAGE_DENY = (
+    "Hermes skills ACL: management permission could not be verified for the "
+    "current OpenWebUI role/group scope; denied."
+)
+
+
+def _acl_manage_block(action: str, target_namespace: Optional[str]) -> Optional[str]:
+    """Fail closed for OpenWebUI writes; shared writes are rechecked by broker."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        platform = ""
+    if platform != "api_server":
+        return None
+    if target_namespace == "user":
+        try:
+            from agent.skill_namespaces import current_skill_namespace_user_id
+
+            return None if current_skill_namespace_user_id() else _ACL_MANAGE_DENY
+        except Exception:
+            return _ACL_MANAGE_DENY
+    try:
+        from tools.skill_acl import load_skill_acl_config, require_skill_permission
+
+        config = load_skill_acl_config()
+        if not config.get("enabled"):
+            return _ACL_MANAGE_DENY if target_namespace == "platform" else None
+        if target_namespace == "platform":
+            return None
+        allowed, reason = require_skill_permission(action)
+        return None if allowed else reason
+    except Exception:
+        return _ACL_MANAGE_DENY
+
+
 def skill_manage(
     action: str,
     name: str,
+    namespace: str = None,
     content: str = None,
     category: str = None,
     file_path: str = None,
@@ -1558,7 +1802,31 @@ def skill_manage(
 
     Returns JSON string with results.
     """
-    preflight = _background_review_preflight(action, name)
+    resolved_namespace, bare_name, namespace_error = _normalize_namespace_and_name(
+        name, namespace
+    )
+    if namespace_error:
+        return tool_error(namespace_error, success=False)
+    try:
+        from gateway.session_context import get_session_env
+
+        api_server_session = get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
+    except Exception:
+        api_server_session = False
+    if resolved_namespace is None and api_server_session:
+        resolved_namespace = "user"
+    target = None if action == "create" else _find_skill(bare_name, resolved_namespace)
+    target_namespace = (
+        resolved_namespace
+        or (target.get("namespace") if target else None)
+        or _default_create_namespace()
+    )
+
+    blocked = _acl_manage_block(action, target_namespace)
+    if blocked:
+        return tool_error(blocked, success=False)
+
+    preflight = _background_review_preflight(action, bare_name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
@@ -1567,7 +1835,8 @@ def skill_manage(
     # (default) passes straight through. The gate is bypassed when this call is
     # itself replaying an already-approved staged write (_skill_apply_pending).
     gate_result = _apply_skill_write_gate(
-        action, name, content=content, category=category,
+        action, bare_name, namespace=target_namespace,
+        content=content, category=category,
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
@@ -1584,43 +1853,74 @@ def skill_manage(
     _ledger_before_dir = None
     try:
         from tools import skill_ledger as _ledger
-        _pre = _find_skill(name)
+        _pre = _find_skill(bare_name, target_namespace)
         _ledger_before_dir = _pre["path"] if _pre else None
         _ledger_before = _ledger.capture_before(_ledger_before_dir)
     except Exception:
         pass
 
-    if action == "create":
+    if target_namespace == "platform" and api_server_session:
+        arguments = {
+            "content": content,
+            "category": category,
+            "file_path": file_path,
+            "file_content": file_content,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all,
+            "absorbed_into": absorbed_into,
+        }
+        try:
+            from tools.shared_skill_writer import (
+                SharedSkillWriterError,
+                request_shared_skill_mutation,
+            )
+
+            result = request_shared_skill_mutation(
+                action, bare_name, arguments=arguments
+            )
+        except SharedSkillWriterError as exc:
+            result = {
+                "success": False,
+                "error": str(exc),
+                "error_code": exc.code,
+            }
+
+    elif action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+        result = _create_skill(bare_name, content, category, target_namespace)
 
     elif action == "edit":
         if not content:
             return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        result = _edit_skill(bare_name, content, target_namespace)
 
     elif action == "patch":
         if not old_string:
             return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
         if new_string is None:
             return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        result = _patch_skill(
+            bare_name, old_string, new_string, file_path, replace_all, target_namespace
+        )
 
     elif action == "delete":
-        result = _delete_skill(name, absorbed_into=absorbed_into)
+        result = _delete_skill(
+            bare_name, absorbed_into=absorbed_into, namespace=target_namespace
+        )
 
     elif action == "write_file":
         if not file_path:
             return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
         if file_content is None:
             return tool_error("file_content is required for 'write_file'.", success=False)
-        result = _write_file(name, file_path, file_content)
+        result = _write_file(bare_name, file_path, file_content, target_namespace)
 
     elif action == "remove_file":
         if not file_path:
             return tool_error("file_path is required for 'remove_file'.", success=False)
-        result = _remove_file(name, file_path)
+        result = _remove_file(bare_name, file_path, target_namespace)
 
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
@@ -1629,7 +1929,7 @@ def skill_manage(
         # Audit ledger append (best-effort; never blocks the mutation).
         try:
             from tools import skill_ledger as _ledger
-            _post = _find_skill(name)
+            _post = _find_skill(bare_name, target_namespace)
             _after_dir = _post["path"] if _post else None
             _evidence = {}
             if action == "delete":
@@ -1643,7 +1943,7 @@ def skill_manage(
                 _evidence["file_path"] = file_path
             _ledger.record_mutation(
                 action,
-                name,
+                bare_name,
                 before=_ledger_before if _ledger_before is not None else [],
                 after_root=_after_dir,
                 evidence=_evidence,
@@ -1666,14 +1966,14 @@ def skill_manage(
             from tools.skill_provenance import is_background_review
             if action == "create":
                 record_created(
-                    name,
+                    bare_name,
                     agent_created=is_background_review(),
                     task_id=task_id,
                     session_id=session_id,
                 )
             elif action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(
-                    name,
+                    bare_name,
                     action=action,
                     task_id=task_id,
                     session_id=session_id,
@@ -1683,7 +1983,7 @@ def skill_manage(
                 # keeps its usage record as STATE_ARCHIVED so `hermes curator
                 # status`/`restore` still see it. Only a hard delete forgets.
                 if not result.get("_archived"):
-                    forget(name)
+                    forget(bare_name)
         except Exception:
             pass
 
@@ -1695,7 +1995,7 @@ def skill_manage(
         # sync. Debounced so a burst of edits collapses to one push. Never
         # raises -- an agent write must never block on sync (M1-C invariant).
         try:
-            _maybe_debounced_sync_push(name)
+            _maybe_debounced_sync_push(bare_name)
         except Exception:
             pass
 
@@ -1756,6 +2056,15 @@ SKILL_MANAGE_SCHEMA = {
                     "Skill name (lowercase, hyphens/underscores, max 64 chars). "
                     "Must match an existing skill for patch/edit/delete/write_file/remove_file."
                 )
+            },
+            "namespace": {
+                "type": "string",
+                "enum": ["user", "platform"],
+                "description": (
+                    "Destination skill namespace. OpenWebUI sessions default to "
+                    "the authenticated user's private namespace; shared platform "
+                    "writes require explicit namespace='platform' and ACL approval."
+                ),
             },
             "content": {
                 "type": "string",
@@ -1835,6 +2144,7 @@ registry.register(
     handler=lambda args, **kw: skill_manage(
         action=args.get("action", ""),
         name=args.get("name", ""),
+        namespace=args.get("namespace"),
         content=args.get("content"),
         category=args.get("category"),
         file_path=args.get("file_path"),

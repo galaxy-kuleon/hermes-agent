@@ -197,10 +197,22 @@ TOOLSETS = {
         "includes": []
     },
     
+    "skills_read": {
+        "description": "List and view skill documents (read-only)",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
+
+    "skills_manage": {
+        "description": "Create, edit, and delete skill documents",
+        "tools": ["skill_manage"],
+        "includes": []
+    },
+
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
-        "tools": ["skills_list", "skill_view", "skill_manage"],
-        "includes": []
+        "tools": [],
+        "includes": ["skills_read", "skills_manage"]
     },
     
     "browser": {

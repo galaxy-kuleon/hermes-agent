@@ -24,6 +24,7 @@ Lifecycle states:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -35,6 +36,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from tools.skill_state import (
+    PLATFORM_USAGE_FILENAME,
+    is_platform_skills_root,
+    platform_skill_state_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,13 @@ STATE_ACTIVE = "active"
 STATE_STALE = "stale"
 STATE_ARCHIVED = "archived"
 _VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
+
+_USAGE_SKILLS_ROOT: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
+    "HERMES_SKILL_USAGE_ROOT", default=None
+)
+_USAGE_PLATFORM_CONTEXT: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar("HERMES_SKILL_USAGE_IS_PLATFORM", default=None)
+)
 
 # Load-bearing bundled built-ins the curator must NEVER archive or consolidate,
 # regardless of ``curator.prune_builtins``, pin state, or LLM judgment. These
@@ -78,11 +91,54 @@ def is_protected_builtin(skill_name: str) -> bool:
     return skill_name in PROTECTED_BUILTIN_SKILLS
 
 
-def _skills_dir() -> Path:
+def current_skills_dir() -> Path:
+    override = _USAGE_SKILLS_ROOT.get()
+    if override is not None:
+        return override
+    try:
+        from agent.skill_namespaces import get_current_user_skills_dir
+
+        user_root = get_current_user_skills_dir()
+        if user_root is not None:
+            return user_root
+    except Exception:
+        pass
     return get_hermes_home() / "skills"
 
 
+@contextmanager
+def skill_usage_scope(skills_root: Optional[Path], *, platform: Optional[bool] = None):
+    """Bind usage and curator state to the skill root resolved by the caller."""
+    if skills_root is None:
+        yield
+        return
+    token = _USAGE_SKILLS_ROOT.set(Path(skills_root))
+    platform_token = _USAGE_PLATFORM_CONTEXT.set(platform)
+    try:
+        yield
+    finally:
+        _USAGE_PLATFORM_CONTEXT.reset(platform_token)
+        _USAGE_SKILLS_ROOT.reset(token)
+
+
+def _skills_dir() -> Path:
+    return current_skills_dir()
+
+
+def is_platform_skills_context() -> bool:
+    declared = _USAGE_PLATFORM_CONTEXT.get()
+    if declared is not None:
+        return declared
+    return is_platform_skills_root(_skills_dir())
+
+
+def current_skill_state_dir() -> Path:
+    return platform_skill_state_dir() if is_platform_skills_context() else _skills_dir()
+
+
 def _usage_file() -> Path:
+    if is_platform_skills_context():
+        return current_skill_state_dir() / PLATFORM_USAGE_FILENAME
     return _skills_dir() / ".usage.json"
 
 
