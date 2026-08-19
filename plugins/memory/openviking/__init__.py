@@ -80,6 +80,12 @@ _TIMEOUT = 30.0
 _SESSION_DRAIN_TIMEOUT = 10.0
 _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
+_SESSION_COMMIT_MEMORY_POLICY = {
+    "self": {"enabled": True},
+    "peer": {"enabled": False},
+    "memory_types": ["profile", "preferences"],
+    "working_memory": {"enabled": False},
+}
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 _SYNC_TRACE_ENV = "HERMES_OPENVIKING_SYNC_TRACE"
 _DEFAULT_RECALL_LIMIT = 6
@@ -3515,7 +3521,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         try:
             self._client.post(
                 f"/api/v1/sessions/{sid}/commit",
-                {"keep_recent_count": 0},
+                {
+                    "keep_recent_count": 0,
+                    "memory_policy": _SESSION_COMMIT_MEMORY_POLICY,
+                },
             )
             self._mark_session_committed(sid)
             self._clear_pending_session(sid)
@@ -4675,8 +4684,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Commit the session to trigger memory extraction.
 
-        OpenViking automatically extracts 6 categories of memories:
-        profile, preferences, entities, events, cases, and patterns.
+        Hermes limits automatic extraction to user profile and preferences.
+        Matter knowledge belongs in separately scoped resources, while peer and
+        working-memory extraction are disabled to avoid irrelevant LLM fan-out.
         """
         if not self._ensure_client():
             return

@@ -1133,7 +1133,15 @@ def test_on_session_switch_commits_old_session_and_rotates_id():
 
     provider._client.post.assert_called_once_with(
         "/api/v1/sessions/old-sid/commit",
-        {"keep_recent_count": 0},
+        {
+            "keep_recent_count": 0,
+            "memory_policy": {
+                "self": {"enabled": True},
+                "peer": {"enabled": False},
+                "memory_types": ["profile", "preferences"],
+                "working_memory": {"enabled": False},
+            },
+        },
     )
     assert provider._session_id == "new-sid"
     assert provider._turn_count == 0
@@ -1223,7 +1231,15 @@ def test_end_then_switch_does_not_double_commit():
     # Exactly one commit call, on the OLD session, fired by on_session_end.
     provider._client.post.assert_called_once_with(
         "/api/v1/sessions/old-sid/commit",
-        {"keep_recent_count": 0},
+        {
+            "keep_recent_count": 0,
+            "memory_policy": {
+                "self": {"enabled": True},
+                "peer": {"enabled": False},
+                "memory_types": ["profile", "preferences"],
+                "working_memory": {"enabled": False},
+            },
+        },
     )
     assert provider._session_id == "new-sid"
     assert provider._turn_count == 0
@@ -1335,7 +1351,15 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
 
     assert posts.count((
         "/api/v1/sessions/old-sid/commit",
-        {"keep_recent_count": 0},
+        {
+            "keep_recent_count": 0,
+            "memory_policy": {
+                "self": {"enabled": True},
+                "peer": {"enabled": False},
+                "memory_types": ["profile", "preferences"],
+                "working_memory": {"enabled": False},
+            },
+        },
     )) == 1
 
 
