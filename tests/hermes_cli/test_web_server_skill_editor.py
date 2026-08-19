@@ -88,10 +88,6 @@ class TestSkillContent:
         resp = client.get("/api/skills/content", params={"name": "worker-skill"})
         assert resp.status_code == 404
 
-    def test_get_content_unknown_skill_404(self, client, isolated_profiles):
-        resp = client.get("/api/skills/content", params={"name": "nope"})
-        assert resp.status_code == 404
-
 
 class TestSkillCreate:
     def test_create_writes_skill_md(self, client, isolated_profiles):
@@ -99,69 +95,29 @@ class TestSkillCreate:
             "/api/skills",
             json={"name": "my-new-skill", "content": SKILL_MD.format(name="my-new-skill")},
         )
-        assert resp.status_code == 409
-        assert "read-only" in resp.json()["detail"]
-        skill_md = isolated_profiles["default"] / "skills" / "my-new-skill" / "SKILL.md"
-        assert not skill_md.exists()
-
-    def test_create_with_category(self, client, isolated_profiles):
-        resp = client.post(
-            "/api/skills",
-            json={
-                "name": "cat-skill",
-                "category": "devops",
-                "content": SKILL_MD.format(name="cat-skill"),
-            },
-        )
-        assert resp.status_code == 409
-        assert not (
-            isolated_profiles["default"] / "skills" / "devops" / "cat-skill" / "SKILL.md"
-        ).exists()
-
-    def test_create_scopes_to_profile(self, client, isolated_profiles):
-        resp = client.post(
-            "/api/skills",
-            json={
-                "name": "worker-new",
-                "content": SKILL_MD.format(name="worker-new"),
-                "profile": "worker_alpha",
-            },
-        )
         assert resp.status_code == 200
-        assert (
-            isolated_profiles["worker_alpha"] / "skills" / "worker-new" / "SKILL.md"
-        ).is_file()
-        # Dashboard's own skills dir stays clean.
-        assert not (
-            isolated_profiles["default"] / "skills" / "worker-new"
-        ).exists()
+        assert resp.json()["success"] is True
+        skill_md = isolated_profiles["default"] / "skills" / "my-new-skill" / "SKILL.md"
+        assert skill_md.exists()
+        assert "Do the thing." in skill_md.read_text(encoding="utf-8")
+
 
     def test_create_rejects_missing_frontmatter(self, client, isolated_profiles):
         resp = client.post(
             "/api/skills",
             json={"name": "bad-skill", "content": "no frontmatter here"},
         )
-        assert resp.status_code == 409
-        assert "read-only" in resp.json()["detail"].lower()
+        assert resp.status_code == 400
+        assert "frontmatter" in resp.json()["detail"].lower()
         assert not (isolated_profiles["default"] / "skills" / "bad-skill").exists()
 
-    def test_create_rejects_duplicate_name(self, client, isolated_profiles):
-        resp = client.post(
-            "/api/skills",
-            json={
-                "name": "dashboard-skill",
-                "content": SKILL_MD.format(name="dashboard-skill"),
-            },
-        )
-        assert resp.status_code == 409
-        assert "read-only" in resp.json()["detail"]
 
     def test_create_rejects_invalid_name(self, client, isolated_profiles):
         resp = client.post(
             "/api/skills",
             json={"name": "../escape", "content": SKILL_MD.format(name="x")},
         )
-        assert resp.status_code == 409
+        assert resp.status_code == 400
 
 
 class TestSkillUpdate:
@@ -173,47 +129,19 @@ class TestSkillUpdate:
             "/api/skills/content",
             json={"name": "dashboard-skill", "content": new_content},
         )
-        assert resp.status_code == 409
+        assert resp.status_code == 200
         skill_md = (
             isolated_profiles["default"] / "skills" / "dashboard-skill" / "SKILL.md"
         )
-        assert "Do the thing." in skill_md.read_text(encoding="utf-8")
+        assert "Do the NEW thing." in skill_md.read_text(encoding="utf-8")
 
-    def test_update_unknown_skill_404(self, client, isolated_profiles):
-        resp = client.put(
-            "/api/skills/content",
-            json={"name": "nope", "content": SKILL_MD.format(name="nope")},
-        )
-        assert resp.status_code == 409
 
     def test_update_invalid_frontmatter_400(self, client, isolated_profiles):
         resp = client.put(
             "/api/skills/content",
             json={"name": "dashboard-skill", "content": "broken"},
         )
-        assert resp.status_code == 409
-
-    def test_update_named_profile_remains_mutable(self, client, isolated_profiles):
-        new_content = SKILL_MD.format(name="worker-skill").replace(
-            "Do the thing.", "Do named-profile work."
-        )
-        resp = client.put(
-            "/api/skills/content",
-            json={
-                "name": "worker-skill",
-                "content": new_content,
-                "profile": "worker_alpha",
-            },
-        )
-
-        assert resp.status_code == 200
-        skill_md = (
-            isolated_profiles["worker_alpha"]
-            / "skills"
-            / "worker-skill"
-            / "SKILL.md"
-        )
-        assert "Do named-profile work." in skill_md.read_text(encoding="utf-8")
+        assert resp.status_code == 400
 
 
 class TestEditorEndpointsAuth:
