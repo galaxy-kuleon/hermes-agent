@@ -2264,6 +2264,34 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
+def _advance_past_covered_lines(
+    path: str,
+    *,
+    offset: int,
+    task_id: str,
+) -> tuple[int, dict | None]:
+    """Move a stale document offset to the first uncovered line.
+
+    Context compression can preserve the attachment coverage ledger while a
+    model forgets the last ``next_offset``.  Replaying a covered 100K-character
+    slice is pure context churn.  The ledger is mechanism-level state, so use
+    it to resume at the first gap; callers that truly need an earlier passage
+    can still request a narrower range that begins outside the covered prefix.
+    """
+    from tools.attachment_ledger import get_outcome, merge_ranges
+
+    outcome = get_outcome(path, task_id=task_id)
+    if not outcome or str(outcome.get("extent_unit") or "lines") != "lines":
+        return offset, outcome
+    candidate = offset
+    for start, end in merge_ranges(outcome.get("ranges") or []):
+        if start <= candidate <= end:
+            candidate = end + 1
+        elif start > candidate:
+            break
+    return candidate, outcome
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers.
 
@@ -2277,6 +2305,33 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
     resolved_arg = resolve_grant_alias(path, task_id=task_id)
     handle = str(path).strip() if resolved_arg != str(path) else ""
+    requested_offset = offset
+    offset, prior_coverage = _advance_past_covered_lines(
+        resolved_arg,
+        offset=offset,
+        task_id=task_id,
+    )
+    if offset != requested_offset:
+        total = prior_coverage.get("extent_total") if prior_coverage else None
+        if isinstance(total, int) and offset > total:
+            return json.dumps(
+                {
+                    "status": "already_covered",
+                    "content_returned": False,
+                    "path": handle or str(path),
+                    "requested_offset": requested_offset,
+                    "coverage": prior_coverage.get("status"),
+                    "covered_ranges": prior_coverage.get("ranges") or [],
+                    "total_lines": total,
+                    "gaps": prior_coverage.get("gaps") or [],
+                    "hint": (
+                        "Every line is already covered in this request. Use the "
+                        "earlier result or continue the task; do not reread the "
+                        "document from line 1."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
     if request_file_cache.is_active(task_id):
         memo = request_file_cache.lookup(resolved_arg, offset, limit, task_id=task_id)
@@ -2292,6 +2347,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         parsed = json.loads(result)
     except (TypeError, ValueError):
         parsed = None
+
+    if isinstance(parsed, dict) and offset != requested_offset:
+        parsed["requested_offset"] = requested_offset
+        parsed["auto_advanced_offset"] = offset
+        parsed["auto_advanced_reason"] = "requested range already covered"
+        result = json.dumps(parsed, ensure_ascii=False)
 
     if request_file_cache.is_active(task_id):
         # Memoise only a real content read (full or partial). Errors and

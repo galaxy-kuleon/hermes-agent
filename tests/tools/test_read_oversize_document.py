@@ -100,6 +100,58 @@ class OversizeExtractedDocumentTests(unittest.TestCase):
             "no skipped line between the two reads",
         )
 
+    def test_stale_offset_auto_advances_to_first_uncovered_line(self):
+        paths = [str(self.path)]
+        handles = make_file_handles(paths)
+        with file_grant_scope("stale-offset", paths, handles=handles), (
+            request_file_cache.request_file_cache_scope("stale-offset")
+        ):
+            with patch("tools.file_tools._get_max_read_chars", return_value=_BUDGET):
+                first = json.loads(
+                    read_file_tool("F01", task_id="stale-offset", offset=1)
+                )
+                repeated_stale = json.loads(
+                    read_file_tool("F01", task_id="stale-offset", offset=1)
+                )
+
+        self.assertEqual(repeated_stale["requested_offset"], 1)
+        self.assertEqual(repeated_stale["auto_advanced_offset"], first["next_offset"])
+        self.assertEqual(
+            repeated_stale["consumed"]["start"],
+            first["next_offset"],
+        )
+        self.assertNotIn(
+            first["content"].splitlines()[0],
+            repeated_stale["content"],
+            "a stale offset must not reinsert the covered prefix",
+        )
+
+    def test_fully_covered_stale_offset_returns_compact_status(self):
+        paths = [str(self.path)]
+        handles = make_file_handles(paths)
+        with file_grant_scope("covered-offset", paths, handles=handles), (
+            request_file_cache.request_file_cache_scope("covered-offset")
+        ):
+            with patch("tools.file_tools._get_max_read_chars", return_value=_BUDGET):
+                offset = 1
+                while True:
+                    page = json.loads(
+                        read_file_tool(
+                            "F01", task_id="covered-offset", offset=offset
+                        )
+                    )
+                    if not page.get("truncated"):
+                        break
+                    offset = page["next_offset"]
+                repeated = json.loads(
+                    read_file_tool("F01", task_id="covered-offset", offset=1)
+                )
+
+        self.assertEqual(repeated["status"], "already_covered")
+        self.assertFalse(repeated["content_returned"])
+        self.assertEqual(repeated["coverage"], "read")
+        self.assertEqual(repeated["covered_ranges"], [[1, len(self.paragraphs)]])
+
     def test_pagination_extracts_the_document_only_once_per_request(self):
         paths = [str(self.path)]
         handles = make_file_handles(paths)
