@@ -2809,6 +2809,32 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+def _seed_agent_attachment_coverage(agent: Any, task_id: str) -> dict[str, int]:
+    """Rehydrate request ledger from this session's durable tool evidence."""
+    from tools.attachment_ledger import seed_from_tool_history
+
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is None or not session_id:
+        return {"tool_results": 0, "seeded_extents": 0, "seeded_unreadable": 0}
+    messages = session_db.get_messages(
+        session_id,
+        include_compacted=True,
+    )
+    stats = seed_from_tool_history(messages, task_id=task_id)
+    if stats.get("seeded_extents") or stats.get("seeded_unreadable"):
+        logger.info(
+            "attachment_coverage_rehydrated session_id=%s task_id=%s "
+            "tool_results=%s seeded_extents=%s seeded_unreadable=%s",
+            session_id,
+            task_id,
+            stats.get("tool_results", 0),
+            stats.get("seeded_extents", 0),
+            stats.get("seeded_unreadable", 0),
+        )
+    return stats
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -8983,6 +9009,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             granted_file_paths,
                             handles=make_file_handles(granted_file_paths),
                         ), request_file_cache_scope(effective_task_id):
+                            _seed_agent_attachment_coverage(
+                                agent, effective_task_id
+                            )
                             result = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
@@ -9545,6 +9574,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 granted_file_paths,
                                 handles=make_file_handles(granted_file_paths),
                             ), request_file_cache_scope(effective_task_id):
+                                _seed_agent_attachment_coverage(
+                                    agent, effective_task_id
+                                )
                                 run_result = agent.run_conversation(
                                     user_message=user_message,
                                     conversation_history=conversation_history,

@@ -25,6 +25,7 @@ from tools.attachment_ledger import (
     ranges_cover_total,
     record_outcome,
     record_read_extent,
+    seed_from_tool_history,
     terminal_coverage_suffix,
 )
 from tools.attachments_tool import attachments_tool
@@ -203,6 +204,65 @@ class AttachmentLedgerTests(unittest.TestCase):
             )
             ledger = json.loads(attachments_tool("t6"))
             self.assertEqual(ledger["files"][0]["status"], OUTCOME_PARTIAL)
+
+    def test_durable_tool_history_rehydrates_ranges_by_handle(self):
+        first = self.root / "001-aaaaaaaa-first.pdf"
+        second = self.root / "002-bbbbbbbb-second.pdf"
+        first.write_bytes(b"%PDF-1.4\n")
+        second.write_bytes(b"%PDF-1.4\n")
+        paths = [str(first), str(second)]
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": "F01"}),
+                        },
+                    },
+                    {
+                        "id": "call-2",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": "F02"}),
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "read_file",
+                "tool_call_id": "call-1",
+                "content": json.dumps(
+                    {
+                        "name": "lossy.pdf",
+                        "report_as": "partial",
+                        "consumed": {"unit": "lines", "start": 1, "end": 499, "total": 1000},
+                        "gaps": ["uncovered_lines=500-1000"],
+                    }
+                ),
+            },
+            {
+                "role": "tool",
+                "tool_name": "read_file",
+                "tool_call_id": "call-2",
+                "content": json.dumps(
+                    {
+                        "name": "lossy.pdf",
+                        "report_as": "read",
+                        "consumed": {"unit": "lines", "start": 1, "end": 20, "total": 20},
+                    }
+                ),
+            },
+        ]
+        with file_grant_scope("history", paths, handles=make_file_handles(paths)):
+            stats = seed_from_tool_history(messages, task_id="history")
+            self.assertEqual(stats["seeded_extents"], 2)
+            self.assertEqual(get_outcome(paths[0], task_id="history")["ranges"], [[1, 499]])
+            self.assertEqual(get_outcome(paths[0], task_id="history")["status"], OUTCOME_PARTIAL)
+            self.assertEqual(get_outcome(paths[1], task_id="history")["status"], OUTCOME_READ)
 
 
 class TruncatedReadExtentTests(unittest.TestCase):

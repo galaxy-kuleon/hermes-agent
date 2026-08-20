@@ -19,6 +19,7 @@ paginated reads stay ``partial``.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from contextlib import contextmanager
@@ -365,6 +366,104 @@ def seed_extension_unreadable(
     )
 
 
+def seed_from_tool_history(
+    messages: list[dict[str, Any]], *, task_id: str
+) -> dict[str, int]:
+    """Rebuild current-request coverage from durable prior read_file rows.
+
+    File grants are request-scoped, but a conversation may deliberately read a
+    large attachment over many user turns.  SessionDB already durably stores
+    both each read_file call (including its stable F01 handle) and its result.
+    Rehydrate that evidence into the fresh ledger instead of asking the model
+    to remember offsets across turns or context compression.
+    """
+    from tools.file_grants import list_file_handles
+
+    handle_paths = dict(list_file_handles(task_id) or [])
+    call_handles: dict[str, str] = {}
+    for message in messages or []:
+        calls = message.get("tool_calls") or []
+        if isinstance(calls, str):
+            try:
+                calls = json.loads(calls)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                calls = []
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get("function") or {}
+            if function.get("name") != "read_file":
+                continue
+            arguments = function.get("arguments") or {}
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    arguments = {}
+            raw_path = str(
+                (arguments or {}).get("path")
+                or (arguments or {}).get("file_path")
+                or (arguments or {}).get("file")
+                or ""
+            ).strip()
+            handle_match = re.fullmatch(r"#?(F\d{1,4})", raw_path, re.IGNORECASE)
+            if handle_match:
+                call_handles[str(call.get("id") or "")] = handle_match.group(1).upper()
+
+    stats = {"tool_results": 0, "seeded_extents": 0, "seeded_unreadable": 0}
+    decoder = json.JSONDecoder()
+    for message in messages or []:
+        if message.get("role") != "tool" or message.get("tool_name") != "read_file":
+            continue
+        handle = call_handles.get(str(message.get("tool_call_id") or ""), "")
+        path = handle_paths.get(handle)
+        if not path:
+            continue
+        try:
+            result, _ = decoder.raw_decode(str(message.get("content") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(result, dict):
+            continue
+        stats["tool_results"] += 1
+        if result.get("report_as") == OUTCOME_UNREADABLE or result.get("extraction_failed"):
+            record_outcome(
+                path,
+                task_id=task_id,
+                status=OUTCOME_UNREADABLE,
+                reason=str(result.get("error") or result.get("reason") or "prior extraction failed"),
+                gaps=[str(gap) for gap in result.get("gaps") or []],
+                handle=handle,
+                reader="read_file_history",
+            )
+            stats["seeded_unreadable"] += 1
+            continue
+        consumed = result.get("consumed") or {}
+        if consumed.get("start") is None or consumed.get("end") is None:
+            continue
+        format_gaps = [
+            str(gap)
+            for gap in result.get("gaps") or []
+            if not is_extent_gap(gap)
+        ]
+        record_read_extent(
+            path,
+            task_id=task_id,
+            start=int(consumed["start"]),
+            end=int(consumed["end"]),
+            total=(
+                int(consumed["total"])
+                if consumed.get("total") is not None
+                else None
+            ),
+            unit=str(consumed.get("unit") or "lines"),
+            format_gaps=format_gaps,
+            reason="rehydrated from durable read_file history",
+            handle=handle,
+            reader="read_file_history",
+        )
+        stats["seeded_extents"] += 1
+    return stats
+
+
 def coverage_snapshot(
     handles: list[tuple[str, str]],
     *,
@@ -649,6 +748,7 @@ __all__ = [
     "ranges_cover_total",
     "record_outcome",
     "record_read_extent",
+    "seed_from_tool_history",
     "seed_extension_unreadable",
     "terminal_coverage_suffix",
     "uncovered_summary",
