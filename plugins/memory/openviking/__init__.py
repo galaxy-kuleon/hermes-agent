@@ -94,6 +94,15 @@ _RECALL_QUERY_MIN_CHARS = 5
 _RECALL_MIN_TIMEOUT_SECONDS = 0.05
 _READ_BATCH_LIMIT = 3
 _READ_BATCH_FULL_LIMIT = 2500
+_DOCUMENT_REFERENCE_RE = re.compile(
+    r"(?:\b(?:document|file|source|pdf|docx|pptx|xlsx)\b|\bF\d{2}\b|文件|檔案|文檔|資料)",
+    re.IGNORECASE,
+)
+_DOCUMENT_COMPLETENESS_CLAIM_RE = re.compile(
+    r"(?:\b(?:fully|completely)\s+(?:read|reviewed|indexed|processed|analysed|analyzed|extracted)\b|"
+    r"(?:完整|完全)(?:讀取|閱讀|審閱|索引|處理|分析|擷取|提取))",
+    re.IGNORECASE,
+)
 _PROFILE_URI = "viking://user/memories/profile.md"
 _PREFERENCES_URI = "viking://user/memories/preferences"
 _ENTITIES_URI = "viking://user/memories/entities"
@@ -612,7 +621,10 @@ REMEMBER_SCHEMA = {
     "description": (
         "Explicitly store a fact or memory in the OpenViking knowledge base. "
         "Use for important information the agent should remember long-term. "
-        "The system automatically categorizes and indexes the memory."
+        "The system automatically categorizes and indexes the memory. Store "
+        "durable facts, not process-completeness claims such as a document "
+        "being fully read or indexed; attachment coverage belongs in the "
+        "authoritative coverage ledger."
     ),
     "parameters": {
         "type": "object",
@@ -5181,6 +5193,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
+        if (
+            _DOCUMENT_REFERENCE_RE.search(str(content))
+            and _DOCUMENT_COMPLETENESS_CLAIM_RE.search(str(content))
+        ):
+            return tool_error(
+                "Refusing to store an attachment process-completeness claim. "
+                "Store the durable document facts instead; use the attachment "
+                "coverage ledger for partial/full read state."
+            )
 
         category = args.get("category", "")
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)

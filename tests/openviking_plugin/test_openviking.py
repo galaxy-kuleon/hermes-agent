@@ -924,6 +924,40 @@ class TestEnsureClientReloadsEnv:
             "viking://user/peers/hermes/memories/"
         )
 
+    def test_remember_rejects_document_completeness_claim(self, monkeypatch):
+        class _StubClient:
+            def __init__(self, *args, **kwargs):
+                self.posts = []
+
+            def health(self):
+                return True
+
+            def post(self, path, payload=None, **kwargs):
+                self.posts.append((path, payload or {}))
+                return {"result": {"written_bytes": 1}}
+
+        monkeypatch.setattr("plugins.memory.openviking._VikingClient", _StubClient)
+        monkeypatch.setenv("OPENVIKING_ENDPOINT", "https://openviking.example")
+        monkeypatch.setenv("OPENVIKING_API_KEY", "sk-test")
+        provider = OpenVikingMemoryProvider()
+        provider.initialize("session-coverage-guard")
+
+        out = json.loads(
+            provider.handle_tool_call(
+                "viking_remember",
+                {
+                    "content": (
+                        "Document F02 was fully indexed for the legal library."
+                    ),
+                    "category": "entity",
+                },
+            )
+        )
+
+        assert "error" in out
+        assert "process-completeness" in out["error"]
+        assert provider._client.posts == []
+
     def test_concurrent_refresh_does_not_return_stale_client(self, monkeypatch):
         refresh_entered = threading.Event()
         release_refresh = threading.Event()
