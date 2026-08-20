@@ -303,7 +303,7 @@ def test_routed_review_fork_does_not_inherit_reasoning_config():
         "api_mode": None,
         "credential_pool": None,
         "request_overrides": {},
-        "max_tokens": None,
+        "max_tokens": 4096,
         "command": None,
         "args": [],
         "routed": True,
@@ -320,6 +320,9 @@ def test_routed_review_fork_does_not_inherit_reasoning_config():
         )
 
     init_kwargs = captured.get("init_kwargs", {})
+    assert init_kwargs.get("max_tokens") == 4096, (
+        "The resolved background-review output cap must reach the forked agent."
+    )
     assert "reasoning_config" not in init_kwargs, (
         f"Routed review fork was passed the parent's reasoning_config "
         f"({init_kwargs.get('reasoning_config')!r}). On the routed path the "
