@@ -29,6 +29,8 @@ from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_BACKGROUND_REVIEW_MAX_TOKENS = 4096
+
 
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
@@ -140,6 +142,14 @@ def _resolve_review_runtime(
     parent_api_mode = parent_runtime.get("api_mode") or None
     if parent_api_mode == "codex_app_server":
         parent_api_mode = "codex_responses"
+    task = _background_review_task_config(task_cfg)
+    configured_review_max = task.get("max_tokens")
+    if not isinstance(configured_review_max, int) or isinstance(configured_review_max, bool) or configured_review_max <= 0:
+        configured_review_max = _DEFAULT_BACKGROUND_REVIEW_MAX_TOKENS
+    parent_max = getattr(agent, "max_tokens", None)
+    if not isinstance(parent_max, int) or isinstance(parent_max, bool) or parent_max <= 0:
+        parent_max = configured_review_max
+
     parent = {
         "provider": agent.provider,
         "model": agent.model,
@@ -148,12 +158,11 @@ def _resolve_review_runtime(
         "api_mode": parent_api_mode,
         "credential_pool": getattr(agent, "_credential_pool", None),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
-        "max_tokens": getattr(agent, "max_tokens", None),
+        "max_tokens": min(parent_max, configured_review_max),
         "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
-    task = _background_review_task_config(task_cfg)
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
@@ -170,6 +179,9 @@ def _resolve_review_runtime(
             explicit_api_key=task_api_key,
             explicit_base_url=task_base_url,
         )
+        routed_max = rp.get("max_output_tokens")
+        if not isinstance(routed_max, int) or isinstance(routed_max, bool) or routed_max <= 0:
+            routed_max = configured_review_max
         return {
             "provider": rp.get("provider") or task_provider,
             "model": rp.get("model") or task_model,
@@ -178,7 +190,7 @@ def _resolve_review_runtime(
             "api_mode": rp.get("api_mode"),
             "credential_pool": rp.get("credential_pool"),
             "request_overrides": dict(rp.get("request_overrides") or {}),
-            "max_tokens": rp.get("max_output_tokens"),
+            "max_tokens": min(routed_max, configured_review_max),
             "command": rp.get("command"),
             "args": list(rp.get("args") or []),
             "routed": True,

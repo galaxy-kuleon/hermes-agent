@@ -1162,6 +1162,9 @@ DEFAULT_CONFIG = {
             # Master switch for automatic post-turn memory/skill review forks.
             # false = skip automatic spawns (manual /refine still works).
             "enabled": True,
+            # Review output is a small memory/skill decision, never a long-form
+            # deliverable. Bound runaway reasoning independently of context size.
+            "max_tokens": 4096,
             "provider": "auto",
             "model": "",
             "base_url": "",

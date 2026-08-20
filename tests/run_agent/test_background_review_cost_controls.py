@@ -50,6 +50,24 @@ def test_routing_auto_inherits_parent_and_downgrades_codex_app_server():
     assert rt["provider"] == "openai-codex"
     assert rt["model"] == "gpt-5.5"
     assert rt["api_mode"] == "codex_responses"  # downgraded so agent-loop tools dispatch
+    assert rt["max_tokens"] == br._DEFAULT_BACKGROUND_REVIEW_MAX_TOKENS
+
+
+def test_unrouted_review_output_is_bounded_below_parent_limit():
+    agent = _FakeAgent()
+    agent.max_tokens = 65536
+    cfg = {"auxiliary": {"background_review": {"max_tokens": 4096}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        rt = br._resolve_review_runtime(agent)
+    assert rt["max_tokens"] == 4096
+
+
+def test_review_output_cap_can_be_configured_explicitly():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {"max_tokens": 8192}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        rt = br._resolve_review_runtime(agent)
+    assert rt["max_tokens"] == 8192
 
 
 def test_routing_to_different_model_marks_routed_and_resolves_credentials():
