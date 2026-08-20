@@ -2360,12 +2360,14 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        self._persist_gateway_active_work()
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                self._persist_gateway_active_work()
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -2376,6 +2378,7 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        adapter._persist_gateway_active_work()
 
 
 @contextmanager
@@ -2387,6 +2390,7 @@ def _reserve_pending_api_work(adapter):
     """
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
+    adapter._persist_gateway_active_work()
     try:
         yield reservation
     finally:
@@ -3011,6 +3015,23 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return 0
 
+    def _persist_gateway_active_work(self) -> None:
+        """Publish API work transitions through the gateway's total counter.
+
+        API turns are adapter-owned, so they do not pass through the messaging
+        turn slots that normally refresh ``gateway_state.json``.  Persist at
+        the same admission/run boundaries used by shutdown draining; otherwise
+        a long OpenAI-compatible request is real work while every status reader
+        reports an idle gateway.
+        """
+        try:
+            persist = getattr(self.gateway_runner, "_persist_active_agents", None)
+            if callable(persist):
+                persist()
+        except Exception:
+            # Observability must never reject or terminate the observed turn.
+            pass
+
     def interrupt_active_runs(self, reason: str) -> int:
         """Cooperatively interrupt every adapter-owned agent during shutdown.
 
@@ -3096,7 +3117,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
-        active_api_runs = sum(
+        status_runs = sum(
             1
             for status in self._run_statuses.values()
             # "stopping" (set by _handle_stop_run) is not terminal: the run
@@ -3107,6 +3128,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # whole duration of a cooperative stop.
             if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
         )
+        # ``active_agent_work_count`` covers the OpenWebUI-facing
+        # /v1/chat/completions and /v1/responses paths as well as live run
+        # tasks.  The status map is kept as a fallback for a retained status
+        # whose task registry is temporarily unavailable during teardown.
+        active_api_runs = max(status_runs, self.active_agent_work_count())
         process_depth = 0
         active_delegations = 0
         try:
@@ -9138,6 +9164,7 @@ class APIServerAdapter(BasePlatformAdapter):
         journey_context = contextvars.copy_context()
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
+        self._persist_gateway_active_work()
         tracked_session_id = str(session_id or "")
         self._mark_session_run_started(tracked_session_id)
         try:
@@ -9147,6 +9174,7 @@ class APIServerAdapter(BasePlatformAdapter):
         finally:
             self._mark_session_run_finished(tracked_session_id)
             self._inflight_agent_runs -= 1
+            self._persist_gateway_active_work()
 
     async def _run_owned_in_executor(self, loop, func):
         """Keep API owner accounting until the worker really finishes."""
@@ -9744,10 +9772,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._persist_gateway_active_work()
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        self._persist_gateway_active_work()
         try:
             self._background_tasks.add(task)
         except TypeError:

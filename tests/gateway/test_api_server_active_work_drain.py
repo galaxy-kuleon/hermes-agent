@@ -322,6 +322,37 @@ def _make_async_noop():
 
 class TestRunAgentRegistersForShutdownInterrupt:
     @pytest.mark.asyncio
+    async def test_run_agent_publishes_busy_then_idle(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        observed_counts = []
+        adapter.gateway_runner = SimpleNamespace(
+            _persist_active_agents=lambda: observed_counts.append(
+                adapter.active_agent_work_count()
+            )
+        )
+        agent = MagicMock()
+        agent.session_id = None
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent._last_compaction_in_place = False
+        agent.run_conversation.return_value = {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+        }
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="s1",
+            )
+
+        assert observed_counts == [1, 0]
+
+    @pytest.mark.asyncio
     async def test_run_agent_registers_and_unregisters_the_agent(self):
         """One registration inside ``_run_agent`` covers all six of its callers.
 
@@ -609,4 +640,3 @@ class TestShutdownSettleWindow:
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
         ]
-

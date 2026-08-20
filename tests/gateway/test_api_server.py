@@ -852,6 +852,20 @@ class TestHealthDetailedEndpoint:
              patch("tools.async_delegation.active_count", return_value=0):
             assert adapter._readiness_work_counts() == (4, 0, 0)
 
+    def test_readiness_work_counts_include_openai_compatible_turns(self, adapter):
+        """OpenWebUI uses /v1/chat/completions, not /v1/runs.
+
+        A long document turn must therefore remain visible in detailed health
+        while its executor thread is active, even when the public run-status
+        registry is empty.
+        """
+        adapter._run_statuses = {}
+        adapter._inflight_agent_runs = 1
+
+        with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
+             patch("tools.async_delegation.active_count", return_value=0):
+            assert adapter._readiness_work_counts() == (1, 0, 0)
+
 
 # ---------------------------------------------------------------------------
 # /v1/models endpoint
