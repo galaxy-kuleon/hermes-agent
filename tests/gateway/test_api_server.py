@@ -398,7 +398,7 @@ class TestAgentExecution:
             "memory_policy": {
                 "self": {"enabled": True},
                 "peer": {"enabled": False},
-                "memory_types": ["profile", "preferences"],
+                "memory_types": ["profile", "preferences", "entities", "events"],
                 "working_memory": {"enabled": False},
             },
         }

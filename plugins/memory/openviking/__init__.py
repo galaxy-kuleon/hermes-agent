@@ -80,7 +80,10 @@ _TIMEOUT = 30.0
 _SESSION_DRAIN_TIMEOUT = 10.0
 _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
-_SESSION_COMMIT_MEMORY_TYPES = ("profile", "preferences")
+# Durable cross-chat recall needs user facts and dated facts, not only persona
+# prose. Cases, trajectories, experiences and working memory remain excluded so
+# one task's transient reasoning cannot crystallize as a global user fact.
+_SESSION_COMMIT_MEMORY_TYPES = ("profile", "preferences", "entities", "events")
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 _SYNC_TRACE_ENV = "HERMES_OPENVIKING_SYNC_TRACE"
 _DEFAULT_RECALL_LIMIT = 6

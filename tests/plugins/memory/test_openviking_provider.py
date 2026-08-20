@@ -1138,7 +1138,7 @@ def test_on_session_switch_commits_old_session_and_rotates_id():
             "memory_policy": {
                 "self": {"enabled": True},
                 "peer": {"enabled": False},
-                "memory_types": ["profile", "preferences"],
+                "memory_types": ["profile", "preferences", "entities", "events"],
                 "working_memory": {"enabled": False},
             },
         },
@@ -1236,7 +1236,7 @@ def test_end_then_switch_does_not_double_commit():
             "memory_policy": {
                 "self": {"enabled": True},
                 "peer": {"enabled": False},
-                "memory_types": ["profile", "preferences"],
+                "memory_types": ["profile", "preferences", "entities", "events"],
                 "working_memory": {"enabled": False},
             },
         },
@@ -1356,7 +1356,7 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
             "memory_policy": {
                 "self": {"enabled": True},
                 "peer": {"enabled": False},
-                "memory_types": ["profile", "preferences"],
+                "memory_types": ["profile", "preferences", "entities", "events"],
                 "working_memory": {"enabled": False},
             },
         },
