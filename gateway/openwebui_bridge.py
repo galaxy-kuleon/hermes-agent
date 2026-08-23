@@ -283,11 +283,11 @@ class OpenVikingURIBuilder:
 
     @classmethod
     def dreaming_run(cls, identifier: str) -> str:
-        return f"viking://user/default/signals/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.json"
+        return f"viking://user/default/control/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.json"
 
     @classmethod
     def dreaming_run_lock(cls, identifier: str) -> str:
-        return f"viking://user/default/signals/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.lock.json"
+        return f"viking://user/default/control/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.lock.json"
 
 
 @dataclass

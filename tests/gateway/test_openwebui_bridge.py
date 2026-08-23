@@ -581,7 +581,7 @@ async def test_dreaming_scheduler_starts_only_after_successful_api_start(monkeyp
         (OpenVikingURIBuilder.memory, ('alice', 'preferences', 'm1'), 'viking://user/alice/memories/preferences/m1.json'),
         (OpenVikingURIBuilder.tombstone, ('alice', 'm1'), 'viking://user/alice/memories/tombstones/m1.json'),
         (OpenVikingURIBuilder.org_insight, ('2026-05-10',), 'viking://resources/hermes/org-insights/2026-05-10.json'),
-        (OpenVikingURIBuilder.dreaming_run, ('2026-05-10',), 'viking://user/default/signals/hermes/dreaming-runs/2026-05-10.json'),
+        (OpenVikingURIBuilder.dreaming_run, ('2026-05-10',), 'viking://user/default/control/hermes/dreaming-runs/2026-05-10.json'),
     ],
 )
 def test_canonical_uri_builder(builder, args, expected):
