@@ -88,6 +88,7 @@ def test_file_toolset_split_backward_compatible():
     # grants, so it sits in file_read and must never reach file_write.
     assert set(resolve_toolset("file_read")) == {
         "read_file", "search_files", "local_document_export", "attachments",
+        "hk_legal_authority",
     }
     assert set(resolve_toolset("file_write")) == {"write_file", "patch"}
     assert set(resolve_toolset("file")) == {
