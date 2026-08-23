@@ -53,6 +53,19 @@ def test_query_detection_is_bounded_to_hong_kong_legal_requests():
     assert not is_hk_statutory_query({"content": "Explain US trademark law"})
 
 
+def test_declarative_project_memory_update_is_not_misclassified_as_legal_advice():
+    prompt = """Kindly update memory about the Forever Trainee Project.
+
+Legal framework supplied by the user:
+- Governing Law: Hong Kong law
+- HKIAC arbitration
+- Data Protection: comply with Hong Kong legal requirements
+
+Remember these project facts and raise any consistency question now.
+"""
+    assert not is_hk_statutory_query({"content": prompt})
+
+
 def test_old_turn_authority_cannot_ground_the_current_turn():
     messages = [
         {"role": "user", "content": "Hong Kong trademark law"},

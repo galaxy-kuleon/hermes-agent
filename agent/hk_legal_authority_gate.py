@@ -24,6 +24,15 @@ _LEGAL_RE = re.compile(
     r"\brule\s+\d|\bcap\.?\s*\d)",
     re.IGNORECASE,
 )
+_LEGAL_REQUEST_RE = re.compile(
+    r"(?:\b(?:advise|advice|analyse|analyze|explain|interpret|apply|challenge|"
+    r"oppose|invalidate)\b|\bwhat\s+can\s+i\s+do\b|\bunder\s+(?:the\s+)?law\b|"
+    r"\b(?:what|which|how)\b.{0,80}\b(?:law|legal|ordinance|statute|section|"
+    r"rule|trade\s*marks?|trademarks?)\b|法律意見|法律分析|如何|怎樣|怎样|怎麼|"
+    r"怎么|甚麼|什么|是否|能否|可否|應否|应否|解釋|解释|分析|查核|救濟|救济|"
+    r"侵權|侵权|無效|无效|反對|反对)",
+    re.IGNORECASE | re.DOTALL,
+)
 _TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
 _REGISTERED_RE = re.compile(r"(?:registered|registration|註冊|注册)", re.IGNORECASE)
 _REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "52", "53"})}
@@ -61,7 +70,9 @@ def _message_text(message: Any) -> str:
 def is_hk_statutory_query(user_message: Any) -> bool:
     """Conservatively identify requests that can create HK-law reliance."""
     text = _message_text(user_message)
-    return bool(_HK_RE.search(text) and _LEGAL_RE.search(text))
+    if not (_HK_RE.search(text) and _LEGAL_RE.search(text)):
+        return False
+    return bool(_LEGAL_REQUEST_RE.search(text) or "?" in text or "？" in text)
 
 
 def _json_objects(value: Any) -> Iterable[dict[str, Any]]:
