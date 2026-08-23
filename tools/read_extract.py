@@ -1,6 +1,8 @@
 """Stdlib document-to-text extraction for ``read_file``.
 
-Supports Jupyter notebooks, DOCX, and XLSX without adding hard dependencies.
+Supports Jupyter notebooks, DOCX, XLSX, and PDF without adding hard in-process
+PDF dependencies. PDF is always routed through the stack's Docling service so
+text PDFs and scanned/OCR PDFs share one observable extraction contract.
 When the optional ``firecrawl-anydoc`` package is installed (``pip install
 firecrawl-anydoc``, imports as ``anydoc``), coverage widens to legacy Office
 (.doc/.ppt/.xls), OpenDocument, RTF, EPUB, and PDF — converted to Markdown by
@@ -38,7 +40,8 @@ __all__ = [
 
 _LEGACY_EXTENSIONS = frozenset({".doc", ".xls", ".rtf"})
 EXTRACTABLE_EXTENSIONS = frozenset(
-    {".ipynb", ".docx", ".xlsx", ".msg", ".eml"} | _LEGACY_EXTENSIONS
+    {".ipynb", ".docx", ".xlsx", ".msg", ".eml", ".pdf"}
+    | _LEGACY_EXTENSIONS
 )
 # Formats handled only when the optional anydoc converter is installed.
 ANYDOC_EXTENSIONS = frozenset({
@@ -161,6 +164,13 @@ def extract_document_text(path: str, *, gaps_out: list[str] | None = None) -> st
         text, gaps = _extract_eml_body(path)
         if gaps_out is not None:
             gaps_out.extend(gaps)
+    elif ext == ".pdf":
+        # PDF must not fall through to AnyDoc: its text-layer-only conversion
+        # made scanned pages look unreadable and orphaned the robust Docling
+        # OCR adapter from the real read_file caller.
+        from tools.pdf_extract import extract_pdf_text
+
+        text = extract_pdf_text(path)
     elif ext in ANYDOC_EXTENSIONS:
         text = _extract_anydoc(path)
     else:
@@ -180,6 +190,21 @@ def extract_document_bytes(
         )
     ext = _extension(path)
     if ext in _LEGACY_EXTENSIONS:
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as fh:
+                fh.write(data)
+                temp_path = fh.name
+            return strip_inline_base64_images(
+                extract_document_text(temp_path, gaps_out=gaps_out), source=path
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+    if ext == ".pdf":
         temp_path = ""
         try:
             with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as fh:

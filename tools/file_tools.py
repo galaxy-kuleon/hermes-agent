@@ -3,6 +3,7 @@
 
 import base64
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +35,19 @@ _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 # Path B writes attachments as "<3-digit ordinal>-<8-hex nonce>-<name>"; only
 # the trailing part is meaningful when naming a file back to the model.
 _HANDOFF_NAME_PREFIX_RE = re.compile(r"^\d{3}-[0-9a-f]{8}-")
+_SOURCE_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _sha256_file(path: str) -> str:
+    """Return the full server-observed source digest without loading it twice."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(_SOURCE_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 def _expand_tilde(path: str) -> str:
     """Expand ``~`` using the effective profile home when available.
@@ -2348,6 +2362,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     except (TypeError, ValueError):
         parsed = None
 
+    if isinstance(parsed, dict) and handle:
+        source = parsed.get("source")
+        if isinstance(source, dict):
+            source["request_handle"] = handle
+            result = json.dumps(parsed, ensure_ascii=False)
+
     if isinstance(parsed, dict) and offset != requested_offset:
         parsed["requested_offset"] = requested_offset
         parsed["auto_advanced_offset"] = offset
@@ -2594,6 +2614,9 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     extracted_text = str(cached_document.get("text") or "")
                     file_size = int(cached_document.get("file_size") or 0)
                     document_gaps = list(cached_document.get("gaps") or [])
+                    source_sha256 = str(
+                        cached_document.get("source_sha256") or ""
+                    )
                 elif (
                     _file_ops_uses_host_paths(file_ops)
                     and os.path.isfile(resolved_path)
@@ -2610,12 +2633,14 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     extracted_text = extract_document_text(
                         resolved_path, gaps_out=document_gaps
                     )
+                    source_sha256 = _sha256_file(resolved_path)
                     request_file_cache.remember_document(
                         resolved_path,
                         task_id=task_id,
                         text=extracted_text,
                         file_size=file_size,
                         gaps=document_gaps,
+                        source_sha256=source_sha256,
                     )
                 else:
                     binary = file_ops.read_file_bytes(
@@ -2629,6 +2654,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         binary.base64_content, validate=True
                     )
                     file_size = getattr(binary, "file_size", len(document_bytes))
+                    source_sha256 = hashlib.sha256(document_bytes).hexdigest()
                     extracted_text = extract_document_bytes(
                         document_bytes, resolved_path, gaps_out=document_gaps
                     )
@@ -2638,8 +2664,14 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         text=extracted_text,
                         file_size=file_size,
                         gaps=document_gaps,
+                        source_sha256=source_sha256,
                     )
-            except (ExtractionError, ValueError, base64.binascii.Error) as exc:
+            except (
+                ExtractionError,
+                OSError,
+                ValueError,
+                base64.binascii.Error,
+            ) as exc:
                 reason = str(exc).strip() or type(exc).__name__
                 logger.warning(
                     "document_extraction_failed task=%s ext=%s kind=%s reason=%s",
@@ -2734,7 +2766,31 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                         "end": consumed_end,
                         "total": total_lines,
                     },
+                    "source": {
+                        "request_handle": handle_for_ledger or None,
+                        "sha256": source_sha256,
+                        "bytes": file_size,
+                        "representation": (
+                            "docling_markdown_or_text_with_ocr"
+                            if ext == ".pdf"
+                            else "converter_extracted_text"
+                        ),
+                        "extent": {
+                            "unit": "lines",
+                            "start": offset,
+                            "end": consumed_end,
+                            "total": total_lines,
+                        },
+                    },
                 }
+                if ext == ".pdf":
+                    from tools.pdf_extract import PDF_PAGE_BREAK_PLACEHOLDER
+
+                    result_dict["source"]["document_extent"] = {
+                        "unit": "pages",
+                        "total": extracted_text.count(PDF_PAGE_BREAK_PLACEHOLDER) + 1,
+                        "boundary_marker": PDF_PAGE_BREAK_PLACEHOLDER,
+                    }
                 result_gaps = list(format_gaps)
                 if has_more:
                     result_gaps.append(
@@ -3768,7 +3824,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue until coverage is complete before concluding. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted. PDFs always use the stack's Docling text/OCR adapter; converter-produced inline base64 images are permanently removed before model context. Legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB use the optional AnyDoc converter. NOTE: Cannot read standalone images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {

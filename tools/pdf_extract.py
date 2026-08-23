@@ -64,6 +64,13 @@ _MULTIPART_FIELD = "files"  # docling /v1/convert/file expects field name "files
 # (image_000000_<sha>.png) that resolve nowhere from here, so the agent would
 # get 50 dead links; read_file wants text, so placeholder is the honest mode.
 _DOCLING_IMAGE_EXPORT_MODE = os.environ.get("HERMES_DOCLING_IMAGE_EXPORT_MODE", "placeholder")
+PDF_PAGE_BREAK_PLACEHOLDER = "<!-- hermes-pdf-page-break -->"
+_DOCLING_TIMEOUT_RESERVE_SECONDS = int(
+    os.environ.get("HERMES_DOCLING_TIMEOUT_RESERVE_SECONDS", "300")
+)
+_DOCLING_SERVER_MAX_DOCUMENT_SECONDS = int(
+    os.environ.get("HERMES_DOCLING_SERVER_MAX_DOCUMENT_TIMEOUT", "10800")
+)
 # docling serves a bounded number of conversions at once; anything beyond that
 # waits inside the service, and a client timeout measured across the wait fails
 # work that was never going to be slow.
@@ -114,20 +121,38 @@ def is_pdf(path) -> bool:
     return Path(str(path)).suffix.lower() == PDF_EXTENSION
 
 
-def _build_multipart_body(filename: str, data: bytes) -> bytes:
-    b = _MULTIPART_BOUNDARY
-    field = (
-        f"--{b}\r\n"
-        f'Content-Disposition: form-data; name="image_export_mode"\r\n\r\n'
-        f"{_DOCLING_IMAGE_EXPORT_MODE}\r\n"
+def _multipart_field(name: str, value: str) -> bytes:
+    return (
+        f"--{_MULTIPART_BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{value}\r\n"
     ).encode("utf-8")
+
+
+def _build_multipart_body(
+    filename: str,
+    data: bytes,
+    *,
+    document_timeout_seconds: int | None = None,
+) -> bytes:
+    b = _MULTIPART_BOUNDARY
+    fields = b"".join([
+        _multipart_field("image_export_mode", _DOCLING_IMAGE_EXPORT_MODE),
+        _multipart_field("do_ocr", "true"),
+        _multipart_field("include_images", "false"),
+        _multipart_field("md_page_break_placeholder", PDF_PAGE_BREAK_PLACEHOLDER),
+    ])
+    if document_timeout_seconds is not None:
+        fields += _multipart_field(
+            "document_timeout", str(int(document_timeout_seconds))
+        )
     head = (
         f"--{b}\r\n"
         f'Content-Disposition: form-data; name="{_MULTIPART_FIELD}"; filename="{filename}"\r\n'
         f"Content-Type: application/pdf\r\n\r\n"
     ).encode("utf-8")
     tail = f"\r\n--{b}--\r\n".encode("utf-8")
-    return field + head + data + tail
+    return fields + head + data + tail
 
 
 def extract_pdf_text(path) -> str:
@@ -152,7 +177,16 @@ def extract_pdf_text(path) -> str:
     except OSError as exc:
         raise ExtractionError(str(exc)) from exc
 
-    body = _build_multipart_body(Path(p).name, data)
+    request_timeout = _timeout_for(size)
+    document_timeout = min(
+        _DOCLING_SERVER_MAX_DOCUMENT_SECONDS,
+        max(1, request_timeout - _DOCLING_TIMEOUT_RESERVE_SECONDS),
+    )
+    body = _build_multipart_body(
+        Path(p).name,
+        data,
+        document_timeout_seconds=document_timeout,
+    )
     req = urllib.request.Request(
         f"{_DOCLING_URL}{_DOCLING_CONVERT_PATH}",
         data=body,
@@ -185,7 +219,7 @@ def extract_pdf_text(path) -> str:
         except Exception:  # observability must not cost the user their document
             pass
         try:
-            with urllib.request.urlopen(req, timeout=_timeout_for(size)) as resp:
+            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         except Exception as exc:  # URLError, timeout, JSON error — fail closed
             # Every failure leaves a record where it happens, not just the
@@ -226,7 +260,7 @@ def extract_pdf_text(path) -> str:
                   "sidecar_failed service=docling outcome=bad_text kind=%s bytes=%d",
                   type(text).__name__, size)
         raise ExtractionError(f"docling returned {type(text).__name__} content")
-    if not text.strip():
+    if not text.replace(PDF_PAGE_BREAK_PLACEHOLDER, "").strip():
         # The user sees "unreadable" for a scan with no OCR text. That is a
         # different failure from a busy sidecar and must not read the same.
         _safe_log(_log.warning,

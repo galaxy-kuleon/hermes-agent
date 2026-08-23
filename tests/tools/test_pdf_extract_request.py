@@ -38,9 +38,27 @@ class PdfExtractRequestTests(unittest.TestCase):
         self.assertIn(b'name="image_export_mode"', body)
         self.assertIn(b"placeholder", body)
         self.assertNotIn(b"embedded", body)
+        self.assertIn(b'name="do_ocr"\r\n\r\ntrue', body)
+        self.assertIn(b'name="include_images"\r\n\r\nfalse', body)
+        self.assertIn(pdf_extract.PDF_PAGE_BREAK_PLACEHOLDER.encode(), body)
         # the file part must survive alongside the new field
         self.assertIn(b'name="files"; filename="claim.pdf"', body)
         self.assertIn(b"%PDF-1.4 bytes", body)
+
+    def test_inner_document_timeout_is_below_outer_http_timeout(self):
+        size = 82_890_519
+        outer = pdf_extract._timeout_for(size)
+        inner = min(
+            pdf_extract._DOCLING_SERVER_MAX_DOCUMENT_SECONDS,
+            max(1, outer - pdf_extract._DOCLING_TIMEOUT_RESERVE_SECONDS),
+        )
+        body = pdf_extract._build_multipart_body(
+            "claim.pdf", b"%PDF", document_timeout_seconds=inner
+        )
+        self.assertLess(inner, outer)
+        self.assertIn(
+            f'name="document_timeout"\r\n\r\n{inner}'.encode(), body
+        )
 
     def test_timeout_grows_with_the_file_and_stays_bounded(self):
         small = pdf_extract._timeout_for(1 * 1024 * 1024)

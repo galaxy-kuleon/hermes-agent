@@ -19,6 +19,7 @@ Run with:  python -m pytest tests/tools/test_read_oversize_document.py -v
 """
 
 import json
+import hashlib
 import os
 import sys
 import tempfile
@@ -78,6 +79,13 @@ class OversizeExtractedDocumentTests(unittest.TestCase):
         self.assertEqual(result.get("report_as"), "partial")
         # The first paragraph is what a summary prompt needs first.
         self.assertIn("Paragraph 1 of the judgment", result["content"])
+        self.assertEqual(result["source"]["request_handle"], "F01")
+        self.assertEqual(
+            result["source"]["sha256"],
+            hashlib.sha256(self.path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(result["source"]["representation"], "converter_extracted_text")
+        self.assertEqual(result["source"]["extent"], result["consumed"])
 
     def test_it_says_exactly_where_to_resume(self):
         result = self._read()

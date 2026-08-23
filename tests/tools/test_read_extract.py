@@ -73,12 +73,12 @@ class TestIsExtractable(unittest.TestCase):
         self.assertFalse(is_extractable_document("a.mp4"))
 
     def test_anydoc_extensions_track_availability(self):
-        """PDF (and the other anydoc formats) are extractable exactly when
-        the optional `anydoc` converter is importable."""
+        """PDF is always extractable through Docling; AnyDoc-only formats
+        still track the optional converter's availability."""
         from tools import read_extract
 
         available = read_extract._anydoc() is not None
-        self.assertEqual(is_extractable_document("a.pdf"), available)
+        self.assertTrue(is_extractable_document("a.pdf"))
         self.assertEqual(is_extractable_document("a.odt"), available)
         self.assertEqual(is_extractable_document("a.epub"), available)
 
@@ -209,9 +209,9 @@ class TestAnydocAbsent(unittest.TestCase):
 
         read_extract._anydoc_module = self._saved
 
-    def test_pdf_not_extractable_without_anydoc(self):
-        self.assertFalse(is_extractable_document("a.pdf"))
-        self.assertFalse(is_extractable_document("a.rtf"))
+    def test_pdf_remains_extractable_without_anydoc(self):
+        self.assertTrue(is_extractable_document("a.pdf"))
+        self.assertTrue(is_extractable_document("a.rtf"))
 
     def test_extract_raises_unsupported_without_anydoc(self):
         from tools.read_extract import _extract_anydoc
@@ -626,7 +626,7 @@ class TestReadFileToolIntegration(unittest.TestCase):
         rex._anydoc_module = _FakeAnydoc()
         rex.MAX_ANYDOC_BYTES = 10
         try:
-            p = os.path.join(self.tmp, "big.pdf")
+            p = os.path.join(self.tmp, "big.epub")
             with open(p, "wb") as fh:
                 fh.write(b"x" * 11)
             res = json.loads(read_file_tool(p))
@@ -638,28 +638,25 @@ class TestReadFileToolIntegration(unittest.TestCase):
             rex.MAX_ANYDOC_BYTES = saved_cap
             rex._anydoc_module = saved_module
 
-    def test_unavailable_converter_falls_back_to_raw_read(self):
-        import time
-
+    def test_pdf_uses_docling_even_when_anydoc_is_unavailable(self):
         import tools.read_extract as rex
 
         saved_module = rex._anydoc_module
-        saved_failed_at = rex._anydoc_failed_at
-        # Simulate "converter unavailable and in cooldown": _anydoc() returns
-        # None, the .pdf is not treated as extractable, and read_file keeps
-        # its historical raw-read fallthrough (no extraction error surfaced).
         rex._anydoc_module = None
-        rex._anydoc_failed_at = time.monotonic()
         try:
             p = os.path.join(self.tmp, "doc.pdf")
             with open(p, "wb") as fh:
                 fh.write(b"%PDF-1.4 fake")
-            res = json.loads(read_file_tool(p))
-            self.assertNotIn("error", res)
-            self.assertIn("%PDF-1.4 fake", res.get("content", ""))
+            with mock.patch(
+                "tools.pdf_extract.extract_pdf_text",
+                return_value="OCR text from scanned page\n",
+            ) as docling:
+                res = json.loads(read_file_tool(p))
+            self.assertTrue(res.get("extracted_document"))
+            self.assertIn("OCR text from scanned page", res.get("content", ""))
+            docling.assert_called_once_with(os.path.realpath(p))
         finally:
             rex._anydoc_module = saved_module
-            rex._anydoc_failed_at = saved_failed_at
 
     def test_docx_read_extracts(self):
         p = os.path.join(self.tmp, "d.docx")
@@ -674,7 +671,7 @@ class TestReadFileToolIntegration(unittest.TestCase):
         from tools import file_tools, read_extract
         from tools.file_operations import ReadResult
 
-        payload = br"{\rtf1\ansi Remote body\par}"
+        payload = b"remote EPUB bytes"
 
         class FakeAnydoc:
             def to_markdown_bytes(self, data):
@@ -706,16 +703,16 @@ class TestReadFileToolIntegration(unittest.TestCase):
                     mock.patch.object(
                         file_tools,
                         "_resolve_path_for_task",
-                        return_value=file_tools.PurePosixPath("/workspace/remote.rtf"),
+                        return_value=file_tools.PurePosixPath("/workspace/remote.epub"),
                     ), mock.patch("os.path.getsize", side_effect=AssertionError("host read")):
-                res = json.loads(read_file_tool("/workspace/remote.rtf", task_id="remote"))
+                res = json.loads(read_file_tool("/workspace/remote.epub", task_id="remote"))
         finally:
             read_extract._anydoc_module = saved_module
 
         self.assertTrue(res.get("extracted_document"))
         self.assertIn("Remote body", res["content"])
         self.assertEqual(fake_anydoc.seen, payload)
-        self.assertEqual(fake_ops.path, "/workspace/remote.rtf")
+        self.assertEqual(fake_ops.path, "/workspace/remote.epub")
 
 
 # ---------------------------------------------------------------------------

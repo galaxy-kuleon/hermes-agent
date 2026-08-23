@@ -157,6 +157,7 @@ def remember_document(
     text: str,
     file_size: int,
     gaps: list[str] | None = None,
+    source_sha256: str = "",
 ) -> bool:
     """Cache one extraction so later offsets do not rerun Docling/anydoc."""
     documents = _documents(task_id)
@@ -174,6 +175,7 @@ def remember_document(
         "text": text,
         "file_size": int(file_size),
         "gaps": list(gaps or []),
+        "source_sha256": str(source_sha256 or ""),
     }
     return True
 
