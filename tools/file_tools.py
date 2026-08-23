@@ -2320,32 +2320,36 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     resolved_arg = resolve_grant_alias(path, task_id=task_id)
     handle = str(path).strip() if resolved_arg != str(path) else ""
     requested_offset = offset
-    offset, prior_coverage = _advance_past_covered_lines(
-        resolved_arg,
-        offset=offset,
-        task_id=task_id,
+    refill_after_compression = request_file_cache.consume_invalidation(
+        resolved_arg, task_id=task_id
     )
-    if offset != requested_offset:
-        total = prior_coverage.get("extent_total") if prior_coverage else None
-        if isinstance(total, int) and offset > total:
-            return json.dumps(
-                {
-                    "status": "already_covered",
-                    "content_returned": False,
-                    "path": handle or str(path),
-                    "requested_offset": requested_offset,
-                    "coverage": prior_coverage.get("status"),
-                    "covered_ranges": prior_coverage.get("ranges") or [],
-                    "total_lines": total,
-                    "gaps": prior_coverage.get("gaps") or [],
-                    "hint": (
-                        "Every line is already covered in this request. Use the "
-                        "earlier result or continue the task; do not reread the "
-                        "document from line 1."
-                    ),
-                },
-                ensure_ascii=False,
-            )
+    if not refill_after_compression:
+        offset, prior_coverage = _advance_past_covered_lines(
+            resolved_arg,
+            offset=offset,
+            task_id=task_id,
+        )
+        if offset != requested_offset:
+            total = prior_coverage.get("extent_total") if prior_coverage else None
+            if isinstance(total, int) and offset > total:
+                return json.dumps(
+                    {
+                        "status": "already_covered",
+                        "content_returned": False,
+                        "path": handle or str(path),
+                        "requested_offset": requested_offset,
+                        "coverage": prior_coverage.get("status"),
+                        "covered_ranges": prior_coverage.get("ranges") or [],
+                        "total_lines": total,
+                        "gaps": prior_coverage.get("gaps") or [],
+                        "hint": (
+                            "Every line is already covered in this request. Use the "
+                            "earlier result or continue the task; do not reread the "
+                            "document from line 1."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
 
     if request_file_cache.is_active(task_id):
         memo = request_file_cache.lookup(resolved_arg, offset, limit, task_id=task_id)
@@ -2604,7 +2608,8 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
             binary = None
             document_bytes = b""
             document_gaps: list[str] = []
-            from tools import request_file_cache
+            extraction_cache_kind = "request"
+            from tools import document_extract_cache, request_file_cache
 
             cached_document = request_file_cache.lookup_document(
                 resolved_path, task_id=task_id
@@ -2628,12 +2633,29 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                             f"({file_size:,} bytes, limit is "
                             f"{MAX_DOCUMENT_BYTES:,})"
                         )
-                    # Avoid the old 4/3 base64 transport expansion for local
-                    # 80+ MB PDFs. anydoc reads the path directly.
-                    extracted_text = extract_document_text(
-                        resolved_path, gaps_out=document_gaps
-                    )
                     source_sha256 = _sha256_file(resolved_path)
+                    ext = Path(resolved_path).suffix.lower()
+                    with document_extract_cache.extraction_lock(source_sha256, ext):
+                        persistent = document_extract_cache.lookup(source_sha256, ext)
+                        if persistent is not None:
+                            extracted_text = str(persistent["text"])
+                            document_gaps = list(persistent.get("gaps") or [])
+                            file_size = int(persistent.get("file_size") or file_size)
+                            extraction_cache_kind = "persistent"
+                        else:
+                            # Avoid the old 4/3 base64 transport expansion for
+                            # local 80+ MB PDFs. anydoc reads the path directly.
+                            extracted_text = extract_document_text(
+                                resolved_path, gaps_out=document_gaps
+                            )
+                            document_extract_cache.remember(
+                                source_sha256,
+                                ext,
+                                text=extracted_text,
+                                file_size=file_size,
+                                gaps=document_gaps,
+                            )
+                            extraction_cache_kind = "miss"
                     request_file_cache.remember_document(
                         resolved_path,
                         task_id=task_id,
@@ -2655,9 +2677,26 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     )
                     file_size = getattr(binary, "file_size", len(document_bytes))
                     source_sha256 = hashlib.sha256(document_bytes).hexdigest()
-                    extracted_text = extract_document_bytes(
-                        document_bytes, resolved_path, gaps_out=document_gaps
-                    )
+                    ext = Path(resolved_path).suffix.lower()
+                    with document_extract_cache.extraction_lock(source_sha256, ext):
+                        persistent = document_extract_cache.lookup(source_sha256, ext)
+                        if persistent is not None:
+                            extracted_text = str(persistent["text"])
+                            document_gaps = list(persistent.get("gaps") or [])
+                            file_size = int(persistent.get("file_size") or file_size)
+                            extraction_cache_kind = "persistent"
+                        else:
+                            extracted_text = extract_document_bytes(
+                                document_bytes, resolved_path, gaps_out=document_gaps
+                            )
+                            document_extract_cache.remember(
+                                source_sha256,
+                                ext,
+                                text=extracted_text,
+                                file_size=file_size,
+                                gaps=document_gaps,
+                            )
+                            extraction_cache_kind = "miss"
                     request_file_cache.remember_document(
                         resolved_path,
                         task_id=task_id,
@@ -2760,6 +2799,7 @@ def _read_file_tool_impl(path: str, offset: int, limit: int, task_id: str) -> st
                     "report_as": report_as,
                     "coverage": report_as,
                     "name": display,
+                    "extraction_cache": extraction_cache_kind,
                     "consumed": {
                         "unit": "lines",
                         "start": offset,

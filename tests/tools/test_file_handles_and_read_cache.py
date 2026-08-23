@@ -155,7 +155,7 @@ class ReadFileHandleAndCacheTests(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertIn("line two", result["content"])
 
-    def test_second_identical_read_returns_a_memo_not_the_text(self):
+    def test_second_identical_read_returns_compact_coverage_not_the_text(self):
         handles = make_file_handles([str(self.path)])
         with file_grant_scope("task-1", [str(self.path)], handles=handles), (
             request_file_cache.request_file_cache_scope("task-1")
@@ -166,11 +166,10 @@ class ReadFileHandleAndCacheTests(unittest.TestCase):
 
         self.assertIn("line two", first["content"])
         for repeat in (second, third):
-            self.assertTrue(repeat.get("already_read"))
+            self.assertEqual(repeat["status"], "already_covered")
+            self.assertFalse(repeat["content_returned"])
             self.assertNotIn("content", repeat)
-            self.assertIn("already read", repeat["note"])
-        # The memo must identify the file well enough to be actionable.
-        self.assertIn("F01", second["note"])
+            self.assertIn("earlier result", repeat["hint"])
 
     def test_a_different_offset_is_not_a_repeat(self):
         from tools.file_tools import read_file_tool
@@ -182,7 +181,8 @@ class ReadFileHandleAndCacheTests(unittest.TestCase):
             json.loads(read_file_tool("F01", task_id="task-1"))
             paged = json.loads(read_file_tool("F01", offset=2, task_id="task-1"))
         self.assertFalse(paged.get("already_read"))
-        self.assertIn("line two", paged["content"])
+        self.assertEqual(paged["status"], "already_covered")
+        self.assertFalse(paged["content_returned"])
 
     def test_memo_does_not_outlive_the_request(self):
         # A later turn may run in a fresh session whose context no longer holds
@@ -201,16 +201,16 @@ class ReadFileHandleAndCacheTests(unittest.TestCase):
                 )
             )
 
-    def test_without_a_cache_scope_the_legacy_dedup_still_owns_repeats(self):
-        # No request scope (CLI/TUI) must leave the pre-existing per-task
-        # (path, offset, limit) dedup in charge, byte-for-byte as before.
+    def test_without_a_cache_scope_coverage_prevents_repeats(self):
+        # No request scope (CLI/TUI) still uses authoritative coverage to avoid
+        # returning a fully consumed file a second time.
         handles = make_file_handles([str(self.path)])
         with file_grant_scope("task-9", [str(self.path)], handles=handles):
             first = self._read("F01", task_id="task-9")
             second = self._read("F01", task_id="task-9")
         self.assertIn("line two", first["content"])
         self.assertNotIn("already_read", first)
-        self.assertTrue(second.get("dedup"))
+        self.assertEqual(second["status"], "already_covered")
         self.assertFalse(second.get("content_returned"))
         self.assertNotIn("already_read", second)
 
@@ -426,18 +426,15 @@ class ExtractedDocumentRepeatTests(unittest.TestCase):
 
         return json.loads(read_file_tool(arg, task_id=task_id))
 
-    def test_legacy_dedup_does_not_cover_extracted_documents(self):
-        # Characterisation of the defect, so a future reorder is a visible
-        # change rather than a silent one.
+    def test_coverage_prevents_reextract_without_a_request_memo(self):
         with file_grant_scope("task-doc-legacy", [str(self.docx)]):
             first = self._read(str(self.docx), "task-doc-legacy")
             second = self._read(str(self.docx), "task-doc-legacy")
         self.assertTrue(first.get("extracted_document"))
-        self.assertTrue(second.get("extracted_document"))
-        self.assertIn("Registrar of Trade Marks", second["content"])
-        self.assertFalse(second.get("dedup"))
+        self.assertEqual(second["status"], "already_covered")
+        self.assertFalse(second["content_returned"])
 
-    def test_request_memo_does_cover_extracted_documents(self):
+    def test_request_coverage_does_cover_extracted_documents(self):
         handles = make_file_handles([str(self.docx)])
         with file_grant_scope("task-doc-memo", [str(self.docx)], handles=handles), (
             request_file_cache.request_file_cache_scope("task-doc-memo")
@@ -445,8 +442,41 @@ class ExtractedDocumentRepeatTests(unittest.TestCase):
             first = self._read("F01", "task-doc-memo")
             second = self._read("F01", "task-doc-memo")
         self.assertIn("Registrar of Trade Marks", first["content"])
-        self.assertTrue(second.get("already_read"))
+        self.assertEqual(second["status"], "already_covered")
+        self.assertFalse(second["content_returned"])
         self.assertNotIn("content", second)
+
+    def test_same_bytes_reuse_extraction_across_requests_and_paths(self):
+        import shutil
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from tools.read_extract import extract_document_text as real_extract
+
+        second_path = Path(self._tmp.name) / "002-b485f245-renamed.docx"
+        shutil.copyfile(self.docx, second_path)
+
+        with patch(
+            "tools.read_extract.extract_document_text",
+            wraps=real_extract,
+        ) as extract:
+            first_handles = make_file_handles([str(self.docx)])
+            with file_grant_scope(
+                "task-doc-first", [str(self.docx)], handles=first_handles
+            ), request_file_cache.request_file_cache_scope("task-doc-first"):
+                first = self._read("F01", "task-doc-first")
+
+            second_handles = make_file_handles([str(second_path)])
+            with file_grant_scope(
+                "task-doc-second", [str(second_path)], handles=second_handles
+            ), request_file_cache.request_file_cache_scope("task-doc-second"):
+                second = self._read("F01", "task-doc-second")
+
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(first["extraction_cache"], "miss")
+        self.assertEqual(second["extraction_cache"], "persistent")
+        self.assertIn("Registrar of Trade Marks", second["content"])
+        self.assertEqual(first["source"]["sha256"], second["source"]["sha256"])
 
     def test_five_files_read_round_robin_are_each_read_once(self):
         # The exact live pattern: F01..F05 then F01..F05 again. Interleaving
@@ -473,7 +503,7 @@ class ExtractedDocumentRepeatTests(unittest.TestCase):
 
         self.assertTrue(all("content" in r for r in first_pass))
         for pass_results in (second_pass, third_pass):
-            self.assertTrue(all(r.get("already_read") for r in pass_results))
+            self.assertTrue(all(r.get("status") == "already_covered" for r in pass_results))
             self.assertFalse(any("content" in r for r in pass_results))
 
 
@@ -529,7 +559,7 @@ class MemoCompressionInvalidationTests(unittest.TestCase):
             after = self._read("F01")
 
         self.assertIn("unique body marker", first["content"])
-        self.assertTrue(memoed.get("already_read"))
+        self.assertEqual(memoed["status"], "already_covered")
         self.assertNotIn("content", memoed)
         # The whole point: once the earlier result may be gone, a repeat read
         # must return the text rather than pointing at something absent.
@@ -546,7 +576,9 @@ class MemoCompressionInvalidationTests(unittest.TestCase):
             self._read("F01", "task-c")
             self._read("F01", "task-d")
             self._clear("task-c")
-            self.assertTrue(self._read("F01", "task-d").get("already_read"))
+            self.assertEqual(
+                self._read("F01", "task-d")["status"], "already_covered"
+            )
             self.assertIn("unique body marker", self._read("F01", "task-c")["content"])
 
     def test_invalidate_is_safe_without_a_scope(self):

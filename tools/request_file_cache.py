@@ -48,6 +48,9 @@ _CACHE: ContextVar[dict[str, dict[tuple[str, int, int], dict[str, object]]] | No
 _DOCUMENT_CACHE: ContextVar[dict[str, dict[str, dict[str, object]]] | None] = (
     ContextVar("request_document_extract_cache", default=None)
 )
+_INVALIDATED_PATHS: ContextVar[dict[str, set[str]] | None] = ContextVar(
+    "request_file_invalidated_paths", default=None
+)
 
 # A memo is metadata only (never content), so this bound exists to stop a
 # pathological turn from growing the dict without limit, not to save memory.
@@ -80,9 +83,14 @@ def request_file_cache_scope(task_id: str) -> Iterator[None]:
     updated_documents = dict(current_documents)
     updated_documents[key] = {}
     document_token = _DOCUMENT_CACHE.set(updated_documents)
+    current_invalidated = _INVALIDATED_PATHS.get() or {}
+    updated_invalidated = dict(current_invalidated)
+    updated_invalidated[key] = set()
+    invalidated_token = _INVALIDATED_PATHS.set(updated_invalidated)
     try:
         yield
     finally:
+        _INVALIDATED_PATHS.reset(invalidated_token)
         _DOCUMENT_CACHE.reset(document_token)
         _CACHE.reset(token)
 
@@ -100,11 +108,25 @@ def invalidate(task_id: str) -> int:
     memos = _memos(task_id)
     documents = _documents(task_id)
     dropped = len(memos or {}) + len(documents or {})
+    invalidated = (_INVALIDATED_PATHS.get() or {}).get(_task_key(task_id))
+    if invalidated is not None:
+        invalidated.update(path for path, _offset, _limit in (memos or {}))
+        invalidated.update((documents or {}).keys())
     if memos:
         memos.clear()
     if documents:
         documents.clear()
     return dropped
+
+
+def consume_invalidation(path: str, *, task_id: str) -> bool:
+    """Allow one content refill after compression removed an earlier result."""
+    invalidated = (_INVALIDATED_PATHS.get() or {}).get(_task_key(task_id))
+    key = _path_key(path)
+    if invalidated is None or key not in invalidated:
+        return False
+    invalidated.remove(key)
+    return True
 
 
 def _memos(task_id: str) -> Optional[dict[tuple[str, int, int], dict[str, object]]]:
@@ -227,6 +249,7 @@ __all__ = [
     "MAX_DOCUMENTS_PER_REQUEST",
     "MAX_DOCUMENT_CACHE_CHARS_PER_REQUEST",
     "MAX_MEMOS_PER_REQUEST",
+    "consume_invalidation",
     "invalidate",
     "is_active",
     "lookup",
