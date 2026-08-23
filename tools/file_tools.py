@@ -2292,10 +2292,21 @@ def _advance_past_covered_lines(
     it to resume at the first gap; callers that truly need an earlier passage
     can still request a narrower range that begins outside the covered prefix.
     """
+    from tools import request_file_cache
     from tools.attachment_ledger import get_outcome, merge_ranges
 
     outcome = get_outcome(path, task_id=task_id)
     if not outcome or str(outcome.get("extent_unit") or "lines") != "lines":
+        return offset, outcome
+    # Durable coverage proves what the service read in an older request; it
+    # does not prove that the older tool payload is still present in this
+    # request's model context.  Allow one content-bearing refill before using
+    # the old ranges to auto-advance.  The request memo then makes every later
+    # repeat cheap, while a new user turn can always recover the source text.
+    if (
+        str(outcome.get("reader") or "") == "read_file_history"
+        and request_file_cache.lookup_latest(path, task_id=task_id) is None
+    ):
         return offset, outcome
     candidate = offset
     for start, end in merge_ranges(outcome.get("ranges") or []):

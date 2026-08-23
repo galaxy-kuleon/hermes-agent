@@ -266,6 +266,50 @@ class AttachmentLedgerTests(unittest.TestCase):
             self.assertEqual(get_outcome(paths[0], task_id="history")["status"], OUTCOME_PARTIAL)
             self.assertEqual(get_outcome(paths[1], task_id="history")["status"], OUTCOME_READ)
 
+    def test_durable_complete_coverage_allows_one_content_refill_per_new_request(self):
+        path = self.root / "001-aaaaaaaa-reference.txt"
+        path.write_text("source clause marker\nsecond line\n", encoding="utf-8")
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": "F01"}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "read_file",
+                "tool_call_id": "call-1",
+                "content": json.dumps(
+                    {
+                        "report_as": "read",
+                        "consumed": {
+                            "unit": "lines",
+                            "start": 1,
+                            "end": 2,
+                            "total": 2,
+                        },
+                    }
+                ),
+            },
+        ]
+        paths = [str(path)]
+        with file_grant_scope("history-refill", paths, handles=make_file_handles(paths)), (
+            request_file_cache.request_file_cache_scope("history-refill")
+        ):
+            seed_from_tool_history(messages, task_id="history-refill")
+            first = json.loads(read_file_tool("F01", task_id="history-refill"))
+            second = json.loads(read_file_tool("F01", task_id="history-refill"))
+
+        self.assertIn("source clause marker", first.get("content") or "")
+        self.assertEqual(second.get("status"), "already_covered")
+
 
 class TruncatedReadExtentTests(unittest.TestCase):
     """BLOCKING-2: 601 lines, limit=500 → partial not complete."""
