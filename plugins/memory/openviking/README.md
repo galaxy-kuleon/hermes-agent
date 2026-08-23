@@ -99,17 +99,12 @@ canonical user-scoped form such as
 `viking://user/default/peers/${OPENVIKING_AGENT}/memories/...` in API-key mode.
 Explicit remembers do not depend on session commit extraction.
 
-Hermes built-in `memory` tool additions are mirrored to OpenViking after the
-local memory operation succeeds:
-
-| Hermes action | OpenViking operation |
-|---------------|----------------------|
-| `add` | `content/write` with `mode=create` under the configured peer memory namespace |
-
-Built-in `replace` and `remove` operations are not mirrored because Hermes
-native memory entries do not yet carry stable OpenViking file URIs. Use
-`viking_forget` when the user explicitly asks to delete a specific OpenViking
-memory URI.
+Hermes' built-in `memory` store is not mirrored into OpenViking. Its `user`
+target identifies the local USER.md profile but does not prove that arbitrary
+content is a preference, and its entries do not carry stable OpenViking URIs
+for later replace/remove synchronization. Matter facts are learned through
+typed session commits (`entities` and `events`); explicitly classified writes
+use `viking_remember`.
 
 `viking_forget` is intentionally narrow. It only accepts concrete user memory
 file URIs, such as

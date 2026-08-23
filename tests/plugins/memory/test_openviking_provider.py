@@ -1430,14 +1430,12 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
 
 
 # ---------------------------------------------------------------------------
-# on_memory_write: explicit memory writes use content/write and stay outside
-# the session transcript/commit boundary.
+# on_memory_write: the untyped built-in store must not create a second,
+# unsynchronised OpenViking copy.
 # ---------------------------------------------------------------------------
 
 
-def test_shutdown_waits_for_memory_write_worker(monkeypatch):
-    import threading
-
+def test_builtin_memory_write_is_not_blindly_mirrored():
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
     provider._endpoint = "http://test"
@@ -1446,41 +1444,11 @@ def test_shutdown_waits_for_memory_write_worker(monkeypatch):
     provider._user = "usr"
     provider._agent = "hermes"
 
-    worker_started = threading.Event()
-    release_worker = threading.Event()
-    worker_finished = threading.Event()
-    shutdown_returned = threading.Event()
-
-    class StubClient:
-        def __init__(self, *a, **kw):
-            pass
-
-        def post(self, path, payload=None, **kwargs):
-            assert path == "/api/v1/content/write"
-            worker_started.set()
-            release_worker.wait(timeout=2.0)
-            worker_finished.set()
-            return {}
-
-    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
-
     provider.on_memory_write("add", "user", "remember this")
-    assert worker_started.wait(timeout=2.0), "worker never entered post()"
+    provider.on_memory_write("add", "memory", "environment note")
+    provider.shutdown()
 
-    shutdown_thread = threading.Thread(
-        target=lambda: (provider.shutdown(), shutdown_returned.set()),
-        daemon=True,
-    )
-    shutdown_thread.start()
-
-    returned_before_worker_finished = shutdown_returned.wait(timeout=0.1)
-    release_worker.set()
-    assert shutdown_returned.wait(timeout=2.0), "shutdown did not return after worker finished"
-    shutdown_thread.join(timeout=2.0)
-
-    assert not returned_before_worker_finished
-    assert worker_finished.is_set()
-    assert provider._memory_write_threads == set()
+    provider._client.post.assert_not_called()
 
 
 def _make_prefetch_provider() -> OpenVikingMemoryProvider:

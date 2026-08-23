@@ -128,13 +128,6 @@ _CATEGORY_SUBDIR_MAP = {
 }
 _DEFAULT_MEMORY_SUBDIR = "cases"
 
-# Maps the built-in memory tool's `target` ("user" vs "memory") to a subdir
-# for on_memory_write mirroring. User profile facts → preferences; agent
-# notes / observations → patterns. Anything unknown falls back to the default.
-_MEMORY_WRITE_TARGET_SUBDIR_MAP = {
-    "user": "preferences",
-    "memory": "patterns",
-}
 # OpenViking-generated markdown summaries. Non-.md sidecars such as
 # .relations.json are rejected earlier by the exact memory-file check.
 _GENERATED_MEMORY_SUMMARY_FILENAMES = {
@@ -2334,8 +2327,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._runtime_start_lock = threading.Lock()
         self._runtime_start_thread: Optional[threading.Thread] = None
         self._runtime_start_pending = False
-        self._memory_write_lock = threading.Lock()
-        self._memory_write_threads: Set[threading.Thread] = set()
         self._profile_prefetched_sessions: Set[str] = set()
         # Set on shutdown so deferred-commit / writer finalizers stop issuing
         # network writes against a torn-down provider.
@@ -4846,37 +4837,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Mirror successful built-in memory additions to OpenViking."""
-        if action != "add" or not content or not self._ensure_client():
-            return
+        """Do not duplicate untyped built-in memory into OpenViking.
 
-        subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
-
-        def _write():
-            try:
-                client = self._new_client()
-                client.post("/api/v1/content/write", {
-                    "uri": uri,
-                    "content": content,
-                    "mode": "create",
-                })
-            except Exception as e:
-                logger.debug("OpenViking memory mirror failed: %s", e)
-            finally:
-                with self._memory_write_lock:
-                    self._memory_write_threads.discard(threading.current_thread())
-
-        t = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
-        with self._memory_write_lock:
-            if self._shutting_down:
-                return
-            self._memory_write_threads.add(t)
-            try:
-                t.start()
-            except Exception as e:
-                self._memory_write_threads.discard(t)
-                logger.debug("OpenViking memory mirror worker failed to start: %s", e)
+        ``target=user`` only means Hermes' bounded USER.md profile; it does not
+        prove that the content is a preference.  Blind mirroring previously
+        stored Matter facts as ``preferences`` without the required user/topic
+        fields, and later local replace/remove operations could not update the
+        orphaned copy.  OpenViking instead learns Matter facts through typed
+        session commits (entities/events), while explicitly classified writes
+        remain available through ``viking_remember``.
+        """
+        return
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
@@ -4925,8 +4896,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
             ]
         with self._deferred_commit_lock:
             deferred_workers = list(self._deferred_commit_threads)
-        with self._memory_write_lock:
-            memory_write_workers = list(self._memory_write_threads)
         # The runtime-autostart waiter is a tracked daemon thread that blocks on
         # network health probes; it must be joined too, or it can be left alive
         # at interpreter exit (SIGABRT at Py_FinalizeEx). Setting _shutting_down
@@ -4937,9 +4906,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if t.is_alive():
                 t.join(timeout=5.0)
         for t in deferred_workers:
-            if t.is_alive():
-                t.join(timeout=5.0)
-        for t in memory_write_workers:
             if t.is_alive():
                 t.join(timeout=5.0)
         if runtime_start_thread is not None and runtime_start_thread.is_alive():
