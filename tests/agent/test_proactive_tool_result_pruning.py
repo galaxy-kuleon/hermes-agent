@@ -118,6 +118,8 @@ def test_dedicated_tail_defaults_to_full_compression_tail():
     c = _compressor(protect_last_n=7)
 
     assert c.proactive_prune_protect_last_n == 7
+    c.protect_last_n = 3
+    assert c.proactive_prune_protect_last_n == 3
 
 
 

@@ -1860,6 +1860,18 @@ class ContextCompressor(ContextEngine):
     def name(self) -> str:
         return "compressor"
 
+    @property
+    def proactive_prune_protect_last_n(self) -> int:
+        """Dedicated tool-output tail, or the live compression tail by default."""
+        override = getattr(self, "_proactive_prune_protect_last_n", None)
+        return self.protect_last_n if override is None else override
+
+    @proactive_prune_protect_last_n.setter
+    def proactive_prune_protect_last_n(self, value: int | None) -> None:
+        self._proactive_prune_protect_last_n = (
+            None if value is None else max(0, int(value))
+        )
+
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""
         super().on_session_reset()
@@ -2894,11 +2906,7 @@ class ContextCompressor(ContextEngine):
         # proactive mechanism exactly when it is needed. Unset preserves the
         # historical shared policy; deployments can opt into a smaller,
         # independent tool-output tail.
-        self.proactive_prune_protect_last_n = (
-            self.protect_last_n
-            if proactive_prune_protect_last_n is None
-            else max(0, int(proactive_prune_protect_last_n))
-        )
+        self.proactive_prune_protect_last_n = proactive_prune_protect_last_n
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
