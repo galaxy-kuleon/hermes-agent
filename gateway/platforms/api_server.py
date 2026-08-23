@@ -350,6 +350,8 @@ async def _stop_cancelled_sse_agent(
     agent_ref,
     agent_cancel_event,
     completion_id: str,
+    *,
+    source: str = "sse",
 ) -> None:
     """Cooperatively stop and bounded-drain this request's agent task."""
     # Publish cancellation before consulting agent_ref. If cancellation wins the
@@ -361,11 +363,16 @@ async def _stop_cancelled_sse_agent(
     agent = agent_ref[0] if agent_ref else None
     if agent is not None:
         try:
-            agent.interrupt("SSE handler cancelled")
+            agent.interrupt(
+                "SSE handler cancelled"
+                if source == "sse"
+                else "Non-streaming client disconnected"
+            )
         except Exception as exc:
             logger.warning(
-                "sse_agent_interrupt_failed service=gateway completion_id=%s "
-                "error=%s" + _journey_suffix_safe(),
+                "api_agent_interrupt_failed service=gateway source=%s "
+                "completion_id=%s error=%s" + _journey_suffix_safe(),
+                source,
                 completion_id,
                 type(exc).__name__,
             )
@@ -388,9 +395,10 @@ async def _stop_cancelled_sse_agent(
     except asyncio.TimeoutError:
         cancel_wrapper = True
         logger.warning(
-            "sse_agent_drain_timeout service=gateway completion_id=%s "
+            "api_agent_drain_timeout service=gateway source=%s completion_id=%s "
             "timeout_seconds=%.1f executor_worker_may_still_be_unwinding=true"
             + _journey_suffix_safe(),
+            source,
             completion_id,
             SSE_AGENT_CANCEL_DRAIN_SECONDS,
         )
@@ -401,8 +409,9 @@ async def _stop_cancelled_sse_agent(
         cancel_wrapper = not agent_task.done()
         if cancel_wrapper:
             logger.warning(
-                "sse_agent_drain_aborted service=gateway completion_id=%s "
-                "error=%s" + _journey_suffix_safe(),
+                "api_agent_drain_aborted service=gateway source=%s "
+                "completion_id=%s error=%s" + _journey_suffix_safe(),
+                source,
                 completion_id,
                 type(exc).__name__,
             )
@@ -6390,7 +6399,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_cancel_event=agent_cancel_event,
             )
 
-        # Non-streaming: run the agent (with optional Idempotency-Key)
+        # Non-streaming: run the agent (with optional Idempotency-Key). Keep
+        # the same cooperative cancellation handles as the SSE path. aiohttp
+        # can cancel this handler when its client disconnects, but cancelling
+        # an asyncio wrapper alone cannot stop run_conversation in its executor
+        # thread.
+        nonstream_agent_ref = [None]
+        nonstream_cancel_event = threading.Event()
+
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
@@ -6405,6 +6421,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_groups=scope.get("user_groups", ""),
                 granted_file_paths=granted_file_paths,
                 granted_file_aliases=granted_file_aliases,
+                agent_ref=nonstream_agent_ref,
+                agent_cancel_event=nonstream_cancel_event,
                 **agent_overrides,
                 route=route,
             )
@@ -6430,8 +6448,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
         else:
+            agent_task = asyncio.ensure_future(_compute_completion())
             try:
-                result, usage = await _compute_completion()
+                result, usage = await agent_task
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    _stop_cancelled_sse_agent(
+                        agent_task,
+                        nonstream_agent_ref,
+                        nonstream_cancel_event,
+                        completion_id,
+                        source="non_stream",
+                    )
+                )
+                logger.info(
+                    "Non-streaming client disconnected; interrupted agent task %s"
+                    + _journey_suffix_safe(),
+                    completion_id,
+                )
+                raise
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -9072,7 +9107,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._shutdown_interruptible_agents[id(agent)] = agent
                     if agent_cancel_event is not None and agent_cancel_event.is_set():
                         agent.interrupt(
-                            "SSE handler cancelled before agent startup completed"
+                            "API handler cancelled before agent startup completed"
                         )
                     if granted_file_paths is None:
                         result = agent.run_conversation(
@@ -10742,7 +10777,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # still writable.
             if _terminate_live_stream_bodies not in self._app.on_shutdown:
                 self._app.on_shutdown.append(_terminate_live_stream_bodies)
-            self._runner = web.AppRunner(self._app)
+            # Cancel long-running request handlers as soon as the peer closes
+            # its socket. The chat-completions handlers own explicit
+            # cooperative agent interruption, so a stopped OpenWebUI turn does
+            # not keep consuming the single local-model lane until generation
+            # happens to finish.
+            self._runner = web.AppRunner(
+                self._app,
+                handler_cancellation=True,
+            )
             await self._runner.setup()
             # Bind directly instead of probing 127.0.0.1 first — the old
             # single-family pre-probe raced the real bind and reported a

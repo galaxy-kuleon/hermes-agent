@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 from typing import Any
 from unittest.mock import patch
 
@@ -149,3 +150,77 @@ async def test_cancelling_a_prepared_stream_sends_a_complete_http_and_sse_termin
     assert _ANSWER_DELTA.encode() in body
     assert body.count(b"data: [DONE]") == 1
     assert body.count(b'"finish_reason": "stop"') == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_nonstream_handler_interrupts_its_executor_agent():
+    adapter = api_server.APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-api-key"})
+    )
+    loop = asyncio.get_running_loop()
+    handler_seen: asyncio.Future[asyncio.Task[Any]] = loop.create_future()
+    agent_started = asyncio.Event()
+    agent_released = asyncio.Event()
+    interrupt_reasons: list[str] = []
+
+    class _ControlledAgent:
+        def interrupt(self, reason: str) -> None:
+            interrupt_reasons.append(reason)
+            agent_released.set()
+
+    async def _controlled_run_agent(**kwargs):
+        kwargs["agent_ref"][0] = _ControlledAgent()
+        agent_started.set()
+        await agent_released.wait()
+        return (
+            {"final_response": "cancelled", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+        )
+
+    async def _capture_real_handler(request):
+        if not handler_seen.done():
+            handler_seen.set_result(asyncio.current_task())
+        return await adapter._handle_chat_completions(request)
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", _capture_real_handler)
+    request_task = None
+    handler_task = None
+    try:
+        async with TestClient(TestServer(app)) as client:
+            with patch.object(
+                adapter, "_run_agent", side_effect=_controlled_run_agent
+            ):
+                request_task = asyncio.create_task(
+                    client.post(
+                        "/v1/chat/completions",
+                        headers=_REQUEST_HEADERS,
+                        json={
+                            "model": "test",
+                            "messages": [
+                                {"role": "user", "content": "boundary probe"}
+                            ],
+                            "stream": False,
+                        },
+                    )
+                )
+                handler_task = await asyncio.wait_for(handler_seen, timeout=2)
+                await asyncio.wait_for(agent_started.wait(), timeout=2)
+                handler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await handler_task
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(request_task, timeout=2)
+    finally:
+        agent_released.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+        await asyncio.sleep(0)
+
+    assert interrupt_reasons == ["Non-streaming client disconnected"]
+    assert adapter.active_agent_work_count() == 0
+
+
+def test_live_api_server_enables_handler_cancellation_on_peer_disconnect():
+    source = inspect.getsource(api_server.APIServerAdapter.connect)
+    assert "handler_cancellation=True" in source
