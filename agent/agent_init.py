@@ -2122,6 +2122,15 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+    compression_proactive_prune_protect_last = max(
+        0,
+        _parse_prune_int(
+            _compression_cfg.get(
+                "proactive_prune_protect_last_n", compression_protect_last
+            ),
+            compression_protect_last,
+        ),
+    )
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
@@ -2668,6 +2677,7 @@ def init_agent(
             proactive_prune_tokens=compression_proactive_prune_tokens,
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
+            proactive_prune_protect_last_n=compression_proactive_prune_protect_last,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
         )

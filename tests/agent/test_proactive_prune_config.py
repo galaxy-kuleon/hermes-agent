@@ -1,11 +1,11 @@
 """compression.proactive_prune_* — config parse seam for the proactive prune.
 
-Mirrors ``test_compression_max_attempts_config.py``: the three knobs are
+Mirrors ``test_compression_max_attempts_config.py``: the four knobs are
 parsed in ``agent_init`` with the same hardened semantics (booleans rejected,
 fractional floats rejected — not truncated, integral floats and numeric
 strings accepted) and attached to the built-in compressor.  Default is
-0 / 8000 / 4096, i.e. the feature is OFF and behavior-neutral unless
-``proactive_prune_tokens`` is set above 0.
+0 / 8000 / 4096 / ``protect_last_n``, i.e. the feature is OFF and
+behavior-neutral unless ``proactive_prune_tokens`` is set above 0.
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ class TestProactivePruneConfig:
         assert cc.proactive_prune_tokens == 0
         assert cc.proactive_prune_min_result_chars == 8000
         assert cc.proactive_prune_min_reclaim_tokens == 4096
+        assert cc.proactive_prune_protect_last_n == 20
 
     def test_custom_values_are_honored(self, monkeypatch, tmp_path):
         agent = _make_agent(
@@ -73,11 +74,13 @@ class TestProactivePruneConfig:
             proactive_prune_tokens=48_000,
             proactive_prune_min_result_chars=12_000,
             proactive_prune_min_reclaim_tokens=8_192,
+            proactive_prune_protect_last_n=4,
         )
         cc = agent.context_compressor
         assert cc.proactive_prune_tokens == 48_000
         assert cc.proactive_prune_min_result_chars == 12_000
         assert cc.proactive_prune_min_reclaim_tokens == 8_192
+        assert cc.proactive_prune_protect_last_n == 4
 
     def test_boolean_is_rejected_not_coerced(self, monkeypatch, tmp_path):
         # bool subclasses int: YAML `proactive_prune_tokens: true` must fall
@@ -85,6 +88,12 @@ class TestProactivePruneConfig:
         agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
         assert agent.context_compressor.proactive_prune_tokens == 0
 
+    def test_boolean_tool_tail_is_rejected_not_coerced(self, monkeypatch, tmp_path):
+        agent = _make_agent(
+            monkeypatch, tmp_path, proactive_prune_protect_last_n=True
+        )
+
+        assert agent.context_compressor.proactive_prune_protect_last_n == 20
 
 
 

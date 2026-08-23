@@ -2826,6 +2826,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
+        proactive_prune_protect_last_n: int | None = None,
         min_tail_user_messages: int = 1,
         tail_mode: str = "legacy",
     ):
@@ -2885,6 +2886,18 @@ class ContextCompressor(ContextEngine):
         # and amortized. 0 disables only the minimum-savings gate.
         self.proactive_prune_min_reclaim_tokens = max(
             0, int(proactive_prune_min_reclaim_tokens or 0)
+        )
+        # Tool-result pruning and full conversation compression have different
+        # recency needs. A long conversational tail can be useful to the
+        # summary compressor, but reusing that same count here makes a short
+        # document-heavy turn protect every giant tool result and disables the
+        # proactive mechanism exactly when it is needed. Unset preserves the
+        # historical shared policy; deployments can opt into a smaller,
+        # independent tool-output tail.
+        self.proactive_prune_protect_last_n = (
+            self.protect_last_n
+            if proactive_prune_protect_last_n is None
+            else max(0, int(proactive_prune_protect_last_n))
         )
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
@@ -3701,10 +3714,12 @@ class ContextCompressor(ContextEngine):
         subsequent turn; this reclaims them early with no quality-risky LLM
         summarization.
 
-        Protects the recent tail by message COUNT (``protect_last_n``), never by
-        ``tail_token_budget`` — the latter is derived from the 50% compression
-        threshold (≈100K tokens on a 1M window) and would protect the entire
-        session, pruning nothing.
+        Protects the recent tail by message COUNT
+        (``proactive_prune_protect_last_n``), never by ``tail_token_budget`` —
+        the latter is derived from the 50% compression threshold (≈100K tokens
+        on a 1M window) and would protect the entire session, pruning nothing.
+        The dedicated count defaults to ``protect_last_n`` for compatibility,
+        but can be smaller for document-heavy deployments.
 
         ``_prune_old_tool_results`` runs all three deterministic passes:
         (1) dedup byte-identical tool results — keeps the newest full copy and
@@ -3734,7 +3749,12 @@ class ContextCompressor(ContextEngine):
         if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
             return messages, 0
         # Nothing to reclaim until there are messages outside the protected tail.
-        if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+        if (
+            len(messages)
+            <= self.proactive_prune_protect_last_n
+            + self._protect_head_size(messages)
+            + 1
+        ):
             return messages, 0
         before = sum(_estimate_msg_budget_tokens(m) for m in messages)
         if before < self._proactive_prune_rearm_tokens:
@@ -3753,7 +3773,7 @@ class ContextCompressor(ContextEngine):
             return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages,
-            protect_tail_count=self.protect_last_n,
+            protect_tail_count=self.proactive_prune_protect_last_n,
             protect_tail_tokens=None,
             min_prune_chars=self.proactive_prune_min_result_chars,
         )

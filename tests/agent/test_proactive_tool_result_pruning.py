@@ -87,6 +87,39 @@ def test_prunes_below_compression_threshold():
         assert m["content"] != _PRUNED_TOOL_PLACEHOLDER       # informative, not a blank placeholder
 
 
+def test_dedicated_tail_allows_document_pruning_without_shrinking_chat_tail():
+    """A short document-heavy turn must not protect every giant result.
+
+    Full compression can retain a long conversational tail while proactive
+    pruning retains only the newest tool pairs. The source file and offsets
+    remain available for exact re-reading after an older result is summarized.
+    """
+    c = _compressor(
+        protect_last_n=20,
+        proactive_prune_protect_last_n=2,
+        proactive_prune_tokens=48_000,
+        proactive_prune_min_result_chars=8_000,
+    )
+    msgs = _build(5, big_indices={0, 1, 2, 3, 4})
+
+    result, pruned = c.prune_tool_results_only(
+        msgs, current_tokens=120_000
+    )
+
+    assert c.protect_last_n == 20
+    assert c.proactive_prune_protect_last_n == 2
+    assert pruned >= 4
+    assert result is not msgs
+    assert len(_tool_by_id(result, "call_0")["content"]) < 9000
+    assert len(_tool_by_id(result, "call_4")["content"]) == 9000
+
+
+def test_dedicated_tail_defaults_to_full_compression_tail():
+    c = _compressor(protect_last_n=7)
+
+    assert c.proactive_prune_protect_last_n == 7
+
+
 
 
 
