@@ -89,7 +89,10 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
     try:
         created = json.loads(
             manager.skill_manage(
-                "create", "alice-skill", content=VALID.format(name="alice-skill", body="v1")
+                "create",
+                "alice-skill",
+                content=VALID.format(name="alice-skill", body="v1"),
+                requirements_confirmed=True,
             )
         )
         assert created["success"] is True
@@ -139,6 +142,70 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
         deleted = json.loads(manager.skill_manage("delete", "user:alice-skill"))
         assert deleted["success"] is True
         assert not (home / "user-skills" / "alice" / "alice-skill").exists()
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_api_create_stays_inactive_until_requirements_and_references_are_complete(
+    namespace_home,
+):
+    home, _platform = namespace_home
+    tokens = _scope("alice")
+    try:
+        content = VALID.format(
+            name="draft-skill",
+            body="Read references/rules.md before answering.",
+        )
+        created = json.loads(
+            manager.skill_manage("create", "draft-skill", content=content)
+        )
+        assert created["success"] is True
+        assert created["draft"] is True
+        assert created["published"] is False
+
+        user_root = home / "user-skills" / "alice"
+        assert (user_root / ".drafts" / "draft-skill" / "SKILL.md").exists()
+        assert not (user_root / "draft-skill").exists()
+        listed = json.loads(skills_tool.skills_list())
+        assert "draft-skill" not in {skill["name"] for skill in listed["skills"]}
+
+        blocked = json.loads(
+            manager.skill_manage(
+                "publish",
+                "draft-skill",
+                requirements_confirmed=True,
+            )
+        )
+        assert blocked["success"] is False
+        assert any(
+            item["rule"] == "dangling-reference"
+            for item in blocked["publish_blockers"]
+        )
+
+        written = json.loads(
+            manager.skill_manage(
+                "write_file",
+                "draft-skill",
+                file_path="references/rules.md",
+                file_content="# Complete rules\n\nApply these exact rules.",
+            )
+        )
+        assert written["success"] is True
+        assert written["draft"] is True
+
+        published = json.loads(
+            manager.skill_manage(
+                "publish",
+                "draft-skill",
+                requirements_confirmed=True,
+            )
+        )
+        assert published["success"] is True
+        assert published["published"] is True
+        assert not (user_root / ".drafts" / "draft-skill").exists()
+        assert (user_root / "draft-skill" / "SKILL.md").exists()
+        listed = json.loads(skills_tool.skills_list())
+        assert "draft-skill" in {skill["name"] for skill in listed["skills"]}
     finally:
         clear_session_vars(tokens)
 

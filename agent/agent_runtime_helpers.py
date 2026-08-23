@@ -33,7 +33,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
+from agent.message_sanitization import (
+    _FULL_ARGS_LOG_BOUND,
+    strip_model_tool_disclosures,
+)
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -3529,6 +3532,38 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
         filtered.append(msg)
     messages = filtered
+
+    # --- Remove unauthenticated harness/tool disclosure from assistant text ---
+    # Host-provided history (notably OpenWebUI) may contain rendered
+    # ``<details type=...>`` cards. They are presentation, not native tool
+    # events. Feeding them back to the model teaches it to imitate a successful
+    # call and lets one false card snowball across later turns. Sanitize only
+    # the per-call wire copy; the raw original transcript remains observable.
+    disclosure_cleaned: List[Dict[str, Any]] = []
+    removed_disclosures = 0
+    removed_disclosure_chars = 0
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and isinstance(msg.get("content"), str)
+        ):
+            cleaned = strip_model_tool_disclosures(msg["content"])
+            if cleaned.removed_blocks:
+                fixed = dict(msg)
+                fixed["content"] = cleaned.text
+                msg = fixed
+                removed_disclosures += cleaned.removed_blocks
+                removed_disclosure_chars += cleaned.removed_chars
+        disclosure_cleaned.append(msg)
+    if removed_disclosures:
+        messages = disclosure_cleaned
+        _ra().logger.warning(
+            "Pre-call sanitizer: removed %d unauthenticated model-authored "
+            "tool disclosure block(s), %d chars, from assistant history",
+            removed_disclosures,
+            removed_disclosure_chars,
+        )
 
     # --- Heal empty-content non-final messages (self-recovery) ---
     # A dead stream can leave an empty assistant stub (or an empty user turn)

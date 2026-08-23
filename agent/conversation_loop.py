@@ -58,6 +58,7 @@ from agent.message_sanitization import (
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
+    strip_model_tool_disclosures,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
@@ -105,6 +106,40 @@ logger = logging.getLogger(__name__)
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+
+_MODEL_TOOL_DISCLOSURE_NUDGE = (
+    "Your previous response contained model-authored tool disclosure markup, "
+    "but no native tool call occurred. Do not emit tool UI or claim an action "
+    "ran. If a tool is required, call it through the native tool interface now. "
+    "Otherwise give the user a complete substantive answer and state any "
+    "unverified action honestly."
+)
+_MODEL_TOOL_DISCLOSURE_FAILURE = (
+    "I could not verify or execute the action I described. No native tool call "
+    "occurred, so I have not changed anything. Please retry; the failed action "
+    "has been preserved in the request trace."
+)
+_ACTION_ONLY_AFTER_DISCLOSURE_RE = re.compile(
+    r"\b(?:let me|i(?:'ll| will)|i am going to|now (?:i(?:'ll| will) )?"
+    r"(?:check|search|read|update|apply|run|verify|complete|inspect)|"
+    r"我(?:來|會|將|現在)|讓我|現在(?:檢查|搜尋|讀取|更新|套用|執行|驗證))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_action_only_after_tool_disclosure(text: str) -> bool:
+    """True when disclosure removal leaves only a short action preamble."""
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if not compact:
+        return True
+    if len(compact) > 800:
+        return False
+    # A real result normally contains a list/table, source URI, concrete
+    # artifact, or multiple developed paragraphs. Keep those even when the
+    # model also emitted a fake card; only retry narration of future action.
+    if re.search(r"(?:^|\n)\s*(?:[-*]|\d+[.)]|#{1,6}\s|\|)", text or ""):
+        return False
+    return bool(_ACTION_ONLY_AFTER_DISCLOSURE_RE.search(compact))
 
 
 def _restore_user_after_reference_handoff(
@@ -1845,6 +1880,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    model_tool_disclosure_retries = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -7877,6 +7913,64 @@ def run_conversation(
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                # The normalized message is the single storage/display truth.
+                # Never return raw provider text after the storage boundary
+                # removed unauthenticated tool UI from it. Sanitize the joined
+                # response rather than only the latest provider fragment so
+                # length-continuation parts remain intact.
+                _joined_cleaning = strip_model_tool_disclosures(final_response)
+                final_response = _joined_cleaning.text.strip()
+                final_msg["content"] = final_response
+                if (
+                    _joined_cleaning.removed_blocks
+                    and not final_msg.get("_model_tool_disclosure_removed")
+                ):
+                    final_msg["_model_tool_disclosure_removed"] = {
+                        "blocks": _joined_cleaning.removed_blocks,
+                        "chars": _joined_cleaning.removed_chars,
+                        "unclosed": _joined_cleaning.had_unclosed_block,
+                    }
+                _removed_disclosure = final_msg.get(
+                    "_model_tool_disclosure_removed"
+                )
+                if (
+                    _removed_disclosure
+                    and _is_action_only_after_tool_disclosure(final_response)
+                ):
+                    if model_tool_disclosure_retries < 1:
+                        model_tool_disclosure_retries += 1
+                        logger.warning(
+                            "Rejected action-only response after removing "
+                            "model-authored tool disclosure; requesting one "
+                            "native-tool/substantive recovery (session=%s)",
+                            getattr(agent, "session_id", None) or "none",
+                        )
+                        agent._emit_status(
+                            "↻ Rejected unauthenticated tool display — "
+                            "requesting an honest native action or answer"
+                        )
+                        final_msg["_model_tool_disclosure_nudge"] = True
+                        append_message(messages, final_msg)
+                        append_message(messages, {
+                            "role": "user",
+                            "content": _MODEL_TOOL_DISCLOSURE_NUDGE,
+                            "_model_tool_disclosure_nudge": True,
+                        })
+                        agent._session_messages = messages
+                        final_response = None
+                        continue
+
+                    logger.error(
+                        "Model repeated action-only unauthenticated tool "
+                        "disclosure after bounded recovery (session=%s)",
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    final_response = _MODEL_TOOL_DISCLOSURE_FAILURE
+                    final_msg["content"] = final_response
+                    final_msg["finish_reason"] = "tool_disclosure_rejected"
+
+                # A substantive sanitized answer ends the recovery budget.
+                model_tool_disclosure_retries = 0
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
@@ -7945,6 +8039,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_model_tool_disclosure_nudge")
                     )
                 ):
                     messages.pop()

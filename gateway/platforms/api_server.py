@@ -99,6 +99,7 @@ from gateway.platforms.base import (
 )
 from tools.file_reader_routing import reader_guidance
 from agent.redact import redact_sensitive_text
+from agent.message_sanitization import ToolDisclosureStreamScrubber
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 
@@ -6226,6 +6227,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
+            _delta_scrubber = ToolDisclosureStreamScrubber()
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -6238,7 +6240,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Called from the worker thread running run_conversation —
                 # put_threadsafe (not put_nowait) is required here.
                 if delta is not None:
-                    _stream_q.put_threadsafe(delta)
+                    if isinstance(delta, str):
+                        delta = _delta_scrubber.feed(delta)
+                    if delta:
+                        _stream_q.put_threadsafe(delta)
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
@@ -6346,7 +6351,13 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
+            def _finish_model_stream(_fut):
+                tail = _delta_scrubber.flush()
+                if tail:
+                    _stream_q.put_nowait(tail)
+                _stream_q.put_nowait(None)
+
+            agent_task.add_done_callback(_finish_model_stream)
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -7990,6 +8001,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
             _stream_q = ThreadSafeAsyncQueue()
+            _delta_scrubber = ToolDisclosureStreamScrubber()
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -7998,7 +8010,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Called from the worker thread running run_conversation —
                 # put_threadsafe (not put_nowait) is required here.
                 if delta is not None:
-                    _stream_q.put_threadsafe(delta)
+                    if isinstance(delta, str):
+                        delta = _delta_scrubber.feed(delta)
+                    if delta:
+                        _stream_q.put_threadsafe(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Queue non-start tool progress events if needed in future.
@@ -8049,7 +8064,13 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
+            def _finish_model_stream(_fut):
+                tail = _delta_scrubber.flush()
+                if tail:
+                    _stream_q.put_nowait(tail)
+                _stream_q.put_nowait(None)
+
+            agent_task.add_done_callback(_finish_model_stream)
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)

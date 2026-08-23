@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,174 @@ logger = logging.getLogger(__name__)
 # below as well as by run_agent and the CLI for paste-from-clipboard
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
+
+# OpenWebUI/Hermes tool disclosures are transport-owned UI. A model may emit
+# byte-identical HTML, but that text is not evidence that a tool ran. Ordinary
+# HTML ``details`` has no ``type`` attribute; the harness adds one to mark its
+# private disclosure protocol. Keeping that distinction here lets native,
+# authenticated tool events remain structured while rejecting model-authored
+# imitations without banning legitimate collapsible prose.
+_DETAILS_OPEN_RE = re.compile(r"<details\b(?P<attrs>[^>]*)>", re.IGNORECASE | re.DOTALL)
+_DETAILS_CLOSE_RE = re.compile(r"</details\s*>", re.IGNORECASE)
+_DETAILS_PREFIX = "<details"
+_DETAILS_CLOSE_PREFIX = "</details"
+_DETAILS_TYPE_RE = re.compile(
+    r"\btype\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ToolDisclosureSanitization:
+    """Result of removing unauthenticated harness disclosure markup."""
+
+    text: str
+    removed_blocks: int = 0
+    removed_chars: int = 0
+    had_unclosed_block: bool = False
+
+
+def strip_model_tool_disclosures(text: str) -> ToolDisclosureSanitization:
+    """Remove model-authored ``<details type=...>`` tool UI from *text*.
+
+    The complete block is removed. An unclosed suspicious block is removed
+    through end-of-input, which handles output-token truncation without
+    presenting a false running/completed tool to the user. The transformation
+    is pure and preserves ordinary ``<details>`` HTML byte-for-byte.
+    """
+    if not isinstance(text, str) or not text:
+        return ToolDisclosureSanitization(text=text if isinstance(text, str) else "")
+
+    out: list[str] = []
+    cursor = 0
+    removed_blocks = 0
+    removed_chars = 0
+    had_unclosed = False
+
+    while True:
+        match = _DETAILS_OPEN_RE.search(text, cursor)
+        if match is None:
+            # A truncated opening tag with an explicit type is suspicious too.
+            partial_at = text.lower().find(_DETAILS_PREFIX, cursor)
+            if partial_at >= 0 and _DETAILS_TYPE_RE.search(text[partial_at:]):
+                out.append(text[cursor:partial_at])
+                removed_blocks += 1
+                removed_chars += len(text) - partial_at
+                had_unclosed = True
+            else:
+                out.append(text[cursor:])
+            break
+
+        if not _DETAILS_TYPE_RE.search(match.group("attrs") or ""):
+            out.append(text[cursor:match.end()])
+            cursor = match.end()
+            continue
+
+        out.append(text[cursor:match.start()])
+        close = _DETAILS_CLOSE_RE.search(text, match.end())
+        removed_blocks += 1
+        if close is None:
+            removed_chars += len(text) - match.start()
+            had_unclosed = True
+            break
+        removed_chars += close.end() - match.start()
+        cursor = close.end()
+
+    return ToolDisclosureSanitization(
+        text="".join(out),
+        removed_blocks=removed_blocks,
+        removed_chars=removed_chars,
+        had_unclosed_block=had_unclosed,
+    )
+
+
+class ToolDisclosureStreamScrubber:
+    """Incrementally suppress unauthenticated tool disclosures.
+
+    Safe prose is released immediately. Only a possible partial ``<details``
+    opener or a confirmed typed disclosure is buffered, so chunk boundaries
+    cannot leak a fake tool card and ordinary streaming remains responsive.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._dropping = False
+        self.removed_blocks = 0
+        self.removed_chars = 0
+        self.had_unclosed_block = False
+
+    @staticmethod
+    def _boundary_keep(text: str, prefix: str = _DETAILS_PREFIX) -> int:
+        lowered = text.lower()
+        max_keep = min(len(lowered), len(prefix))
+        for size in range(max_keep, 0, -1):
+            if prefix.startswith(lowered[-size:]):
+                return size
+        return 0
+
+    def feed(self, chunk: str) -> str:
+        if not isinstance(chunk, str) or not chunk:
+            return ""
+        self._buffer += chunk
+        out: list[str] = []
+
+        while self._buffer:
+            if self._dropping:
+                close = _DETAILS_CLOSE_RE.search(self._buffer)
+                if close is None:
+                    keep = self._boundary_keep(
+                        self._buffer, _DETAILS_CLOSE_PREFIX
+                    )
+                    drop_to = len(self._buffer) - keep
+                    self.removed_chars += drop_to
+                    self._buffer = self._buffer[drop_to:]
+                    return "".join(out)
+                self.removed_chars += close.end()
+                self._buffer = self._buffer[close.end():]
+                self._dropping = False
+                continue
+
+            lowered = self._buffer.lower()
+            start = lowered.find(_DETAILS_PREFIX)
+            if start < 0:
+                keep = self._boundary_keep(self._buffer)
+                emit_to = len(self._buffer) - keep
+                out.append(self._buffer[:emit_to])
+                self._buffer = self._buffer[emit_to:]
+                break
+
+            out.append(self._buffer[:start])
+            self._buffer = self._buffer[start:]
+            opening = _DETAILS_OPEN_RE.match(self._buffer)
+            if opening is None:
+                # The opener is split across chunks or lacks its closing '>'.
+                break
+            opening_text = self._buffer[:opening.end()]
+            self._buffer = self._buffer[opening.end():]
+            if _DETAILS_TYPE_RE.search(opening.group("attrs") or ""):
+                self.removed_blocks += 1
+                self.removed_chars += len(opening_text)
+                self._dropping = True
+            else:
+                out.append(opening_text)
+
+        return "".join(out)
+
+    def flush(self) -> str:
+        if self._dropping:
+            self.had_unclosed_block = True
+            self.removed_chars += len(self._buffer)
+            self._buffer = ""
+            self._dropping = False
+            return ""
+        result = strip_model_tool_disclosures(self._buffer)
+        self.removed_blocks += result.removed_blocks
+        self.removed_chars += result.removed_chars
+        self.had_unclosed_block = (
+            self.had_unclosed_block or result.had_unclosed_block
+        )
+        self._buffer = ""
+        return result.text
 
 
 def _sanitize_surrogates(text: str) -> str:

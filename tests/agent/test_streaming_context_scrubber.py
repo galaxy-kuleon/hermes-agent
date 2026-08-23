@@ -182,3 +182,12 @@ class TestBuildMemoryContextBlockWarnsOnViolation:
 
         assert not any("pre-wrapped" in rec.message for rec in caplog.records)
         assert "plain fact about user" in out
+
+    def test_recalled_memory_is_never_labelled_primary_authority(self):
+        from agent.memory_manager import build_memory_context_block
+
+        out = build_memory_context_block("Rule 64 grants an extension")
+        assert "informational background data" in out
+        assert "never as primary authority" in out
+        assert "Verify factual and legal claims" in out
+        assert "authoritative reference data" not in out

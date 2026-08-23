@@ -453,9 +453,9 @@ def _background_review_read_before_write_guard(
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
-    if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {"publish", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
-    existing = _find_skill(name)
+    existing = _find_managed_skill(name)
     if not existing:
         return None
     return _background_review_write_guard(name, existing["path"], action)
@@ -781,6 +781,48 @@ def _find_skill(name: str, namespace: Optional[str] = None) -> Optional[Dict[str
     return None
 
 
+def _find_skill_draft(
+    name: str, namespace: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Find an inactive skill draft without exposing it to skill discovery."""
+    from agent.skill_namespaces import qualify_skill_name
+
+    resolved_namespace, bare_name, error = _normalize_namespace_and_name(
+        name, namespace
+    )
+    if error:
+        return None
+    for root in _skill_roots():
+        if resolved_namespace is not None and root.namespace != resolved_namespace:
+            continue
+        draft_dir = root.path / ".drafts" / bare_name
+        skill_md = draft_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        try:
+            draft_dir.resolve().relative_to(root.path.resolve())
+        except (OSError, ValueError):
+            continue
+        if draft_dir.is_symlink() or root.path.is_symlink():
+            continue
+        return {
+            "path": draft_dir,
+            "root": root.path,
+            "namespace": root.namespace,
+            "owner_user_id": root.owner_user_id,
+            "qualified_name": qualify_skill_name(root.namespace, bare_name),
+            "draft": True,
+        }
+    return None
+
+
+def _find_managed_skill(
+    name: str, namespace: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve an active skill first, then an inactive draft for mutation."""
+    return _find_skill(name, namespace) or _find_skill_draft(name, namespace)
+
+
 def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
     """Submit an org-skill edit upstream when `sync.org_auto_propose` is on.
 
@@ -1029,8 +1071,10 @@ def _create_skill(
     content: str,
     category: str = None,
     namespace: Optional[str] = None,
+    requirements_confirmed: bool = True,
+    enforce_publish_lint: bool = False,
 ) -> Dict[str, Any]:
-    """Create a new user skill with SKILL.md content."""
+    """Draft a new skill and publish only after requirements/lint gates."""
     resolved_namespace, bare_name, namespace_error = _normalize_namespace_and_name(
         name, namespace
     )
@@ -1079,17 +1123,28 @@ def _create_skill(
         root.path.mkdir(parents=True, mode=0o700, exist_ok=True)
         if root_was_missing:
             root.path.chmod(0o700)
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write SKILL.md atomically
-    skill_md = skill_dir / "SKILL.md"
+    # Drafts are deliberately outside discovery/system-prompt roots. This
+    # keeps incomplete model-authored procedure from becoming active while
+    # preserving the proposed bytes for later patch/write_file/publish.
+    draft_dir = root.path / ".drafts" / bare_name
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = draft_dir / "SKILL.md"
     atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
-    scan_error = _security_scan_skill(skill_dir)
+    scan_error = _security_scan_skill(draft_dir)
     if scan_error:
-        shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
+
+    try:
+        from tools.skill_linter import lint_skill
+        lint_findings = lint_skill(skill_md)
+    except Exception:
+        lint_findings = []
+    blocking_lint = [
+        finding for finding in lint_findings
+        if finding.severity == "error" or finding.rule == "dangling-reference"
+    ]
 
     # Extract description from frontmatter for verbose notifications
     _desc = ""
@@ -1103,23 +1158,47 @@ def _create_skill(
 
     result = {
         "success": True,
-        "message": f"Skill '{bare_name}' created.",
-        "path": str(skill_dir.relative_to(root.path)),
+        "message": f"Skill '{bare_name}' draft saved; it is not active.",
+        "path": str(draft_dir.relative_to(root.path)),
         "skill_md": _namespace_relative(skill_md, root.path),
         "namespace": root.namespace,
         "_skills_root": str(root.path),
         "_change": {"description": _desc},
+        "draft": True,
+        "published": False,
     }
     if category:
         result["category"] = category
     result["hint"] = (
-        "To add reference files, templates, or scripts, use "
-        "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(bare_name)
+        "Use patch/write_file to complete this inactive draft, then call "
+        "skill_manage(action='publish', name='{}', requirements_confirmed=true) "
+        "only after the user supplied the complete rules.".format(bare_name)
     )
     from agent.skill_namespaces import qualify_skill_name
     result["qualified_name"] = qualify_skill_name(root.namespace, bare_name)
     _add_description_prompt_preview(result, content)
     _attach_lint_findings(result, skill_md)
+    if not requirements_confirmed:
+        result["publish_blockers"] = [
+            "requirements_confirmed is false; the user's complete rules are not confirmed"
+        ]
+        return result
+    if enforce_publish_lint and blocking_lint:
+        result["publish_blockers"] = [
+            {"severity": f.severity, "rule": f.rule, "message": f.message}
+            for f in blocking_lint
+        ]
+        return result
+
+    skill_dir.parent.mkdir(parents=True, exist_ok=True)
+    draft_dir.replace(skill_dir)
+    result.update({
+        "message": f"Skill '{bare_name}' published and active.",
+        "path": str(skill_dir.relative_to(root.path)),
+        "skill_md": _namespace_relative(skill_dir / "SKILL.md", root.path),
+        "draft": False,
+        "published": True,
+    })
     return result
 
 
@@ -1129,8 +1208,9 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path) -> None:
     The linter enforces the CONTRIBUTING "Skill authoring standards (HARDLINE)"
     conventions that the hard validator does not (shell-utility references,
     missing metadata, dangling reference links, POSIX gating, forbidden files).
-    Findings are ADVISORY — surfaced as guidance so the author can fix them,
-    never a hard block. The hard rejects already ran in _validate_frontmatter.
+    Findings are surfaced as guidance so the author can fix them. Structural
+    errors and dangling references block the public create/publish boundary;
+    remaining warnings are advisory. The hard frontmatter rejects already ran.
     """
     try:
         from tools.skill_linter import lint_skill  # local import: optional path
@@ -1145,10 +1225,89 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path) -> None:
         for f in findings
     ]
     result["lint_hint"] = (
-        "The skill was created. These are advisory authoring-convention "
-        "findings (not blockers) — fix them with skill_manage(action='patch') "
-        "to match Hermes skill standards."
+        "Review these authoring findings. Structural errors and dangling "
+        "references block publish; other warnings remain advisory."
     )
+
+
+def _publish_skill(
+    name: str,
+    category: str = None,
+    namespace: Optional[str] = None,
+    requirements_confirmed: bool = False,
+) -> Dict[str, Any]:
+    """Atomically promote one complete, lint-valid draft into discovery."""
+    if not requirements_confirmed:
+        return {
+            "success": False,
+            "draft": True,
+            "published": False,
+            "error": (
+                "requirements_confirmed=true is required to publish. Set it "
+                "only after the user supplied the complete rules."
+            ),
+        }
+    err = _validate_category(category)
+    if err:
+        return {"success": False, "error": err}
+    if _find_skill(name, namespace):
+        return {"success": False, "error": f"Skill '{name}' is already active."}
+    draft = _find_skill_draft(name, namespace)
+    if not draft:
+        return {
+            "success": False,
+            "error": f"No inactive draft named '{name}' was found.",
+        }
+    skill_md = draft["path"] / "SKILL.md"
+    try:
+        from tools.skill_linter import lint_skill
+        findings = lint_skill(skill_md)
+    except Exception as exc:
+        return {
+            "success": False,
+            "draft": True,
+            "published": False,
+            "error": f"Could not validate draft before publish: {exc}",
+        }
+    blockers = [
+        finding for finding in findings
+        if finding.severity == "error" or finding.rule == "dangling-reference"
+    ]
+    if blockers:
+        return {
+            "success": False,
+            "draft": True,
+            "published": False,
+            "error": "Draft failed publish validation.",
+            "publish_blockers": [
+                {"severity": f.severity, "rule": f.rule, "message": f.message}
+                for f in blockers
+            ],
+        }
+    scan_error = _security_scan_skill(draft["path"])
+    if scan_error:
+        return {
+            "success": False,
+            "draft": True,
+            "published": False,
+            "error": scan_error,
+        }
+    target, root, resolve_error = _resolve_skill_dir(name, category, namespace)
+    if resolve_error or target is None or root is None:
+        return {"success": False, "error": resolve_error or "Skill root unavailable."}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    draft["path"].replace(target)
+    return {
+        "success": True,
+        "message": f"Skill '{name}' published and active.",
+        "path": str(target.relative_to(root.path)),
+        "skill_md": _namespace_relative(target / "SKILL.md", root.path),
+        "namespace": root.namespace,
+        "qualified_name": draft["qualified_name"],
+        "_skills_root": str(root.path),
+        "draft": False,
+        "published": True,
+    }
 
 
 def _edit_skill(
@@ -1163,7 +1322,7 @@ def _edit_skill(
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name, namespace)
+    existing = _find_managed_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
@@ -1210,6 +1369,9 @@ def _edit_skill(
         "_skills_root": str(existing["root"]),
         "_change": {"description": _desc},
     }
+    if existing.get("draft"):
+        result.update({"draft": True, "published": False})
+        result["message"] = f"Inactive draft '{name}' updated (full rewrite)."
     org_note = _maybe_auto_propose_org_edit(name, existing["path"])
     if org_note:
         result["org_sharing"] = org_note
@@ -1236,7 +1398,7 @@ def _patch_skill(
     if new_string is None:
         return {"success": False, "error": "new_string is required for 'patch'. Use an empty string to delete matched text."}
 
-    existing = _find_skill(name, namespace)
+    existing = _find_managed_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
@@ -1330,6 +1492,12 @@ def _patch_skill(
         "qualified_name": existing["qualified_name"],
         "_skills_root": str(existing["root"]),
     }
+    if existing.get("draft"):
+        result.update({"draft": True, "published": False})
+        result["message"] = (
+            f"Patched inactive draft '{name}' ({match_count} "
+            f"replacement{'s' if match_count > 1 else ''})."
+        )
     # Include change previews for verbose notifications
     result["_change"] = {
         "old": old_string[:200] + ("…" if len(old_string) > 200 else ""),
@@ -1358,7 +1526,7 @@ def _delete_skill(
         target must exist on disk. Validated here so the model can't claim an
         umbrella that doesn't exist.
     """
-    existing = _find_skill(name, namespace)
+    existing = _find_managed_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
@@ -1486,7 +1654,7 @@ def _write_file(
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name, namespace)
+    existing = _find_managed_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
@@ -1528,6 +1696,9 @@ def _write_file(
         "qualified_name": existing["qualified_name"],
         "_skills_root": str(existing["root"]),
     }
+    if existing.get("draft"):
+        result.update({"draft": True, "published": False})
+        result["message"] = f"File '{file_path}' written to inactive draft '{name}'."
     org_note = _maybe_auto_propose_org_edit(name, existing["path"])
     if org_note:
         result["org_sharing"] = org_note
@@ -1543,7 +1714,7 @@ def _remove_file(
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name, namespace)
+    existing = _find_managed_skill(name, namespace)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
@@ -1610,7 +1781,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
     """
-    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {"create", "publish", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     if _skill_gate_bypass.get():
         return None
@@ -1690,6 +1861,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
                 new_string=payload.get("new_string"),
                 replace_all=payload.get("replace_all", False),
                 absorbed_into=payload.get("absorbed_into"),
+                requirements_confirmed=payload.get("requirements_confirmed", False),
             )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1794,6 +1966,7 @@ def skill_manage(
     new_string: str = None,
     replace_all: bool = False,
     absorbed_into: str = None,
+    requirements_confirmed: Optional[bool] = None,
     task_id: str = None,
     session_id: str = None,
 ) -> str:
@@ -1813,9 +1986,18 @@ def skill_manage(
         api_server_session = get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server"
     except Exception:
         api_server_session = False
+    requirements_are_confirmed = (
+        bool(requirements_confirmed)
+        if requirements_confirmed is not None
+        else not api_server_session
+    )
     if resolved_namespace is None and api_server_session:
         resolved_namespace = "user"
-    target = None if action == "create" else _find_skill(bare_name, resolved_namespace)
+    target = (
+        None
+        if action == "create"
+        else _find_managed_skill(bare_name, resolved_namespace)
+    )
     target_namespace = (
         resolved_namespace
         or (target.get("namespace") if target else None)
@@ -1840,6 +2022,7 @@ def skill_manage(
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
+        requirements_confirmed=requirements_are_confirmed,
     )
     if gate_result is not None:
         return gate_result
@@ -1854,7 +2037,7 @@ def skill_manage(
     _ledger_root = None
     try:
         from tools import skill_ledger as _ledger
-        _pre = _find_skill(bare_name, target_namespace)
+        _pre = _find_managed_skill(bare_name, target_namespace)
         _ledger_before_dir = _pre["path"] if _pre else None
         target_root = _root_for_namespace(target_namespace)
         # Preserve the long-standing platform ledger/blob locations so
@@ -1881,6 +2064,7 @@ def skill_manage(
             "new_string": new_string,
             "replace_all": replace_all,
             "absorbed_into": absorbed_into,
+            "requirements_confirmed": requirements_are_confirmed,
         }
         try:
             from tools.shared_skill_writer import (
@@ -1901,7 +2085,22 @@ def skill_manage(
     elif action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(bare_name, content, category, target_namespace)
+        result = _create_skill(
+            bare_name,
+            content,
+            category,
+            target_namespace,
+            requirements_confirmed=requirements_are_confirmed,
+            enforce_publish_lint=True,
+        )
+
+    elif action == "publish":
+        result = _publish_skill(
+            bare_name,
+            category,
+            target_namespace,
+            requirements_confirmed=requirements_are_confirmed,
+        )
 
     elif action == "edit":
         if not content:
@@ -1935,13 +2134,13 @@ def skill_manage(
         result = _remove_file(bare_name, file_path, target_namespace)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, publish, edit, patch, delete, write_file, remove_file"}
 
     if result.get("success"):
         # Audit ledger append (best-effort; never blocks the mutation).
         try:
             from tools import skill_ledger as _ledger
-            _post = _find_skill(bare_name, target_namespace)
+            _post = _find_managed_skill(bare_name, target_namespace)
             _after_dir = _post["path"] if _post else None
             _evidence = {}
             if action == "delete":
@@ -1977,7 +2176,7 @@ def skill_manage(
         try:
             from tools.skill_usage import bump_patch, forget, record_created
             from tools.skill_provenance import is_background_review
-            if action == "create":
+            if action in {"create", "publish"} and result.get("published"):
                 record_created(
                     bare_name,
                     agent_created=is_background_review(),
@@ -2007,10 +2206,11 @@ def skill_manage(
         # token), a sync base URL is configured, and the skill is opted into
         # sync. Debounced so a burst of edits collapses to one push. Never
         # raises -- an agent write must never block on sync (M1-C invariant).
-        try:
-            _maybe_debounced_sync_push(bare_name)
-        except Exception:
-            pass
+        if not result.get("draft"):
+            try:
+                _maybe_debounced_sync_push(bare_name)
+            except Exception:
+                pass
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -2025,7 +2225,9 @@ SKILL_MANAGE_SCHEMA = {
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
         f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
-        "Actions: create (full SKILL.md + optional category), "
+        "Actions: create (save a draft; publish immediately only when "
+        "requirements_confirmed=true and validation passes), publish (promote "
+        "a completed inactive draft), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "delete, write_file, remove_file.\n\n"
@@ -2060,7 +2262,7 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["create", "publish", "patch", "edit", "delete", "write_file", "remove_file"],
                 "description": "The action to perform."
             },
             "name": {
@@ -2111,8 +2313,18 @@ SKILL_MANAGE_SCHEMA = {
                 "description": (
                     "Optional category/domain for organizing the skill (e.g., 'devops', "
                     "'data-science', 'mlops'). Creates a subdirectory grouping. "
-                    "Only used with 'create'."
+                    "Used with 'create' or 'publish'."
                 )
+            },
+            "requirements_confirmed": {
+                "type": "boolean",
+                "description": (
+                    "For create/publish: true only when the user has supplied "
+                    "and confirmed the complete rules. False or omitted keeps "
+                    "create as an inactive draft and blocks publish. Never "
+                    "infer missing requirements or set this merely to finish."
+                ),
+                "default": False,
             },
             "file_path": {
                 "type": "string",
@@ -2166,6 +2378,7 @@ registry.register(
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
+        requirements_confirmed=args.get("requirements_confirmed"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id")),
     emoji="📝",

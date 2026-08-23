@@ -42,6 +42,7 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
+    strip_model_tool_disclosures,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -2171,6 +2172,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if isinstance(_san_content, str) and _san_content:
         _san_content = agent._strip_think_blocks(_san_content).strip()
 
+    # Harness disclosure is constructed only from authenticated native tool
+    # callbacks. Model-authored lookalike HTML is plain untrusted text and must
+    # never enter state.db or a rendered response as proof of execution.
+    _tool_disclosure_cleaning = strip_model_tool_disclosures(_san_content)
+    _san_content = _tool_disclosure_cleaning.text.strip()
+
     # Defence-in-depth: redact credentials (PATs, API keys, Bearer tokens)
     # from assistant content BEFORE the message enters conversation history.
     # If the model accidentally inlines a secret in its natural-language
@@ -2199,6 +2206,18 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         "reasoning": reasoning_text,
         "finish_reason": finish_reason,
     })
+    if _tool_disclosure_cleaning.removed_blocks:
+        msg["_model_tool_disclosure_removed"] = {
+            "blocks": _tool_disclosure_cleaning.removed_blocks,
+            "chars": _tool_disclosure_cleaning.removed_chars,
+            "unclosed": _tool_disclosure_cleaning.had_unclosed_block,
+        }
+        logger.warning(
+            "Removed %d unauthenticated model-authored tool disclosure "
+            "block(s), %d chars, before assistant persistence",
+            _tool_disclosure_cleaning.removed_blocks,
+            _tool_disclosure_cleaning.removed_chars,
+        )
 
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None and hasattr(assistant_message, "model_extra"):

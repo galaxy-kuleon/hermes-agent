@@ -278,6 +278,19 @@ class TestSkillsList:
         assert filtered["count"] == 1
         assert filtered["skills"][0]["name"] == "skill-a"
 
+    def test_frontmatter_category_is_authoritative_for_flat_user_skill(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "hk-legal",
+                frontmatter_extra="category: legal\n",
+            )
+            filtered = json.loads(skills_list(category="legal"))
+
+        assert filtered["count"] == 1
+        assert filtered["skills"][0]["name"] == "hk-legal"
+        assert filtered["skills"][0]["category"] == "legal"
+
     def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"
         skills_root = tmp_path / "skills"

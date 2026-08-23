@@ -448,8 +448,16 @@ class TestSkillManageDispatcher:
                  patch("tools.skill_usage.is_hub_installed", return_value=False), \
                  patch("tools.skill_usage.is_bundled",
                        side_effect=lambda skill_name: skill_name == "bundled"):
-                skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+                skill_manage(
+                    action="create",
+                    name="umbrella",
+                    content=VALID_SKILL_CONTENT.replace("name: test-skill", "name: umbrella"),
+                )
+                skill_manage(
+                    action="create",
+                    name="bundled",
+                    content=VALID_SKILL_CONTENT.replace("name: test-skill", "name: bundled"),
+                )
                 raw = skill_manage(
                     action="delete",
                     name="bundled",

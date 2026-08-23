@@ -813,7 +813,17 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if len(description) > MAX_DESCRIPTION_LENGTH:
                     description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
-                category = _get_category_from_path(skill_md)
+                # Frontmatter is the skill author's canonical domain policy.
+                # The directory path is only a legacy organization fallback;
+                # user namespaces are tenant-prefixed and cannot be decoded as
+                # a category by _get_category_from_path.
+                declared_category = frontmatter.get("category")
+                category = (
+                    declared_category.strip()
+                    if isinstance(declared_category, str)
+                    and declared_category.strip()
+                    else _get_category_from_path(skill_md)
+                )
 
                 seen_names.add(name)
                 skills.append({

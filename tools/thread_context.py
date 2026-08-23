@@ -99,6 +99,16 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
     def _runner(*args, **kwargs):
         def _inner():
+            # ThreadPoolExecutor workers are reused. Clear before installing so
+            # a request with no parent session cannot inherit the previous
+            # request's id; clear again in finally so early failures do not
+            # poison the next job on this worker.
+            try:
+                from hermes_logging import clear_session_context
+                clear_session_context()
+            except Exception:
+                logger.debug("Could not clear stale worker session context",
+                             exc_info=True)
             if parent_session_id:
                 try:
                     from hermes_logging import set_session_context
@@ -122,6 +132,12 @@ def propagate_context_to_thread(target: Callable) -> Callable:
             try:
                 return target(*args, **kwargs)
             finally:
+                try:
+                    from hermes_logging import clear_session_context
+                    clear_session_context()
+                except Exception:
+                    logger.debug("Could not clear worker session context",
+                                 exc_info=True)
                 if setters is not None:
                     set_approval, set_sudo = setters
                     try:
