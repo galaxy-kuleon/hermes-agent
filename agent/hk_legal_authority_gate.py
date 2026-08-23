@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-MAX_AUTHORITY_NUDGES = 2
+MAX_AUTHORITY_NUDGES = 3
 
 _HK_RE = re.compile(r"(?:\bhong\s+kong\b|\bhk\b|香港)", re.IGNORECASE)
 _LEGAL_RE = re.compile(
@@ -24,6 +24,14 @@ _LEGAL_RE = re.compile(
     r"\brule\s+\d|\bcap\.?\s*\d)",
     re.IGNORECASE,
 )
+_REGISTERED_MARK_DISPUTE_RE = re.compile(
+    r"(?:trade\s*marks?|trademarks?|商標|商标).{0,240}"
+    r"(?:registered|registration|註冊|注册)|"
+    r"(?:registered|registration|註冊|注册).{0,240}"
+    r"(?:trade\s*marks?|trademarks?|商標|商标)",
+    re.IGNORECASE | re.DOTALL,
+)
+_REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "52", "53"})}
 
 
 @dataclass(frozen=True)
@@ -70,7 +78,7 @@ def _json_objects(value: Any) -> Iterable[dict[str, Any]]:
 
 def successful_authorities(
     messages: list[Any], *, current_turn_user_idx: int
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Return verified official authority results from this user turn only."""
     if current_turn_user_idx < 0:
         return []
@@ -103,17 +111,47 @@ def successful_authorities(
                             "required_answer_citation": str(
                                 result.get("required_answer_citation") or ""
                             ).strip(),
+                            "provisions": tuple(
+                                str(row.get("provision") or "").strip()
+                                for row in (result.get("requested_provisions") or [])
+                                if isinstance(row, dict) and row.get("found") is True
+                            ),
                         }
                     )
     return authorities
 
 
-def _answer_cites_authorities(answer: str, authorities: list[dict[str, str]]) -> bool:
+def _citation_date(version_date: str) -> str:
+    """Return the public date used by HKeL's required answer citation."""
+    return version_date.split("T", 1)[0]
+
+
+def _answer_cites_authorities(answer: str, authorities: list[dict[str, Any]]) -> bool:
     return all(
         authority["official_web_url"] in answer
-        and authority["version_date"] in answer
+        and _citation_date(authority["version_date"]) in answer
         for authority in authorities
     )
+
+
+def _minimum_provisions(user_message: Any) -> dict[str, frozenset[str]]:
+    text = _message_text(user_message)
+    if _REGISTERED_MARK_DISPUTE_RE.search(text):
+        return _REGISTERED_MARK_MINIMUM
+    return {}
+
+
+def _missing_minimum_provisions(
+    user_message: Any, authorities: list[dict[str, Any]]
+) -> dict[str, list[str]]:
+    covered: dict[str, set[str]] = {}
+    for authority in authorities:
+        covered.setdefault(authority["chapter"], set()).update(authority["provisions"])
+    return {
+        chapter: sorted(required - covered.get(chapter, set()), key=lambda x: int(x))
+        for chapter, required in _minimum_provisions(user_message).items()
+        if required - covered.get(chapter, set())
+    }
 
 
 def evaluate_hk_legal_answer(
@@ -148,6 +186,29 @@ def evaluate_hk_legal_answer(
             "fail",
             "無法提供可依賴的香港法例結論：本回合未能成功讀取香港電子法例的官方現行文本。"
             "為免誤導，我不會重複未經官方法源確認的條文、期限、表格、費用或救濟建議。",
+        )
+
+    missing = _missing_minimum_provisions(
+        messages[current_turn_user_idx], authorities
+    )
+    if missing:
+        calls = "; ".join(
+            f"chapter='{chapter}', provisions={provisions}"
+            for chapter, provisions in missing.items()
+        )
+        if attempts < max_attempts:
+            return GateDecision(
+                "nudge",
+                "[System: The official lookup was incomplete for this registered "
+                "Hong Kong trade-mark dispute. Use hk_legal_authority to read the "
+                "missing minimum provisions before answering: "
+                f"{calls}. Then give one complete answer grounded in all successful "
+                "current-turn results, including each official URL and version date.]",
+            )
+        return GateDecision(
+            "fail",
+            "無法提供可依賴的香港商標法結論：本回合未能完整讀取已註冊商標爭議所需的"
+            "最低官方法源集合。為免誤導，本次不提供不完整的救濟建議。",
         )
 
     if not _answer_cites_authorities(final_response, authorities):

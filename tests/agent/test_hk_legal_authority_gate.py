@@ -29,6 +29,10 @@ def _authority_message():
                     "Hong Kong e-Legislation, Cap. 559, current version "
                     "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
                 ),
+                "requested_provisions": [
+                    {"provision": provision, "found": True}
+                    for provision in ("11", "12", "52", "53")
+                ],
             }
         ),
     }
@@ -92,6 +96,43 @@ def test_successful_tool_still_requires_visible_url_and_version():
     assert "https://www.elegislation.gov.hk/hk/cap559!en" in decision.message
 
 
+def test_registered_mark_dispute_requires_complete_minimum_provision_set():
+    partial = _authority_message()
+    payload = json.loads(partial["content"])
+    payload["requested_provisions"] = [
+        {"provision": provision, "found": True}
+        for provision in ("44", "52", "53")
+    ]
+    partial["content"] = json.dumps(payload)
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": PROMPT}, partial],
+        current_turn_user_idx=0,
+        final_response=(
+            "2025-02-14 https://www.elegislation.gov.hk/hk/cap559!en"
+        ),
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "['11', '12']" in decision.message
+
+
+def test_hkel_timestamp_is_cited_by_its_public_calendar_date():
+    authority = _authority_message()
+    payload = json.loads(authority["content"])
+    payload["version_date"] = "2025-02-14T00:00:00"
+    authority["content"] = json.dumps(payload)
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=(
+            "Current version 2025-02-14: "
+            "https://www.elegislation.gov.hk/hk/cap559!en"
+        ),
+        attempts=1,
+    )
+    assert decision.action == "pass"
+
+
 def test_verified_and_cited_answer_passes():
     messages = [{"role": "user", "content": PROMPT}, _authority_message()]
     decision = evaluate_hk_legal_answer(
@@ -111,7 +152,7 @@ def test_retry_exhaustion_fails_closed_instead_of_returning_claims():
         messages=[{"role": "user", "content": PROMPT}],
         current_turn_user_idx=0,
         final_response="Section 47 definitely applies.",
-        attempts=2,
+        attempts=3,
     )
     assert decision.action == "fail"
     assert "無法提供" in decision.message

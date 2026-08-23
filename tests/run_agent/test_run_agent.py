@@ -3007,6 +3007,10 @@ class TestRunConversation:
                     "Hong Kong e-Legislation, Cap. 559, current version "
                     "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
                 ),
+                "requested_provisions": [
+                    {"provision": provision, "found": True}
+                    for provision in ("11", "12", "52", "53")
+                ],
             }
         )
         with (
