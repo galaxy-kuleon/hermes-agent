@@ -3754,8 +3754,6 @@ class ContextCompressor(ContextEngine):
         """
         if self.proactive_prune_tokens <= 0:
             return messages, 0
-        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
-            return messages, 0
         # Nothing to reclaim until there are messages outside the protected tail.
         if (
             len(messages)
@@ -3765,6 +3763,15 @@ class ContextCompressor(ContextEngine):
         ):
             return messages, 0
         before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+        # Provider usage describes the PREVIOUS request. Immediately after a
+        # giant read_file result is appended it can therefore under-report the
+        # next prompt by tens of thousands of tokens. Gate on whichever is
+        # larger: the last exact provider count or the current deterministic
+        # estimate. This is what lets divide-and-conquer happen before the
+        # first expensive 122B prefill instead of one model call too late.
+        effective_current_tokens = max(int(current_tokens or 0), before)
+        if effective_current_tokens < self.proactive_prune_tokens:
+            return messages, 0
         if before < self._proactive_prune_rearm_tokens:
             return messages, 0
         # Capability gate BEFORE the expensive 3-pass scan: a bound store that

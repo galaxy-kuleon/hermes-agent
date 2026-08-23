@@ -122,6 +122,21 @@ def test_dedicated_tail_defaults_to_full_compression_tail():
     assert c.proactive_prune_protect_last_n == 3
 
 
+def test_current_message_estimate_triggers_before_stale_provider_usage():
+    """A newly appended document must be pruned before its first huge prefill."""
+    c = _compressor(
+        proactive_prune_protect_last_n=2,
+        proactive_prune_tokens=48_000,
+        proactive_prune_min_result_chars=8_000,
+    )
+    msgs = _build(5, big_indices={0, 1, 2, 3, 4}, big_chars=50_000)
+
+    result, pruned = c.prune_tool_results_only(msgs, current_tokens=3_000)
+
+    assert pruned >= 4
+    assert result is not msgs
+
+
 
 
 
