@@ -131,7 +131,9 @@ def _normalize_range(start: int, end: int) -> tuple[int, int] | None:
 # honesty defect inverted -- and it lands exactly when the model did the right
 # thing and continued.
 _EXTENT_GAP_PREFIXES = ("uncovered_lines=",)
-_EXTENT_GAP_MARKERS = frozenset({"unknown_total", "oversize_truncated"})
+_EXTENT_GAP_MARKERS = frozenset(
+    {"unknown_total", "oversize_truncated", "partial_read"}
+)
 
 
 def is_extent_gap(gap: object) -> bool:
@@ -160,6 +162,23 @@ def merge_ranges(ranges: list[list[int] | tuple[int, int]]) -> list[list[int]]:
         else:
             merged.append([s, e])
     return merged
+
+
+def clamp_ranges_to_total(
+    ranges: list[list[int] | tuple[int, int]], total: int | None
+) -> list[list[int]]:
+    """Return inclusive ranges limited to the known document extent.
+
+    A read requested beyond EOF can still return a durable tool row. That row
+    is evidence of an attempted read, but it is not document coverage and must
+    not create a phantom gap after the real final line.
+    """
+    merged = merge_ranges(ranges)
+    if total is None or total <= 0:
+        return merged
+    return merge_ranges(
+        [[start, min(end, total)] for start, end in merged if start <= total]
+    )
 
 
 def ranges_cover_total(ranges: list[list[int]], total: int | None) -> bool:
@@ -247,7 +266,7 @@ def record_outcome(
             ranges.extend(extent["ranges"])  # type: ignore[arg-type]
         elif extent.get("start") is not None and extent.get("end") is not None:
             ranges.append([extent["start"], extent["end"]])
-    ranges = merge_ranges(ranges)
+    ranges = clamp_ranges_to_total(ranges, total)
 
     # Force partial when claimed complete but extent incomplete.
     if status == OUTCOME_READ:

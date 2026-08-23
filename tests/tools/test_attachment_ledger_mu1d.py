@@ -18,7 +18,9 @@ from tools.attachment_ledger import (
     OUTCOME_READ,
     OUTCOME_UNREADABLE,
     append_coverage_footer,
+    attachment_ledger_scope,
     build_coverage_footer,
+    clamp_ranges_to_total,
     finalize_attachment_coverage,
     get_outcome,
     merge_ranges,
@@ -315,6 +317,33 @@ class TruncatedReadExtentTests(unittest.TestCase):
         self.assertEqual(merge_ranges([[1, 100], [101, 200]]), [[1, 200]])
         self.assertTrue(ranges_cover_total([[1, 601]], 601))
         self.assertFalse(ranges_cover_total([[1, 500]], 601))
+
+    def test_beyond_eof_attempt_does_not_create_phantom_gap(self):
+        self.assertEqual(
+            clamp_ranges_to_total([[1, 6267], [6499, 6500]], 6267),
+            [[1, 6267]],
+        )
+
+    def test_paginated_marker_clears_after_full_union(self):
+        path = self.root / "001-cccc3333-long.txt"
+        path.write_text("a\nb\nc\n", encoding="utf-8")
+        with attachment_ledger_scope("tz"):
+            self.assertEqual(
+                record_read_extent(
+                    str(path), task_id="tz", start=1, end=2, total=3,
+                    format_gaps=["partial_read"],
+                ),
+                OUTCOME_PARTIAL,
+            )
+            self.assertEqual(
+                record_read_extent(
+                    str(path), task_id="tz", start=3, end=3, total=3,
+                ),
+                OUTCOME_READ,
+            )
+            outcome = get_outcome(str(path), task_id="tz")
+            self.assertEqual(outcome["ranges"], [[1, 3]])
+            self.assertEqual(outcome["gaps"], [])
 
 
 class StreamSuffixTests(unittest.TestCase):
