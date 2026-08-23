@@ -175,6 +175,17 @@ class TestCreateSkill:
         assert "Invalid category '../escape'" in result["error"]
         assert not (tmp_path / "escape").exists()
 
+    def test_create_validation_error_returns_copyable_bounded_frontmatter(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("taiwan-trademark", LONG_DESC_CONTENT)
+
+        assert result["success"] is False
+        frontmatter = result["retry_frontmatter"]
+        parsed, _ = parse_frontmatter(frontmatter + "\n\n# Instructions\nDo the work.\n")
+        assert parsed["name"] == "taiwan-trademark"
+        assert len(parsed["description"]) <= SKILL_PROMPT_DESC_LIMIT
+        assert "copy" in result["retry_instruction"].lower()
+
 
     def test_edit_long_desc_still_allowed_with_preview(self, tmp_path):
         """Edit/patch paths stay permissive so existing over-limit skills

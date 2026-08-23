@@ -1066,6 +1066,16 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
+def _create_retry_frontmatter(name: str) -> str:
+    """Return a valid, bounded frontmatter block a model can copy verbatim."""
+    prefix = "Use for "
+    suffix = " tasks."
+    budget = SKILL_PROMPT_DESC_LIMIT - len(prefix) - len(suffix)
+    label = str(name).replace("-", " ").replace("_", " ")[:budget].rstrip()
+    description = f"{prefix}{label}{suffix}"
+    return f"---\nname: {name}\ndescription: {description}\n---"
+
+
 def _create_skill(
     name: str,
     content: str,
@@ -1092,7 +1102,15 @@ def _create_skill(
     # Validate content
     err = _validate_frontmatter(content, new_skill=True)
     if err:
-        return {"success": False, "error": err}
+        return {
+            "success": False,
+            "error": err,
+            "retry_frontmatter": _create_retry_frontmatter(bare_name),
+            "retry_instruction": (
+                "Copy retry_frontmatter verbatim at the top, preserve the detailed "
+                "instructions in the body below it, and retry create once."
+            ),
+        }
 
     err = _validate_content_size(content)
     if err:
