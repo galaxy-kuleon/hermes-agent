@@ -243,6 +243,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # HK legal authority stop-gate: both an ungrounded assistant candidate and
+    # its corrective user nudge are private retry scaffolding. Never persist or
+    # replay either as genuine user-visible conversation history.
+    "_hk_legal_authority_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an

@@ -90,6 +90,7 @@ from agent.retry_utils import (
 )
 from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
+from agent.hk_legal_authority_gate import evaluate_hk_legal_answer
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
@@ -1885,6 +1886,9 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    # Bounded, per-user-turn budget for the deterministic HK statutory-law
+    # authority stop gate. It must reset between turns on cached agents.
+    hk_legal_authority_nudges = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
     # overflow/413 retry handlers, and the post-tool compaction gate. The
@@ -8040,9 +8044,56 @@ def run_conversation(
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
                         or messages[-1].get("_model_tool_disclosure_nudge")
+                        or messages[-1].get("_hk_legal_authority_synthetic")
                     )
                 ):
                     messages.pop()
+
+                # ── Hong Kong statutory-law authority stop gate ───────
+                # Prompt policy is insufficient when a stale user skill tells
+                # a small model to use incorrect provisions. Before exposing a
+                # legal conclusion, require a successful official HKeL lookup
+                # from THIS user turn and a visible URL + version citation.
+                _hk_legal_decision = evaluate_hk_legal_answer(
+                    messages=messages,
+                    current_turn_user_idx=current_turn_user_idx,
+                    final_response=final_response or "",
+                    attempts=hk_legal_authority_nudges,
+                )
+
+                if _hk_legal_decision and _hk_legal_decision.action == "nudge":
+                    hk_legal_authority_nudges += 1
+                    final_msg["finish_reason"] = "hk_legal_authority_required"
+                    final_msg["_hk_legal_authority_synthetic"] = True
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _hk_legal_decision.message,
+                        "_hk_legal_authority_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.warning(
+                        "HK legal answer rejected pending official authority "
+                        "(attempt %d, session=%s)",
+                        hk_legal_authority_nudges,
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    agent._emit_status(
+                        "↻ 香港法律答案未通過官方法源閘門 — 正在查核現行法例"
+                    )
+                    final_response = None
+                    continue
+
+                if _hk_legal_decision and _hk_legal_decision.action == "fail":
+                    logger.error(
+                        "HK legal answer failed closed after %d authority nudges "
+                        "(session=%s)",
+                        hk_legal_authority_nudges,
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    final_response = _hk_legal_decision.message
+                    final_msg["content"] = final_response
+                    final_msg["finish_reason"] = "hk_legal_authority_unconfirmed"
 
                 try:
                     from agent.verification_stop import (

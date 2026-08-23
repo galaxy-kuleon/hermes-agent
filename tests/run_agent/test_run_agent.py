@@ -2966,6 +2966,71 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_hk_legal_answer_is_retried_until_current_official_result_is_cited(self, agent):
+        self._setup_agent(agent)
+        agent.tools = _make_tool_defs("hk_legal_authority")
+        agent.valid_tool_names = {"hk_legal_authority"}
+        tc = _mock_tool_call(
+            name="hk_legal_authority",
+            arguments='{"chapter":"559","provisions":["53"]}',
+            call_id="hkel-1",
+        )
+        ungrounded = _mock_response(
+            content="Section 47 is definitely the invalidity route.",
+            finish_reason="stop",
+        )
+        tool_call = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+        )
+        grounded = _mock_response(
+            content=(
+                "Section 53 is the invalidity route. Current version "
+                "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+            ),
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            ungrounded,
+            tool_call,
+            grounded,
+        ]
+        authority = json.dumps(
+            {
+                "success": True,
+                "cannot_confirm": False,
+                "chapter": "559",
+                "version_date": "2025-02-14",
+                "official_web_url": "https://www.elegislation.gov.hk/hk/cap559!en",
+                "required_answer_citation": (
+                    "Hong Kong e-Legislation, Cap. 559, current version "
+                    "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+                ),
+            }
+        )
+        with (
+            patch("run_agent.handle_function_call", return_value=authority),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Apply Hong Kong Trade Mark law. What remedy do I have?"
+            )
+
+        assert result["api_calls"] == 3
+        assert result["completed"] is True
+        assert result["final_response"] == grounded.choices[0].message.content
+        assert all(
+            not message.get("_hk_legal_authority_synthetic")
+            for message in result["messages"]
+        )
+        assert all(
+            "Section 47 is definitely" not in str(message.get("content") or "")
+            for message in result["messages"]
+        )
+
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
