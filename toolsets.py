@@ -238,7 +238,7 @@ TOOLSETS = {
         "description": "File handoff, manipulation, search, and local document export tools",
         "tools": [
             "attachments", "read_file", "write_file", "patch", "search_files",
-            "local_document_export",
+            "local_document_export", "hk_legal_authority",
         ],
         "includes": []
     },

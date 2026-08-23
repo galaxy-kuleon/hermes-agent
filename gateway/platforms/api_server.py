@@ -76,6 +76,25 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
+
+def _merge_api_system_prompts(configured: Any, request_prompt: Any) -> str:
+    """Merge API-client instructions with the profile's durable policy.
+
+    The native gateway already loads ``display.personality`` /
+    ``agent.system_prompt``.  The API adapter previously forwarded only the
+    client request's system message, which made the exact same configured
+    policy silently disappear for OpenWebUI.  Keep the request overlay, then
+    append the local profile policy so it remains the final system-level
+    contract.  Exact duplicates are emitted once.
+    """
+    request_text = str(request_prompt or "").strip()
+    configured_text = str(configured or "").strip()
+    if not configured_text:
+        return request_text
+    if not request_text or request_text == configured_text:
+        return configured_text
+    return f"{request_text}\n\n{configured_text}"
+
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
         return ["once", "deny"]
@@ -4735,6 +4754,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
+        from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+
+        configured_prompt = (
+            os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "").strip()
+            or resolve_ephemeral_system_prompt_from_config(user_config)
+        )
+        ephemeral_system_prompt = _merge_api_system_prompts(
+            configured_prompt,
+            ephemeral_system_prompt,
+        )
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Schema-level skill ACL minimization (issue #12): hide skill toolsets the
         # caller cannot use. Runtime gates remain authoritative.

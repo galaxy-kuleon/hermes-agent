@@ -38,6 +38,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _merge_api_system_prompts,
     _redact_api_error_text,
     _request_agent_overrides,
     check_api_server_requirements,
@@ -158,6 +159,12 @@ class TestIdempotencyCache:
 
 
 class TestAdapterInit:
+    def test_api_system_prompt_keeps_client_overlay_and_durable_policy(self):
+        assert _merge_api_system_prompts("durable policy", "client instructions") == (
+            "client instructions\n\ndurable policy"
+        )
+        assert _merge_api_system_prompts("durable policy", "durable policy") == "durable policy"
+
     def test_default_config(self):
         config = PlatformConfig(enabled=True)
         adapter = APIServerAdapter(config)
@@ -203,7 +210,10 @@ class TestAdapterInit:
         monkeypatch.setattr(
             "gateway.run._load_gateway_config",
             lambda: {
-                "agent": {"reasoning_effort": "xhigh"},
+                "agent": {
+                    "reasoning_effort": "xhigh",
+                    "system_prompt": "durable policy",
+                },
                 "checkpoints": {
                     "enabled": True,
                     "max_snapshots": 7,
@@ -222,7 +232,10 @@ class TestAdapterInit:
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
-        agent = adapter._create_agent(session_id="api-session")
+        agent = adapter._create_agent(
+            session_id="api-session",
+            ephemeral_system_prompt="client instructions",
+        )
 
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
@@ -230,6 +243,9 @@ class TestAdapterInit:
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
+        assert captured["ephemeral_system_prompt"] == (
+            "client instructions\n\ndurable policy"
+        )
 
 
 # ---------------------------------------------------------------------------

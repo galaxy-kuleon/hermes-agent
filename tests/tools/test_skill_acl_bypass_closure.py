@@ -84,6 +84,10 @@ def _denied(result: str) -> bool:
 # ── file toolset split (backward compatible) ─────────────────────────────────
 
 def test_file_toolset_split_backward_compatible():
+    # Mirror production startup before asserting registry-extended toolsets.
+    from tools.registry import discover_builtin_tools
+
+    discover_builtin_tools()
     # `attachments` is read-only introspection over the caller's own request
     # grants, so it sits in file_read and must never reach file_write.
     assert set(resolve_toolset("file_read")) == {
@@ -93,7 +97,7 @@ def test_file_toolset_split_backward_compatible():
     assert set(resolve_toolset("file_write")) == {"write_file", "patch"}
     assert set(resolve_toolset("file")) == {
         "read_file", "search_files", "local_document_export", "attachments",
-        "write_file", "patch",
+        "write_file", "patch", "hk_legal_authority",
     }
 
 
