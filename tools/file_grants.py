@@ -50,6 +50,13 @@ def make_file_handles(paths: Iterable[str | Path]) -> dict[str, str]:
     return handles
 
 
+def _handle_sort_key(name: str) -> tuple[int, int, str]:
+    match = _HANDLE_RE.match(name)
+    if match:
+        return 0, int(match.group(1)[1:]), ""
+    return 1, 0, name
+
+
 @contextmanager
 def file_grant_scope(
     task_id: str,
@@ -123,26 +130,39 @@ def resolve_grant_alias(value: str | Path, *, task_id: str) -> str:
 
 
 def list_file_handles(task_id: str) -> list[tuple[str, str]]:
-    """Return `(handle, canonical_path)` for this request, in handle order."""
+    """Return one model-visible handle per canonical attachment.
+
+    Trusted adapters may bind both an opaque upload identity and an ``F01``
+    handle to the same path. Both aliases remain resolvable for authorization,
+    but inventory/coverage must count the underlying upload once. Prefer the
+    short ``F`` handle so models do not retype UUIDs.
+    """
     aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
-    return sorted(aliases.items())
+    by_path: dict[str, list[str]] = {}
+    for name, target in aliases.items():
+        by_path.setdefault(target, []).append(name)
+
+    representatives = []
+    for target, names in by_path.items():
+        preferred = sorted(names, key=_handle_sort_key)[0]
+        representatives.append((preferred, target))
+    return sorted(representatives, key=lambda item: _handle_sort_key(item[0]))
 
 
 def file_handle_for_path(path: str | Path, *, task_id: str) -> str | None:
     """Return the current request's handle for *path*, if it has one."""
     canonical_path = _canonical_path(path)
-    aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
-    for handle, target in aliases.items():
+    for handle, target in list_file_handles(task_id):
         if target == canonical_path:
             return handle
     return None
 
 
 def _known_handles_hint(task_id: str) -> str:
-    aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
-    if not aliases:
+    handles = list_file_handles(task_id)
+    if not handles:
         return ""
-    names = sorted(aliases)
+    names = [name for name, _target in handles]
     shown = names[:_MAX_LISTED_HANDLES]
     listed = ", ".join(shown)
     if len(names) > len(shown):

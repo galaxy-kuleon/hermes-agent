@@ -107,6 +107,37 @@ def test_grants_propagate_to_concurrent_tool_worker(tmp_path):
     assert "not granted" in denied_error.lower()
 
 
+def test_inventory_deduplicates_aliases_but_both_stay_authorized(tmp_path):
+    from tools.attachments_tool import attachments_tool
+    from tools.file_grants import (
+        file_grant_scope,
+        list_file_handles,
+        resolve_file_grant,
+    )
+
+    attached = tmp_path / "handoff" / "user" / "u1" / "report.pdf"
+    attached.parent.mkdir(parents=True)
+    attached.write_bytes(b"pdf")
+    opaque_id = "550f3404-a42b-40c8-9a2c-c9282188b177"
+
+    with file_grant_scope(
+        "task-1",
+        [attached],
+        handles={opaque_id: attached, "F01": attached},
+    ):
+        canonical = str(attached.resolve())
+        assert list_file_handles("task-1") == [("F01", canonical)]
+        assert resolve_file_grant(
+            "F01", task_id="task-1", operation="read"
+        ) == (canonical, None)
+        assert resolve_file_grant(
+            opaque_id, task_id="task-1", operation="read"
+        ) == (canonical, None)
+        inventory = json.loads(attachments_tool(task_id="task-1"))
+        assert inventory["total"] == 1
+        assert inventory["unread_ids"] == ["F01"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native", [True, False])
 async def test_vision_handler_forwards_task_id_to_both_local_path_consumers(
