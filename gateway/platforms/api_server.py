@@ -4834,6 +4834,10 @@ class APIServerAdapter(BasePlatformAdapter):
             process_completion_queue_depth=process_depth,
             active_delegations=active_delegations,
         )
+        from gateway.openwebui_bridge import load_known_openwebui_user_ids
+
+        known_user_count = len(load_known_openwebui_user_ids())
+        dreaming_status = self._openwebui_bridge().status(org=True)
         return web.json_response({
             "status": readiness["status"],
             "readiness": readiness,
@@ -4856,6 +4860,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
+            "dreaming": {
+                "enabled": os.getenv("HERMES_DREAMING_ENABLED", "false").lower()
+                in {"1", "true", "yes", "on"},
+                "known_openwebui_user_count": known_user_count,
+                "org_phase": dreaming_status.get("phase", "never_run"),
+                "org_distinct_users": int(dreaming_status.get("distinct_users") or 0),
+            },
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -10304,9 +10315,16 @@ class APIServerAdapter(BasePlatformAdapter):
         - Persists the activity table so a container restart doesn't lose
           any pending commits (P0).
         """
+        user_id = scope.get("user_id", "")
+        if user_id:
+            try:
+                from gateway.openwebui_bridge import record_known_openwebui_user
+
+                record_known_openwebui_user(user_id)
+            except Exception as exc:
+                logger.debug("[api_server] known-user registry update failed: %s", exc)
         if not session_id:
             return
-        user_id = scope.get("user_id", "")
         chat_id = scope.get("chat_id", "")
         # P1: detect chat-switch BEFORE we register the new session, so
         # we look at the dict in its pre-touch state.

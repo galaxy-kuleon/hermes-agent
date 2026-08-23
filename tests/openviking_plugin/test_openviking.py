@@ -958,6 +958,53 @@ class TestEnsureClientReloadsEnv:
         assert "process-completeness" in out["error"]
         assert provider._client.posts == []
 
+    def test_preference_requires_exact_current_user_evidence(self, monkeypatch):
+        class _StubClient:
+            def __init__(self, *args, **kwargs):
+                self.posts = []
+
+            def health(self):
+                return True
+
+            def post(self, path, payload=None, **kwargs):
+                self.posts.append((path, payload or {}))
+                return {"result": {"written_bytes": 1}}
+
+        monkeypatch.setattr("plugins.memory.openviking._VikingClient", _StubClient)
+        monkeypatch.setenv("OPENVIKING_ENDPOINT", "https://openviking.example")
+        monkeypatch.setenv("OPENVIKING_API_KEY", "sk-test")
+        provider = OpenVikingMemoryProvider()
+        provider.initialize("session-preference-evidence")
+
+        rejected = json.loads(
+            provider.handle_tool_call(
+                "viking_remember",
+                {
+                    "content": "User prefers concise answers.",
+                    "category": "preference",
+                    "evidence": "I prefer concise answers",
+                },
+                messages=[{"role": "user", "content": "Review this legal file."}],
+            )
+        )
+        accepted = json.loads(
+            provider.handle_tool_call(
+                "viking_remember",
+                {
+                    "content": "User prefers concise answers.",
+                    "category": "preference",
+                    "evidence": "I prefer concise answers",
+                },
+                messages=[
+                    {"role": "user", "content": "I prefer concise answers across chats."}
+                ],
+            )
+        )
+
+        assert "error" in rejected
+        assert accepted["status"] == "stored"
+        assert len(provider._client.posts) == 1
+
     def test_concurrent_refresh_does_not_return_stale_client(self, monkeypatch):
         refresh_entered = threading.Event()
         release_refresh = threading.Event()

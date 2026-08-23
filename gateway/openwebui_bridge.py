@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -30,10 +31,81 @@ import httpx
 MEMORY_TYPES = frozenset({"preferences", "recent_tasks", "needs", "imported"})
 DERIVED_MEMORY_TYPES = frozenset({"preferences", "recent_tasks", "needs"})
 logger = logging.getLogger(__name__)
+_KNOWN_USERS_LOCK = threading.Lock()
+_KNOWN_USERS_SCHEMA = 1
+_KNOWN_USERS_FILE_ENV = "HERMES_KNOWN_OPENWEBUI_USERS_FILE"
 _OPENVIKING_SCOPE_USER: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "openviking_scope_user",
     default=None,
 )
+
+
+def _known_openwebui_users_path() -> Path:
+    configured = os.getenv(_KNOWN_USERS_FILE_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
+    return hermes_home / "state" / "known-openwebui-users.json"
+
+
+def load_known_openwebui_user_ids() -> List[str]:
+    """Read the durable exact OpenWebUI identities accumulated by chat ingress."""
+    path = _known_openwebui_users_path()
+    with _KNOWN_USERS_LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+    if not isinstance(payload, dict) or payload.get("schema") != _KNOWN_USERS_SCHEMA:
+        return []
+    users = payload.get("users")
+    if not isinstance(users, dict):
+        return []
+    return sorted(user_id for user_id in users if isinstance(user_id, str) and user_id)
+
+
+def record_known_openwebui_user(user_id: str, *, observed_at: Optional[int] = None) -> bool:
+    """Accumulate one authenticated user without ever removing prior users."""
+    exact_user_id = str(user_id or "").strip()
+    if not exact_user_id:
+        return False
+    now = int(time.time()) if observed_at is None else int(observed_at)
+    path = _known_openwebui_users_path()
+    with _KNOWN_USERS_LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("schema") != _KNOWN_USERS_SCHEMA:
+            payload = {"schema": _KNOWN_USERS_SCHEMA, "users": {}}
+        users = payload.get("users")
+        if not isinstance(users, dict):
+            users = {}
+            payload["users"] = users
+        prior = users.get(exact_user_id)
+        try:
+            first_seen_at = int(prior.get("first_seen_at")) if isinstance(prior, dict) else now
+        except (TypeError, ValueError):
+            first_seen_at = now
+        try:
+            prior_last_seen_at = int(prior.get("last_seen_at") or 0) if isinstance(prior, dict) else 0
+        except (TypeError, ValueError):
+            prior_last_seen_at = 0
+        users[exact_user_id] = {
+            "first_seen_at": first_seen_at,
+            "last_seen_at": max(now, prior_last_seen_at),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            return False
+    return True
 
 
 class OpenVikingNotFound(Exception):
@@ -211,11 +283,11 @@ class OpenVikingURIBuilder:
 
     @classmethod
     def dreaming_run(cls, identifier: str) -> str:
-        return f"viking://resources/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.json"
+        return f"viking://user/default/signals/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.json"
 
     @classmethod
     def dreaming_run_lock(cls, identifier: str) -> str:
-        return f"viking://resources/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.lock.json"
+        return f"viking://user/default/signals/hermes/dreaming-runs/{cls._segment(identifier, field='identifier')}.lock.json"
 
 
 @dataclass
@@ -493,6 +565,16 @@ class OpenWebUIBridgeService:
     def _memory_id(memory_type: str, content: str) -> str:
         digest = hashlib.sha256(f"{memory_type}\n{content}".encode("utf-8")).hexdigest()[:20]
         return f"dream-{digest}"
+
+    async def _eligible_user_ids(self) -> List[str]:
+        known_users = set(load_known_openwebui_user_ids())
+        service_user = os.getenv("OPENVIKING_USER", "default").strip() or "default"
+        discovered = {
+            user_id
+            for user_id in await self.client.list_user_ids()
+            if user_id and (user_id != service_user or user_id in known_users)
+        }
+        return sorted(discovered | known_users)
 
     async def _tombstone_ids(self, user_id: str) -> set[str]:
         payloads = await self.client.list_json(self.uris.memory_prefix(user_id, "tombstones"))
@@ -1108,8 +1190,7 @@ class OpenWebUIBridgeService:
             self._running.discard(run_key)
 
     async def run_org_aggregate(self) -> Dict[str, Any]:
-        users = await self.client.list_user_ids()
-        eligible_users = sorted({u for u in users if u})
+        eligible_users = await self._eligible_user_ids()
         run_id = f"org-{uuid.uuid4().hex[:12]}"
         status = {
             "run_id": run_id,
@@ -1207,8 +1288,7 @@ class OpenWebUIBridgeService:
         before_phase: Optional[Callable[[str, Optional[str]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Run the v1 dreaming pipeline: all users first, then org aggregate."""
-        users = await self.client.list_user_ids()
-        eligible_users = sorted({u for u in users if u})
+        eligible_users = await self._eligible_user_ids()
         user_runs = []
         user_failures = []
         for user_id in eligible_users:

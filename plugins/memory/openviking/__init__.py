@@ -80,10 +80,11 @@ _TIMEOUT = 30.0
 _SESSION_DRAIN_TIMEOUT = 10.0
 _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
-# Durable cross-chat recall needs user facts and dated facts, not only persona
-# prose. Cases, trajectories, experiences and working memory remain excluded so
-# one task's transient reasoning cannot crystallize as a global user fact.
-_SESSION_COMMIT_MEMORY_TYPES = ("profile", "preferences", "entities", "events")
+# Automatic extraction is Matter-first. Entity/event facts can describe the
+# active matter without silently turning legal work into a personal profile.
+# Personal preferences/profile facts enter only through an explicit remember
+# action grounded in the user's durable statement.
+_SESSION_COMMIT_MEMORY_TYPES = ("entities", "events")
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 _SYNC_TRACE_ENV = "HERMES_OPENVIKING_SYNC_TRACE"
 _DEFAULT_RECALL_LIMIT = 6
@@ -125,7 +126,7 @@ _CATEGORY_SUBDIR_MAP = {
     "case": "cases",
     "pattern": "patterns",
 }
-_DEFAULT_MEMORY_SUBDIR = "preferences"
+_DEFAULT_MEMORY_SUBDIR = "cases"
 
 # Maps the built-in memory tool's `target` ("user" vs "memory") to a subdir
 # for on_memory_write mirroring. User profile facts → preferences; agent
@@ -248,7 +249,7 @@ def _sync_trace_enabled() -> bool:
 
 
 def hermes_session_commit_payload() -> Dict[str, Any]:
-    """Return the shared bounded-memory policy for every Hermes commit path."""
+    """Return the shared Matter-first policy for every Hermes commit path."""
     return {
         "keep_recent_count": 0,
         "memory_policy": {
@@ -637,6 +638,13 @@ REMEMBER_SCHEMA = {
                 "type": "string",
                 "enum": ["preference", "entity", "event", "case", "pattern"],
                 "description": "Memory category (default: auto-detected).",
+            },
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "For category=preference, an exact excerpt from a current user message "
+                    "that explicitly states the durable personal preference."
+                ),
             },
         },
         "required": ["content"],
@@ -4704,9 +4712,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Commit the session to trigger memory extraction.
 
-        Hermes limits automatic extraction to user profile and preferences.
-        Matter knowledge belongs in separately scoped resources, while peer and
-        working-memory extraction are disabled to avoid irrelevant LLM fan-out.
+        Hermes limits automatic extraction to Matter-capable entity/event
+        memory. Personal profile/preference writes require an explicit remember
+        action; peer and working-memory extraction stay disabled.
         """
         if not self._ensure_client():
             return
@@ -4885,6 +4893,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return tool_error("OpenViking server not connected")
 
         try:
+            if tool_name == "viking_remember" and kwargs.get("messages") is not None:
+                args = {**args, "_current_messages": kwargs["messages"]}
             if tool_name == "viking_search":
                 return self._tool_search(args)
             elif tool_name == "viking_read":
@@ -5207,6 +5217,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
             )
 
         category = args.get("category", "")
+        if category == "preference":
+            evidence = str(args.get("evidence") or "").strip()
+            messages = args.get("_current_messages")
+            user_texts = [
+                flatten_message_text(message.get("content"))
+                for message in messages or []
+                if isinstance(message, dict) and message.get("role") == "user"
+            ]
+            if not evidence or not any(evidence in text for text in user_texts):
+                return tool_error(
+                    "Preference memory requires evidence copied exactly from a current "
+                    "user message; Matter work and agent inference are not personal profile facts."
+                )
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
         uri = self._build_memory_uri(subdir)
 

@@ -17,6 +17,8 @@ from gateway.openwebui_bridge import (
     OpenWebUIBridgeService,
     SkillEvolutionGuard,
     dreaming_scheduler_loop,
+    load_known_openwebui_user_ids,
+    record_known_openwebui_user,
 )
 from gateway.platforms.api_server import APIServerAdapter
 
@@ -579,7 +581,7 @@ async def test_dreaming_scheduler_starts_only_after_successful_api_start(monkeyp
         (OpenVikingURIBuilder.memory, ('alice', 'preferences', 'm1'), 'viking://user/alice/memories/preferences/m1.json'),
         (OpenVikingURIBuilder.tombstone, ('alice', 'm1'), 'viking://user/alice/memories/tombstones/m1.json'),
         (OpenVikingURIBuilder.org_insight, ('2026-05-10',), 'viking://resources/hermes/org-insights/2026-05-10.json'),
-        (OpenVikingURIBuilder.dreaming_run, ('2026-05-10',), 'viking://resources/hermes/dreaming-runs/2026-05-10.json'),
+        (OpenVikingURIBuilder.dreaming_run, ('2026-05-10',), 'viking://user/default/signals/hermes/dreaming-runs/2026-05-10.json'),
     ],
 )
 def test_canonical_uri_builder(builder, args, expected):
@@ -591,6 +593,36 @@ def test_uri_builder_rejects_traversal():
         OpenVikingURIBuilder.feedback_signal('../alice', 'evt')
     with pytest.raises(ValueError):
         OpenVikingURIBuilder.memory('alice', 'preferences', 'bad/id')
+
+
+def test_known_user_registry_accumulates_exact_users_without_regression(tmp_path, monkeypatch):
+    path = tmp_path / "known-users.json"
+    monkeypatch.setenv("HERMES_KNOWN_OPENWEBUI_USERS_FILE", str(path))
+
+    assert record_known_openwebui_user("rbv-ai", observed_at=100)
+    assert record_known_openwebui_user("alice", observed_at=110)
+    assert record_known_openwebui_user("rbv-ai", observed_at=120)
+
+    assert load_known_openwebui_user_ids() == ["alice", "rbv-ai"]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["users"]["rbv-ai"] == {
+        "first_seen_at": 100,
+        "last_seen_at": 120,
+    }
+
+
+@pytest.mark.asyncio
+async def test_nightly_user_set_unions_durable_ingress_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_KNOWN_OPENWEBUI_USERS_FILE", str(tmp_path / "known-users.json")
+    )
+    record_known_openwebui_user("rbv-ai", observed_at=100)
+    fake = FakeVikingClient()
+    fake.store["viking://user/alice/signals/feedback/one.json"] = {"id": "one"}
+
+    users = await OpenWebUIBridgeService(fake)._eligible_user_ids()
+
+    assert users == ["alice", "rbv-ai"]
 
 
 @pytest.mark.asyncio
