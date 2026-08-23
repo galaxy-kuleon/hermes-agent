@@ -728,6 +728,72 @@ def test_tool_add_resource_rejects_hermes_credential_file_upload(tmp_path, monke
     provider._client.post.assert_not_called()
 
 
+def test_tool_add_resource_temp_uploads_request_scoped_attachment_handle(tmp_path):
+    from tools.file_grants import file_grant_scope
+
+    attachment = tmp_path / "law.pdf"
+    attachment.write_bytes(b"%PDF-test")
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.upload_temp_file.return_value = "temp-123"
+    provider._client.post.return_value = {
+        "result": {"root_uri": "viking://resources/law"}
+    }
+
+    with file_grant_scope(
+        "request-1",
+        [attachment],
+        handles={"F02": attachment},
+    ):
+        result = json.loads(
+            provider.handle_tool_call(
+                "viking_add_resource",
+                {"url": "F02", "reason": "baseline authority"},
+                task_id="request-1",
+            )
+        )
+
+    assert result["status"] == "added"
+    provider._client.upload_temp_file.assert_called_once_with(attachment.resolve())
+    provider._client.post.assert_called_once_with(
+        "/api/v1/resources",
+        {
+            "reason": "baseline authority",
+            "source_name": "law.pdf",
+            "temp_file_id": "temp-123",
+        },
+    )
+
+
+def test_tool_add_resource_does_not_bypass_request_file_grants(tmp_path):
+    from tools.file_grants import file_grant_scope
+
+    granted = tmp_path / "granted.pdf"
+    denied = tmp_path / "denied.pdf"
+    granted.write_bytes(b"granted")
+    denied.write_bytes(b"denied")
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    with file_grant_scope(
+        "request-2",
+        [granted],
+        handles={"F01": granted},
+    ):
+        result = json.loads(
+            provider.handle_tool_call(
+                "viking_add_resource",
+                {"url": str(denied)},
+                task_id="request-2",
+            )
+        )
+
+    assert "error" in result
+    assert "Local file access not granted" in result["error"]
+    provider._client.upload_temp_file.assert_not_called()
+    provider._client.post.assert_not_called()
+
+
 def test_get_tool_schemas_omits_profile_and_keeps_narrow_forget_tools():
     provider = OpenVikingMemoryProvider()
 

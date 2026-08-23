@@ -4906,7 +4906,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
             elif tool_name == "viking_forget":
                 return self._tool_forget(args)
             elif tool_name == "viking_add_resource":
-                return self._tool_add_resource(args)
+                return self._tool_add_resource(
+                    args,
+                    task_id=kwargs.get("task_id") or "default",
+                )
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
             return tool_error(str(e))
@@ -5276,12 +5279,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         return json.dumps(payload, ensure_ascii=False)
 
-    def _tool_add_resource(self, args: dict) -> str:
+    def _tool_add_resource(self, args: dict, *, task_id: str = "default") -> str:
         from agent.file_safety import raise_if_read_blocked
+        from tools.file_grants import file_grant_error, resolve_grant_alias
 
-        url = args.get("url", "")
-        if not url:
+        requested_url = args.get("url", "")
+        if not requested_url:
             return tool_error("url is required")
+
+        # OpenWebUI attachments are intentionally exposed to the model as short
+        # request-scoped handles (F01, F02, ...) and opaque file ids.  Resolve
+        # those aliases before classifying the source.  Otherwise a valid F02
+        # attachment is forwarded to OpenViking as the literal path "F02",
+        # which the HTTP server correctly rejects instead of temp-uploading the
+        # already-authorized file.
+        url = resolve_grant_alias(str(requested_url), task_id=task_id)
 
         if args.get("to") and args.get("parent"):
             return tool_error("Cannot specify both 'to' and 'parent'")
@@ -5307,6 +5319,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
         try:
             if source_path is not None:
                 if source_path.exists():
+                    denial = file_grant_error(
+                        source_path,
+                        task_id=task_id,
+                        operation="viking_add_resource",
+                    )
+                    if denial:
+                        return tool_error(denial)
                     if source_path.is_dir():
                         payload["source_name"] = source_path.name
                         cleanup_path = _zip_directory(source_path)
