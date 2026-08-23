@@ -1499,6 +1499,7 @@ _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 # Path B basenames are "<3-digit ordinal>-<8-hex nonce>-<sanitised name>".
 _HANDOFF_NAME_PREFIX_RE = re.compile(r"^\d{3}-[0-9a-f]{8}-")
+_AMBIGUOUS_DISPLAY_NAME_ALIAS = "/__hermes_ambiguous_attachment_display_name__"
 
 
 def _sign_handoff_entry(
@@ -1699,9 +1700,10 @@ def _build_handoff_context(
             continue
 
         handle = f"F{handle_offset + accepted + 1:02d}"
+        display_name = _display_handoff_name(safe_orig)
         attrs = [
             f'id="{handle}"',
-            f'name="{html.escape(_display_handoff_name(safe_orig), quote=True)}"',
+            f'name="{html.escape(display_name, quote=True)}"',
         ]
         if entry.get("file_id"):
             attrs.append(f'file_id="{html.escape(entry["file_id"], quote=True)}"')
@@ -1722,8 +1724,18 @@ def _build_handoff_context(
         sections.append(f'<file {" ".join(attrs)}/>')
         if granted_paths is not None:
             granted_paths.append(str(safe_orig))
-        if granted_aliases is not None and entry.get("file_id"):
-            granted_aliases[entry["file_id"]] = str(safe_orig)
+        if granted_aliases is not None:
+            if entry.get("file_id"):
+                granted_aliases[entry["file_id"]] = str(safe_orig)
+            # The display name is useful when a model prepends a stale
+            # workspace directory instead of using F01.  Duplicate display
+            # names deliberately resolve to an ungranted sentinel so the
+            # authorization layer fails closed rather than guessing a file.
+            existing = granted_aliases.get(display_name)
+            if existing is None:
+                granted_aliases[display_name] = str(safe_orig)
+            elif existing != str(safe_orig):
+                granted_aliases[display_name] = _AMBIGUOUS_DISPLAY_NAME_ALIAS
         accepted += 1
 
     if accepted == 0:

@@ -167,7 +167,39 @@ def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeyp
     assert f'original="{original}"' in out
     assert "%PDF original" not in out
     assert granted_paths == [str(original)]
-    assert granted_aliases == {"owui-file-1": str(original)}
+    assert granted_aliases == {
+        "owui-file-1": str(original),
+        "report.pdf": str(original),
+    }
+
+
+def test_duplicate_display_names_fail_closed(monkeypatch, tmp_path):
+    first = _prepare_handoff(monkeypatch, tmp_path)
+    second = first.parents[1] / "msg-2" / "report.pdf"
+    second.parent.mkdir(parents=True)
+    second.write_bytes(b"%PDF second")
+    entries = []
+    for path in (first, second):
+        entries.append(
+            {
+                "original": str(path),
+                "sig": api_server._sign_handoff_entry(
+                    "user-1", "chat-1", str(path)
+                ),
+            }
+        )
+    granted_paths = []
+    granted_aliases = {}
+
+    api_server._build_handoff_context(
+        entries, _scope(), granted_paths, granted_aliases
+    )
+
+    assert granted_paths == [str(first), str(second)]
+    assert (
+        granted_aliases["report.pdf"]
+        == api_server._AMBIGUOUS_DISPLAY_NAME_ALIAS
+    )
 
 
 def test_cross_user_replay_is_rejected(monkeypatch, tmp_path):

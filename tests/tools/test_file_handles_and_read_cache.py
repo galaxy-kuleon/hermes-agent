@@ -65,6 +65,19 @@ class FileHandleResolutionTests(unittest.TestCase):
         self.assertIsNone(canonical)
         self.assertIsNotNone(denial)
 
+    def test_unique_display_filename_resolves_from_stale_workspace_path(self):
+        aliases = {"report.pdf": str(self.granted)}
+        with file_grant_scope(
+            "task-1", [str(self.granted)], handles=aliases
+        ):
+            canonical, denial = resolve_file_grant(
+                "/home/hermes/workspace/report.pdf",
+                task_id="task-1",
+                operation="read",
+            )
+        self.assertEqual(canonical, str(self.granted.resolve()))
+        self.assertIsNone(denial)
+
     def test_handle_is_case_insensitive_and_accepts_hash_prefix(self):
         handles = make_file_handles([str(self.granted)])
         with file_grant_scope("task-1", [str(self.granted)], handles=handles):

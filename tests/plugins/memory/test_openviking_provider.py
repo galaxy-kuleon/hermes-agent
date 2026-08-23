@@ -1619,7 +1619,7 @@ def test_prefetch_sends_contract_safe_memory_context_payload(monkeypatch):
 
     monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
 
-    provider.prefetch("anything")
+    provider.prefetch("anything", session_id="active-session")
 
     assert captured_calls == [
         (
@@ -1633,6 +1633,7 @@ def test_prefetch_sends_contract_safe_memory_context_payload(monkeypatch):
         )
     ]
     payload = captured_calls[0][1]
+    assert "session_id" not in payload
     assert "top_k" not in payload
     assert "mode" not in payload
     assert "target_uri" not in payload

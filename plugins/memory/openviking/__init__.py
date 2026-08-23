@@ -3062,25 +3062,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
             "score_threshold": 0,
             "context_type": context_type,
         }
-        if session_id:
-            try:
-                timeout = OpenVikingMemoryProvider._remaining_recall_timeout(
-                    deadline,
-                    request_timeout,
-                )
-                return client.post(
-                    "/api/v1/search/search",
-                    {**base_payload, "session_id": session_id},
-                    timeout=timeout,
-                )
-            except TimeoutError:
-                raise
-            except Exception as e:
-                logger.debug(
-                    "OpenViking session-aware prefetch failed, "
-                    "falling back to search/find: %s",
-                    e,
-                )
+        # Automatic per-turn recall must stay deterministic and cheap.  The
+        # session-aware deep-search endpoint invokes an LLM intent analyser;
+        # on a single-lane Mac it let routine recall wait behind semantic
+        # background work for many minutes.  Current-session context is already
+        # supplied by the transcript and _session_start_memory_context().  Keep
+        # deep search available only through the explicit viking_search tool.
+        del session_id
         timeout = OpenVikingMemoryProvider._remaining_recall_timeout(
             deadline,
             request_timeout,

@@ -123,6 +123,16 @@ def resolve_grant_alias(value: str | Path, *, task_id: str) -> str:
     opaque_target = aliases.get(raw) or aliases.get(raw.upper())
     if opaque_target:
         return opaque_target
+    # Models sometimes preserve the validated attachment's display filename
+    # but prepend a stale workspace directory.  Trusted adapters may bind that
+    # display filename as an alias.  Resolve only the final path component and
+    # still subject the result to the exact grant membership check below; this
+    # never grants a directory or an unrelated local file.
+    basename = re.split(r"[\\/]", raw.rstrip("/\\"))[-1]
+    if basename and basename != raw:
+        display_target = aliases.get(basename) or aliases.get(basename.upper())
+        if display_target:
+            return display_target
     match = _HANDLE_RE.match(raw.strip())
     if not match:
         return raw
