@@ -24,13 +24,8 @@ _LEGAL_RE = re.compile(
     r"\brule\s+\d|\bcap\.?\s*\d)",
     re.IGNORECASE,
 )
-_REGISTERED_MARK_DISPUTE_RE = re.compile(
-    r"(?:trade\s*marks?|trademarks?|商標|商标).{0,240}"
-    r"(?:registered|registration|註冊|注册)|"
-    r"(?:registered|registration|註冊|注册).{0,240}"
-    r"(?:trade\s*marks?|trademarks?|商標|商标)",
-    re.IGNORECASE | re.DOTALL,
-)
+_TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
+_REGISTERED_RE = re.compile(r"(?:registered|registration|註冊|注册)", re.IGNORECASE)
 _REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "52", "53"})}
 _SECTION_12_6_RE = re.compile(r"(?:section\s*)?12\s*\(\s*6\s*\)", re.IGNORECASE)
 _SECTION_53_5_B_RE = re.compile(
@@ -146,7 +141,7 @@ def _answer_cites_authorities(answer: str, authorities: list[dict[str, Any]]) ->
 
 def _minimum_provisions(user_message: Any) -> dict[str, frozenset[str]]:
     text = _message_text(user_message)
-    if _REGISTERED_MARK_DISPUTE_RE.search(text):
+    if _TRADE_MARK_RE.search(text) and _REGISTERED_RE.search(text):
         return _REGISTERED_MARK_MINIMUM
     return {}
 
@@ -168,7 +163,8 @@ def _confuses_opposition_with_post_registration_invalidity(
     user_message: Any, answer: str
 ) -> bool:
     """Catch the recurrent s.12(6) versus s.53(5)(b) category error."""
-    if not _REGISTERED_MARK_DISPUTE_RE.search(_message_text(user_message)):
+    text = _message_text(user_message)
+    if not (_TRADE_MARK_RE.search(text) and _REGISTERED_RE.search(text)):
         return False
     if not _SECTION_12_6_RE.search(answer):
         return False

@@ -11,6 +11,14 @@ PROMPT = (
     "apply Hong Kong Trade Mark enquiry skill. I found an identical mark "
     "registered in Hong Kong. What can I do under the law?"
 )
+EXACT_REPORTED_PROMPT = (
+    "apply Hong Kong Trade Mark enquiry skill.  I am a famous brand in Korea "
+    "called the Bennett (I started in 2019), and the mark is moderately "
+    "designed - Green colour, and circled. I suddenly find that a Korean "
+    "company filed a mark virtually identical to mine in February 2026 in "
+    "Hong Kong, and get registered on 2 July 2026.  Now is 23 August 2026, "
+    "what can I do?"
+)
 
 
 def _authority_message():
@@ -116,13 +124,33 @@ def test_registered_mark_dispute_requires_complete_minimum_provision_set():
     assert "['11', '12']" in decision.message
 
 
+def test_exact_long_reported_prompt_is_still_a_registered_mark_dispute():
+    partial = _authority_message()
+    payload = json.loads(partial["content"])
+    payload["requested_provisions"] = [
+        {"provision": provision, "found": True}
+        for provision in ("44", "52", "53")
+    ]
+    partial["content"] = json.dumps(payload)
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, partial],
+        current_turn_user_idx=0,
+        final_response=(
+            "2025-02-14 https://www.elegislation.gov.hk/hk/cap559!en"
+        ),
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "['11', '12']" in decision.message
+
+
 def test_hkel_timestamp_is_cited_by_its_public_calendar_date():
     authority = _authority_message()
     payload = json.loads(authority["content"])
     payload["version_date"] = "2025-02-14T00:00:00"
     authority["content"] = json.dumps(payload)
     decision = evaluate_hk_legal_answer(
-        messages=[{"role": "user", "content": PROMPT}, authority],
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
         current_turn_user_idx=0,
         final_response=(
             "Current version 2025-02-14: "
@@ -142,7 +170,7 @@ def test_section_12_6_must_not_be_said_to_bar_section_53_5_b_invalidity():
         "https://www.elegislation.gov.hk/hk/cap559!en"
     )
     decision = evaluate_hk_legal_answer(
-        messages=[{"role": "user", "content": PROMPT}, authority],
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
         current_turn_user_idx=0,
         final_response=misleading,
         attempts=1,
@@ -157,7 +185,7 @@ def test_section_12_6_must_not_be_said_to_bar_section_53_5_b_invalidity():
         "https://www.elegislation.gov.hk/hk/cap559!en"
     )
     assert evaluate_hk_legal_answer(
-        messages=[{"role": "user", "content": PROMPT}, authority],
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
         current_turn_user_idx=0,
         final_response=corrected,
         attempts=1,

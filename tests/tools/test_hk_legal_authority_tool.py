@@ -3,6 +3,7 @@ import json
 import random
 import urllib.error
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,9 @@ from tools.hk_legal_authority_tool import (
     parse_catalog,
     read_zip_member_by_range,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 CATALOG = b"""<?xml version="1.0"?>
@@ -104,6 +108,17 @@ def test_parse_catalog_resolves_current_official_version():
     assert result.version_date == "2025-02-14T00:00:00"
     assert result.archive_sha256 == "abcdef"
     assert result.member_name == "cap_559_en_c/cap_559_20250214000000_en_c.xml"
+
+
+def test_container_boot_seeds_and_repairs_authority_cache_ownership():
+    stage2 = (REPO_ROOT / "docker/stage2-hook.sh").read_text(encoding="utf-8")
+    assert '"$HERMES_HOME/legal-authority-cache"' in stage2
+    repair = (
+        'if [ -d "$HERMES_HOME/legal-authority-cache" ] '
+        '&& tree_has_non_hermes_owner "$HERMES_HOME/legal-authority-cache"; then'
+    )
+    assert repair in stage2
+    assert 'chown_hermes_tree "$HERMES_HOME/legal-authority-cache"' in stage2
 
 
 @pytest.mark.parametrize("chapter", ["", "../../etc", "559<script>", "A559"])

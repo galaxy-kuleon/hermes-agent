@@ -263,7 +263,7 @@ if [ "$needs_chown" = true ]; then
     # Hermes-owned subdirs: recursive chown is safe here because these are
     # created and managed exclusively by hermes (see the s6-setuidgid mkdir
     # -p block below for the canonical list).
-    for sub in cron sessions logs hooks memories skins plans workspace home profiles pairing platforms/pairing user-skills skill-state lazy-packages; do
+    for sub in cron sessions logs hooks memories skins plans workspace home profiles pairing platforms/pairing user-skills skill-state lazy-packages legal-authority-cache; do
         if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then
             chown_hermes_tree "$HERMES_HOME/$sub"
         fi
@@ -309,6 +309,14 @@ fi
 # gate as profiles/).
 if [ -d "$HERMES_HOME/cron" ] && tree_has_non_hermes_owner "$HERMES_HOME/cron"; then
     chown_hermes_tree "$HERMES_HOME/cron"
+fi
+
+# Official HKeL XML is retained append-only under this cache. A root-context
+# docker exec may create the directory or a version file as root; repair this
+# exact Hermes-owned tree on every boot so the unprivileged gateway can reuse
+# the same verified bytes instead of returning a false authority outage.
+if [ -d "$HERMES_HOME/legal-authority-cache" ] && tree_has_non_hermes_owner "$HERMES_HOME/legal-authority-cache"; then
+    chown_hermes_tree "$HERMES_HOME/legal-authority-cache"
 fi
 
 # Always ensure logs/gateways is hermes-owned (#45258). Formerly healed by
@@ -410,7 +418,8 @@ as_hermes mkdir -p \
     "$HERMES_HOME/platforms/pairing" \
     "$HERMES_HOME/user-skills" \
     "$HERMES_HOME/skill-state/platform" \
-    "$HERMES_HOME/lazy-packages"
+    "$HERMES_HOME/lazy-packages" \
+    "$HERMES_HOME/legal-authority-cache"
 
 # --- Install-method stamp ---
 # The 'docker' stamp is baked into the immutable install tree at
