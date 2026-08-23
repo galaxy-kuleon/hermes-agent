@@ -43,6 +43,11 @@ _HERMES_CORE_TOOLS = [
     # File manipulation
     "attachments", "read_file", "write_file", "patch", "search_files",
     "local_document_export",
+    # Fail-closed legal grounding cannot recover reliably when this schema is
+    # hidden behind tool_call: small/local models repeatedly call the bridge
+    # with only the tool name and omit chapter/provisions.  Keep the existing
+    # tool eager so the exact required arguments are visible on every turn.
+    "hk_legal_authority",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # BFL FLUX 3 video generation
