@@ -30,6 +30,8 @@ from tools import mcp_tool  # noqa: E402
 def seen(monkeypatch):
     """Capture the args that survive the grant block, then stop the call."""
     box = {}
+    mcp_tool._server_error_counts.pop("soc_v2", None)
+    mcp_tool._server_breaker_opened_at.pop("soc_v2", None)
 
     def _guard(server_name, args):
         box["args"] = args
@@ -131,3 +133,48 @@ def test_submit_uses_file_id_alias_when_path_is_omitted(seen, monkeypatch):
         "strict_file_id": True,
         "path": canonical,
     }
+
+
+def test_submit_normalizes_live_model_translation_aliases(seen, monkeypatch):
+    canonical = "/handoff/user/u42/report.pdf"
+
+    monkeypatch.setattr(
+        "tools.file_grants.resolve_file_grant",
+        lambda path, *, task_id, operation: (canonical, None),
+        raising=False,
+    )
+
+    out = _handler("submit_conversion")(
+        {
+            "file_id": "F01",
+            "target_format": "docx",
+            "translation_target": "Chinese",
+        },
+        task_id="t1",
+    )
+
+    assert _reached_transport(out), f"call was short-circuited instead: {out[:200]}"
+    assert seen["args"] == {
+        "file_id": "F01",
+        "translate": True,
+        "target_lang": "zh-tw",
+        "format": "docx",
+        "path": canonical,
+    }
+
+
+def test_submit_rejects_conflicting_translation_aliases_before_transport(seen):
+    out = json.loads(
+        _handler("submit_conversion")(
+            {
+                "file_id": "F01",
+                "target_language": "Traditional Chinese",
+                "translation_target": "Simplified Chinese",
+            },
+            task_id="t1",
+        )
+    )
+
+    assert out["success"] is False
+    assert "conflicting" in out["error"]
+    assert "args" not in seen

@@ -5712,6 +5712,88 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+_SOCV2_LANGUAGE_ALIASES = {
+    "chinese": "zh-tw",
+    "traditional chinese": "zh-tw",
+    "chinese traditional": "zh-tw",
+    "繁體中文": "zh-tw",
+    "中文": "zh-tw",
+    "simplified chinese": "zh-cn",
+    "chinese simplified": "zh-cn",
+    "简体中文": "zh-cn",
+    "簡體中文": "zh-cn",
+    "hong kong chinese": "zh-hk",
+    "香港中文": "zh-hk",
+    "english": "en",
+    "japanese": "ja",
+    "日本語": "ja",
+}
+_SOCV2_CANONICAL_LANGUAGES = {
+    "zh-tw", "zh-cn", "zh-hk", "en", "en-us", "en-uk", "ja",
+}
+
+
+def _normalize_socv2_submit_args(args: dict) -> tuple[dict, str | None]:
+    """Preserve obvious translation intent before MCP schema validation.
+
+    The tool-call meta-tool receives model-authored dictionaries. Models have
+    emitted ``target_language``, ``translation_target`` and ``translate_to``
+    while narrating the same explicit translation intent. Older FastMCP
+    schemas silently discarded those unknown keys and submitted a raw job.
+    Normalize language-bearing keys by their value, reject conflicts, and keep
+    the server as the final policy/validation boundary.
+    """
+    normalized = dict(args or {})
+    language_keys = []
+    languages = set()
+    for key, value in list(normalized.items()):
+        key_token = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+        if key_token == "translate" or not (
+            "language" in key_token or "translat" in key_token
+        ):
+            continue
+        raw_value = " ".join(str(value or "").strip().lower().split())
+        if not raw_value:
+            continue
+        language = _SOCV2_LANGUAGE_ALIASES.get(raw_value, raw_value)
+        if language not in _SOCV2_CANONICAL_LANGUAGES:
+            return normalized, f"unsupported SOCv2 target language {value!r}"
+        language_keys.append(key)
+        languages.add(language)
+
+    # ``target_lang`` is canonical but still implies translation when the model
+    # explicitly supplied it, even if it forgot the separate boolean.
+    if "target_lang" in normalized and str(normalized.get("target_lang") or "").strip():
+        raw_value = " ".join(str(normalized["target_lang"]).strip().lower().split())
+        language = _SOCV2_LANGUAGE_ALIASES.get(raw_value, raw_value)
+        if language not in _SOCV2_CANONICAL_LANGUAGES:
+            return normalized, f"unsupported SOCv2 target language {normalized['target_lang']!r}"
+        languages.add(language)
+
+    if len(languages) > 1:
+        return normalized, "conflicting SOCv2 target languages"
+    if languages:
+        if "translate" in normalized and normalized.get("translate") is False:
+            return normalized, "translate=false conflicts with the requested target language"
+        normalized["translate"] = True
+        normalized["target_lang"] = next(iter(languages))
+        for key in language_keys:
+            if key != "target_lang":
+                normalized.pop(key, None)
+
+    for key, value in list(normalized.items()):
+        key_token = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+        if "format" not in key_token:
+            continue
+        raw_value = str(value or "").strip().lower().lstrip(".")
+        if raw_value not in {"docx", "word", "word document"}:
+            return normalized, f"unsupported SOCv2 output format {value!r}"
+        normalized["format"] = "docx"
+        if key != "format":
+            normalized.pop(key, None)
+    return normalized, None
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -5725,6 +5807,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
             return gate_error
+
+        if server_name == "soc_v2" and tool_name == "submit_conversion":
+            args, alias_error = _normalize_socv2_submit_args(args)
+            if alias_error:
+                return json.dumps(
+                    {"error": alias_error, "success": False},
+                    ensure_ascii=False,
+                )
 
         capability_request = None
         # These soc_v2 tools carry no owui user header on this channel, so the
