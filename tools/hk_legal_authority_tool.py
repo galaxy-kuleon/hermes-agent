@@ -390,6 +390,11 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
 
     rows = extract_provisions(content, provisions)
     missing = [row["provision"] for row in rows if not row["found"]]
+    version_day = version.version_date.split("T", 1)[0]
+    required_citation = (
+        f"Hong Kong e-Legislation, Cap. {version.chapter}, current version "
+        f"{version_day}: {version.web_url}"
+    )
     return json.dumps(
         {
             "success": not missing,
@@ -402,6 +407,11 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
             "version_date": version.version_date,
             "status": version.status,
             "official_web_url": version.web_url,
+            "required_answer_citation": required_citation,
+            "answer_requirement": (
+                "Include required_answer_citation verbatim or as an equivalent "
+                "clickable citation in the user-visible answer."
+            ),
             "catalog_updated_at": version.catalog_updated_at,
             "catalog_archive_sha256": version.archive_sha256,
             "integrity": (
@@ -413,7 +423,7 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
             "requested_provisions": rows,
             "missing_provisions": missing,
             "instruction": (
-                "Cite the official URL and version date. OpenViking/search summaries are leads only. "
+                "Cite required_answer_citation. OpenViking/search summaries are leads only. "
                 "If cannot_confirm is true, do not state a confident statutory conclusion."
             ),
         },

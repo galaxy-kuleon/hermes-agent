@@ -151,6 +151,10 @@ def test_full_tool_retains_versioned_xml_and_reports_authority(monkeypatch, tmp_
     assert result["freshness"] == "current_catalog"
     assert result["source"] == "Hong Kong e-Legislation open data, Department of Justice"
     assert result["official_web_url"] == "https://www.elegislation.gov.hk/hk/cap559!en"
+    assert result["required_answer_citation"] == (
+        "Hong Kong e-Legislation, Cap. 559, current version 2025-02-14: "
+        "https://www.elegislation.gov.hk/hk/cap559!en"
+    )
     assert result["requested_provisions"][0]["provision"] == "52"
     retained = list(tmp_path.glob("cap_559_20250214000000_en_c.xml.*.xml"))
     assert len(retained) == 1
