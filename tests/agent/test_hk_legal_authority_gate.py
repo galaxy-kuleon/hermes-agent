@@ -133,6 +133,37 @@ def test_hkel_timestamp_is_cited_by_its_public_calendar_date():
     assert decision.action == "pass"
 
 
+def test_section_12_6_must_not_be_said_to_bar_section_53_5_b_invalidity():
+    authority = _authority_message()
+    misleading = (
+        "Section 53(5)(b) concerns well-known marks. Section 12(6) says those "
+        "grounds normally must be raised in opposition, and you missed that window. "
+        "Current version 2025-02-14: "
+        "https://www.elegislation.gov.hk/hk/cap559!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=misleading,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "must not be presented as barring" in decision.message
+
+    corrected = (
+        "Section 12(6) governs refusal at opposition, but does not bar the "
+        "separate section 53(5)(b) invalidity route after registration. "
+        "Current version 2025-02-14: "
+        "https://www.elegislation.gov.hk/hk/cap559!en"
+    )
+    assert evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=corrected,
+        attempts=1,
+    ).action == "pass"
+
+
 def test_verified_and_cited_answer_passes():
     messages = [{"role": "user", "content": PROMPT}, _authority_message()]
     decision = evaluate_hk_legal_answer(

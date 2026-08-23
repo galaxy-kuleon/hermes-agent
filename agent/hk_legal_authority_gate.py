@@ -32,6 +32,16 @@ _REGISTERED_MARK_DISPUTE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "52", "53"})}
+_SECTION_12_6_RE = re.compile(r"(?:section\s*)?12\s*\(\s*6\s*\)", re.IGNORECASE)
+_SECTION_53_5_B_RE = re.compile(
+    r"(?:section\s*)?53\s*\(\s*5\s*\)\s*\(\s*b\s*\)", re.IGNORECASE
+)
+_NOT_BAR_RE = re.compile(
+    r"(?:does\s+not|doesn't|not)\s+(?:bar|prevent|exclude|preclude)|"
+    r"(?:still|remains?)\s+(?:available|open)|"
+    r"不(?:妨礙|阻止|排除|限制)|仍(?:可|然可以)|不影響",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,22 @@ def _missing_minimum_provisions(
     }
 
 
+def _confuses_opposition_with_post_registration_invalidity(
+    user_message: Any, answer: str
+) -> bool:
+    """Catch the recurrent s.12(6) versus s.53(5)(b) category error."""
+    if not _REGISTERED_MARK_DISPUTE_RE.search(_message_text(user_message)):
+        return False
+    if not _SECTION_12_6_RE.search(answer):
+        return False
+    section_12_6 = _SECTION_12_6_RE.search(answer)
+    assert section_12_6 is not None
+    window_start = max(0, section_12_6.start() - 500)
+    window_end = min(len(answer), section_12_6.end() + 700)
+    window = answer[window_start:window_end]
+    return not (_SECTION_53_5_B_RE.search(window) and _NOT_BAR_RE.search(window))
+
+
 def evaluate_hk_legal_answer(
     *,
     messages: list[Any],
@@ -209,6 +235,27 @@ def evaluate_hk_legal_answer(
             "fail",
             "無法提供可依賴的香港商標法結論：本回合未能完整讀取已註冊商標爭議所需的"
             "最低官方法源集合。為免誤導，本次不提供不完整的救濟建議。",
+        )
+
+    if _confuses_opposition_with_post_registration_invalidity(
+        messages[current_turn_user_idx], final_response
+    ):
+        if attempts < max_attempts:
+            return GateDecision(
+                "nudge",
+                "[System: Correct a material legal distinction in the complete "
+                "answer. Section 12(6) governs refusal on section 12(4)/(5) "
+                "grounds at the opposition stage. It must not be presented as "
+                "barring the separate post-registration invalidity route that "
+                "section 53(5)(b) expressly provides. Either omit the unnecessary "
+                "section 12(6) discussion or explicitly state that it does not bar "
+                "a section 53(5)(b) invalidity application. Preserve the official "
+                "URL and version citation.]",
+            )
+        return GateDecision(
+            "fail",
+            "無法提供可依賴的香港商標法結論：最終答案未能正確區分第12(6)條的反對階段"
+            "規則與第53(5)(b)條的註冊後無效申請。為免誤導，本次不提供矛盾的救濟建議。",
         )
 
     if not _answer_cites_authorities(final_response, authorities):
