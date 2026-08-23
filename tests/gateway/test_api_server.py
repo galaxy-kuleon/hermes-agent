@@ -398,7 +398,10 @@ class TestAgentExecution:
             "memory_policy": {
                 "self": {"enabled": True},
                 "peer": {"enabled": False},
-                "memory_types": ["profile", "preferences", "entities", "events"],
+                # Idle commits are Matter-first. Cross-chat personal profile
+                # and preference memory is an explicit user action, not an
+                # automatic side effect of finishing a case turn.
+                "memory_types": ["entities", "events"],
                 "working_memory": {"enabled": False},
             },
         }

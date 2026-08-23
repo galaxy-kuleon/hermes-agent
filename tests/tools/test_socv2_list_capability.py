@@ -107,3 +107,27 @@ def test_submit_still_denies_a_missing_path(seen, monkeypatch):
     assert out["success"] is False
     assert "no grant" in out["error"]
     assert "args" not in seen, "a denied submit must never reach the transport"
+
+
+def test_submit_uses_file_id_alias_when_path_is_omitted(seen, monkeypatch):
+    canonical = "/handoff/user/u42/report.pdf"
+    consulted = []
+
+    def _grant(path, *, task_id, operation):
+        consulted.append((path, task_id, operation))
+        return canonical, None
+
+    monkeypatch.setattr("tools.file_grants.resolve_file_grant", _grant, raising=False)
+
+    out = _handler("submit_conversion")(
+        {"file_id": "owui-file-1", "strict_file_id": True},
+        task_id="t1",
+    )
+
+    assert consulted == [("owui-file-1", "t1", "soc_v2.submit_conversion")]
+    assert _reached_transport(out), f"call was short-circuited instead: {out[:200]}"
+    assert seen["args"] == {
+        "file_id": "owui-file-1",
+        "strict_file_id": True,
+        "path": canonical,
+    }

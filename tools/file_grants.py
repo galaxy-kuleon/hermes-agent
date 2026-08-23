@@ -108,10 +108,17 @@ def resolve_grant_alias(value: str | Path, *, task_id: str) -> str:
     unchanged so it fails the normal grant check rather than being special-cased.
     """
     raw = str(value)
+    aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
+    # Trusted adapters may bind an opaque source identity (for example an
+    # OpenWebUI file UUID) to the same canonical path as its short F01 handle.
+    # The alias still grants nothing by itself: resolve_file_grant performs the
+    # exact canonical membership check after this lookup.
+    opaque_target = aliases.get(raw) or aliases.get(raw.upper())
+    if opaque_target:
+        return opaque_target
     match = _HANDLE_RE.match(raw.strip())
     if not match:
         return raw
-    aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
     return aliases.get(match.group(1).upper(), raw)
 
 

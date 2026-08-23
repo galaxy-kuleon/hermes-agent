@@ -5744,7 +5744,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             )
 
             task_id = kwargs.get("task_id") or "default"
-            path = str(args.get("path") or "")
+            # OpenWebUI supplies both a signed file identity and a request-
+            # scoped path. Models naturally prefer the stable file_id. The
+            # gateway binds that identity to its validated path, so use it as
+            # an alias when path is omitted; it still passes through the exact
+            # file-grant membership check below.
+            path = str(args.get("path") or args.get("file_id") or "")
             # For the two mutations a path is mandatory and its absence is a real
             # denial. For list_conversions it is the optional proof of whose jobs
             # to list, so an empty one must reach the server and be answered with

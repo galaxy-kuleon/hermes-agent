@@ -42,6 +42,29 @@ class FileHandleResolutionTests(unittest.TestCase):
                 file_grant_error("F01", task_id="task-1", operation="read")
             )
 
+    def test_opaque_source_identity_resolves_through_the_same_grant(self):
+        aliases = {"owui-file-1": str(self.granted)}
+        with file_grant_scope(
+            "task-1", [str(self.granted)], handles=aliases
+        ):
+            canonical, denial = resolve_file_grant(
+                "owui-file-1", task_id="task-1", operation="convert"
+            )
+        self.assertEqual(canonical, str(self.granted.resolve()))
+        self.assertIsNone(denial)
+
+    def test_opaque_source_identity_cannot_alias_an_ungranted_path(self):
+        with file_grant_scope(
+            "task-1",
+            [str(self.granted)],
+            handles={"owui-file-1": str(self.other)},
+        ):
+            canonical, denial = resolve_file_grant(
+                "owui-file-1", task_id="task-1", operation="convert"
+            )
+        self.assertIsNone(canonical)
+        self.assertIsNotNone(denial)
+
     def test_handle_is_case_insensitive_and_accepts_hash_prefix(self):
         handles = make_file_handles([str(self.granted)])
         with file_grant_scope("task-1", [str(self.granted)], handles=handles):

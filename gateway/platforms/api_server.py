@@ -1622,6 +1622,7 @@ def _build_handoff_context(
     entries: List[Dict[str, str]],
     scope: Dict[str, str],
     granted_paths: Optional[List[str]] = None,
+    granted_aliases: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Validate skip-rag handoff file entries and expose path metadata only.
@@ -1693,6 +1694,8 @@ def _build_handoff_context(
         sections.append(f'<file {" ".join(attrs)}/>')
         if granted_paths is not None:
             granted_paths.append(str(safe_orig))
+        if granted_aliases is not None and entry.get("file_id"):
+            granted_aliases[entry["file_id"]] = str(safe_orig)
         accepted += 1
 
     if accepted == 0:
@@ -1705,13 +1708,16 @@ def _augment_handoff_text(
     text: str,
     scope: Dict[str, str],
     granted_paths: Optional[List[str]] = None,
+    granted_aliases: Optional[Dict[str, str]] = None,
 ) -> str:
     """Strip raw <files> blocks and append validated path-only metadata."""
     if "<files>" not in text:
         return text
     scope = scope or {}
     entries = _parse_handoff_file_entries(text)
-    context = _build_handoff_context(entries, scope, granted_paths)
+    context = _build_handoff_context(
+        entries, scope, granted_paths, granted_aliases
+    )
     message_without_raw_files = _FILES_BLOCK_RE.sub("", text).rstrip()
     if not context:
         return message_without_raw_files
@@ -1723,11 +1729,14 @@ def _augment_message_with_handoff_context(
     user_message: Any,
     scope: Optional[Dict[str, str]] = None,
     granted_paths: Optional[List[str]] = None,
+    granted_aliases: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Replace raw signed /handoff blocks with validated path-only metadata."""
     scope = scope or {}
     if isinstance(user_message, str):
-        return _augment_handoff_text(user_message, scope, granted_paths)
+        return _augment_handoff_text(
+            user_message, scope, granted_paths, granted_aliases
+        )
     if isinstance(user_message, list):
         augmented_parts: List[Any] = []
         for part in user_message:
@@ -1740,6 +1749,7 @@ def _augment_message_with_handoff_context(
                         text,
                         scope,
                         granted_paths,
+                        granted_aliases,
                     )
                     augmented_parts.append(new_part)
                     continue
@@ -6118,10 +6128,12 @@ class APIServerAdapter(BasePlatformAdapter):
             history = conversation_messages[:-1]
 
         granted_file_paths: List[str] = []
+        granted_file_aliases: Dict[str, str] = {}
         user_message = _augment_message_with_handoff_context(
             user_message,
             scope,
             granted_file_paths,
+            granted_file_aliases,
         )
 
         if not _content_has_visible_payload(user_message):
@@ -6357,6 +6369,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
                 granted_file_paths=granted_file_paths,
+                granted_file_aliases=granted_file_aliases,
                 **agent_overrides,
                 route=route,
             ))
@@ -6391,6 +6404,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
                 granted_file_paths=granted_file_paths,
+                granted_file_aliases=granted_file_aliases,
                 **agent_overrides,
                 route=route,
             )
@@ -7968,10 +7982,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Last input message is the user_message
         user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
         granted_file_paths: List[str] = []
+        granted_file_aliases: Dict[str, str] = {}
         user_message = _augment_message_with_handoff_context(
             user_message,
             scope,
             granted_file_paths,
+            granted_file_aliases,
         )
         if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
@@ -8070,6 +8086,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
                 granted_file_paths=granted_file_paths,
+                granted_file_aliases=granted_file_aliases,
                 **agent_overrides,
                 route=route,
             ))
@@ -8118,6 +8135,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_role=scope.get("user_role", ""),
                 user_groups=scope.get("user_groups", ""),
                 granted_file_paths=granted_file_paths,
+                granted_file_aliases=granted_file_aliases,
                 **agent_overrides,
                 route=route,
             )
@@ -8937,6 +8955,7 @@ class APIServerAdapter(BasePlatformAdapter):
         user_role: Optional[str] = None,
         user_groups: Optional[str] = None,
         granted_file_paths: Optional[List[str]] = None,
+        granted_file_aliases: Optional[Dict[str, str]] = None,
         active_run_id: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -9062,10 +9081,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             task_id=effective_task_id,
                         )
                     else:
+                        file_aliases = {
+                            **(granted_file_aliases or {}),
+                            **make_file_handles(granted_file_paths),
+                        }
                         with file_grant_scope(
                             effective_task_id,
                             granted_file_paths,
-                            handles=make_file_handles(granted_file_paths),
+                            handles=file_aliases,
                         ), request_file_cache_scope(effective_task_id):
                             _seed_agent_attachment_coverage(
                                 agent, effective_task_id
@@ -9370,10 +9393,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
         granted_file_paths: List[str] = []
+        granted_file_aliases: Dict[str, str] = {}
         user_message = _augment_message_with_handoff_context(
             user_message,
             scope,
             granted_file_paths,
+            granted_file_aliases,
         )
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
@@ -9629,10 +9654,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             _publish_turn_process_ownership(
                                 agent, effective_task_id
                             )
+                            file_aliases = {
+                                **granted_file_aliases,
+                                **make_file_handles(granted_file_paths),
+                            }
                             with file_grant_scope(
                                 effective_task_id,
                                 granted_file_paths,
-                                handles=make_file_handles(granted_file_paths),
+                                handles=file_aliases,
                             ), request_file_cache_scope(effective_task_id):
                                 _seed_agent_attachment_coverage(
                                     agent, effective_task_id

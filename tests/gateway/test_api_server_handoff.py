@@ -153,7 +153,11 @@ def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeyp
         f'sha256="{sha256}" sig="{sig}"/></files>'
     )
 
-    out = api_server._augment_message_with_handoff_context(message, _scope())
+    granted_paths = []
+    granted_aliases = {}
+    out = api_server._augment_message_with_handoff_context(
+        message, _scope(), granted_paths, granted_aliases
+    )
 
     assert "<files>" not in out
     assert '<file id="F01" name="report.pdf" file_id="owui-file-1"' in out
@@ -162,6 +166,8 @@ def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeyp
     assert sha256 not in out
     assert f'original="{original}"' in out
     assert "%PDF original" not in out
+    assert granted_paths == [str(original)]
+    assert granted_aliases == {"owui-file-1": str(original)}
 
 
 def test_cross_user_replay_is_rejected(monkeypatch, tmp_path):
