@@ -35,7 +35,7 @@ _LEGAL_REQUEST_RE = re.compile(
 )
 _TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
 _REGISTERED_RE = re.compile(r"(?:registered|registration|註冊|注册)", re.IGNORECASE)
-_REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "52", "53"})}
+_REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "44", "45", "52", "53"})}
 _SECTION_12_6_RE = re.compile(r"(?:section\s*)?12\s*\(\s*6\s*\)", re.IGNORECASE)
 _SECTION_53_5_B_RE = re.compile(
     r"(?:section\s*)?53\s*\(\s*5\s*\)\s*\(\s*b\s*\)", re.IGNORECASE
@@ -45,6 +45,32 @@ _NOT_BAR_RE = re.compile(
     r"(?:still|remains?)\s+(?:available|open)|"
     r"不(?:妨礙|阻止|排除|限制)|仍(?:可|然可以)|不影響",
     re.IGNORECASE,
+)
+_FAMOUS_MARK_RE = re.compile(
+    r"(?:famous|well[- ]known|reputation|馳名|驰名|知名)", re.IGNORECASE
+)
+_INVALIDITY_RE = re.compile(
+    r"(?:invalid(?:ity)?|declar(?:e|ation).{0,30}invalid|無效|无效|宣告無效|宣告无效)",
+    re.IGNORECASE,
+)
+_REVOCATION_RE = re.compile(
+    r"(?:revocation|revoke|non[- ]use|撤銷|撤销|不使用)", re.IGNORECASE
+)
+_BAD_FAITH_RE = re.compile(r"(?:bad\s+faith|惡意|恶意|不真誠|不真诚)", re.IGNORECASE)
+_OPPOSITION_RE = re.compile(r"(?:opposition|oppose|反對|反对|異議|异议)", re.IGNORECASE)
+_RECTIFICATION_RE = re.compile(
+    r"(?:rectification|rectify|更正|改正|糾正|纠正)", re.IGNORECASE
+)
+_THREE_YEAR_RE = re.compile(
+    r"(?:\b3\s*years?\b|\bthree[- ]year|3\s*年|三\s*年)", re.IGNORECASE
+)
+_FIVE_YEAR_RE = re.compile(
+    r"(?:\b5\s*years?\b|\bfive[- ]year|5\s*年|五\s*年)", re.IGNORECASE
+)
+_HONG_KONG_WELL_KNOWN_RE = re.compile(
+    r"(?:well[- ]known.{0,120}Hong\s+Kong|Hong\s+Kong.{0,120}well[- ]known|"
+    r"在香港.{0,80}(?:馳名|驰名)|(?:馳名|驰名).{0,80}香港)",
+    re.IGNORECASE | re.DOTALL,
 )
 _PRACTICE_GUIDANCE_RE = re.compile(
     r"(?:working\s+manual|work\s+manual|practice\s+manual|registry\s+manual|"
@@ -255,6 +281,81 @@ def _answer_uses_rule_13_time_evidence(answer: str) -> bool:
     )
 
 
+def _near(
+    answer: str, left: re.Pattern[str], right: re.Pattern[str], distance: int = 220
+) -> bool:
+    return bool(
+        re.search(
+            f"(?:{left.pattern}).{{0,{distance}}}(?:{right.pattern})",
+            answer,
+            re.IGNORECASE | re.DOTALL,
+        )
+        or re.search(
+            f"(?:{right.pattern}).{{0,{distance}}}(?:{left.pattern})",
+            answer,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+
+
+def _mislabels_as_rectification(answer: str, section: re.Pattern[str]) -> bool:
+    for match in section.finditer(answer):
+        window = answer[
+            max(0, match.start() - 220) : min(len(answer), match.end() + 220)
+        ]
+        if not _RECTIFICATION_RE.search(window):
+            continue
+        if re.search(
+            r"(?:not|isn't|is\s+not|does\s+not)\s+(?:a\s+)?(?:rectification|rectify)|"
+            r"(?:並非|不是|不屬於|不属于).{0,20}(?:更正|改正|糾正|纠正)",
+            window,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            continue
+        return True
+    return False
+
+
+def _registered_famous_mark_remedy_errors(user_message: Any, answer: str) -> list[str]:
+    text = _message_text(user_message)
+    if not (
+        _TRADE_MARK_RE.search(text)
+        and _REGISTERED_RE.search(text)
+        and _FAMOUS_MARK_RE.search(text)
+    ):
+        return []
+
+    section_53 = re.compile(r"(?:section|s\.?|第)?\s*53\b", re.IGNORECASE)
+    section_52 = re.compile(r"(?:section|s\.?|第)?\s*52\b", re.IGNORECASE)
+    section_44 = re.compile(r"(?:section|s\.?|第)?\s*44\b", re.IGNORECASE)
+    section_45 = re.compile(r"(?:section|s\.?|第)?\s*45\b", re.IGNORECASE)
+    section_21 = re.compile(r"(?:section|s\.?|第)?\s*21\b", re.IGNORECASE)
+    section_11_5_b = re.compile(r"11\s*\(\s*5\s*\)\s*\(\s*b\s*\)", re.IGNORECASE)
+
+    errors = []
+    if not _near(answer, _INVALIDITY_RE, section_53):
+        errors.append("Section 53 must be identified as declaration of invalidity")
+    if not _near(answer, _REVOCATION_RE, section_52):
+        errors.append("Section 52 must be identified as revocation/non-use")
+    if not _near(answer, _BAD_FAITH_RE, section_11_5_b):
+        errors.append("bad faith must be tied to section 11(5)(b)")
+    if not _HONG_KONG_WELL_KNOWN_RE.search(answer):
+        errors.append("well-known-mark protection must address Hong Kong")
+    if _near(answer, _OPPOSITION_RE, section_21):
+        errors.append("section 21 is not the opposition provision")
+    if _mislabels_as_rectification(answer, section_45):
+        errors.append("section 45 is withdrawal by the applicant, not rectification")
+    if _mislabels_as_rectification(answer, section_52):
+        errors.append("section 52 is revocation, not rectification")
+    if _OPPOSITION_RE.search(answer) and not section_44.search(answer):
+        errors.append("opposition must be tied to section 44")
+    if _REVOCATION_RE.search(answer) and (
+        _FIVE_YEAR_RE.search(answer) or not _THREE_YEAR_RE.search(answer)
+    ):
+        errors.append("section 52 non-use period is 3 years, not 5 years")
+    return errors
+
+
 def _minimum_provisions(user_message: Any) -> dict[str, frozenset[str]]:
     text = _message_text(user_message)
     if _TRADE_MARK_RE.search(text) and _REGISTERED_RE.search(text):
@@ -417,6 +518,32 @@ def evaluate_hk_legal_answer(
             "fail",
             "無法提供可依賴的香港商標法結論：最終答案未能正確區分第12(6)條的反對階段"
             "規則與第53(5)(b)條的註冊後無效申請。為免誤導，本次不提供矛盾的救濟建議。",
+        )
+
+    remedy_errors = _registered_famous_mark_remedy_errors(
+        messages[current_turn_user_idx], final_response
+    )
+    if remedy_errors:
+        if attempts < max_attempts:
+            return GateDecision(
+                "nudge",
+                "[System: Reject and rewrite the complete registered-famous-mark "
+                "remedy answer. The current official provisions were read, but the "
+                "candidate misclassified or omitted remedies. Correct every item: "
+                "section 44 is opposition at the application stage; section 45 is "
+                "withdrawal by the applicant, not rectification; section 52 is "
+                "revocation, including continuous non-use in Hong Kong for at least "
+                "3 years; section 53 is declaration of invalidity to the Registrar "
+                "or court; bad faith is section 11(5)(b) and supports invalidity via "
+                "section 53(3); a well-known/earlier-right route must explain the "
+                "Hong Kong protection requirement and section 53(5)(b). Preserve the "
+                "section 12(6) distinction and all official URLs/version dates.\n"
+                "Detected defects:\n- " + "\n- ".join(remedy_errors) + "]",
+            )
+        return GateDecision(
+            "fail",
+            "無法提供可依賴的香港註冊商標救濟結論：最終答案仍混淆反對、撤回、撤銷、"
+            "無效、惡意及馳名商標的法定路徑。為免誤導，本次不提供錯配條文的行動建議。",
         )
 
     if not _answer_cites_authorities(final_response, authorities):

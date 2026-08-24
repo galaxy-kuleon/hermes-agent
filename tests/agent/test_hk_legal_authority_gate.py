@@ -44,7 +44,7 @@ def _authority_message():
             ),
             "requested_provisions": [
                 {"provision": provision, "found": True}
-                for provision in ("11", "12", "52", "53")
+                for provision in ("11", "12", "44", "45", "52", "53")
             ],
         }),
     }
@@ -106,6 +106,21 @@ def _rule_13_answer():
         "IPD practice manual: https://www.ipd.gov.hk/filemanager/ipd/common/"
         "trade-marks/registry-work-manual/current/eng/"
         "time_limits_in_exam_process.pdf"
+    )
+
+
+def _registered_famous_mark_answer():
+    return (
+        "Section 44 governs opposition while the application is pending; section "
+        "45 is withdrawal by the applicant, not rectification. After registration, "
+        "section 53 is the declaration-of-invalidity route to the Registrar or court. "
+        "Bad faith under section 11(5)(b) supports invalidity through section 53(3). "
+        "Section 52 is revocation, including continuous non-use in Hong Kong for at "
+        "least 3 years. The section 12(4) well-known-mark and section 53(5)(b) earlier-"
+        "right route requires establishing protection as a well-known mark in Hong "
+        "Kong. Section 12(6) governs opposition but does not bar the separate section "
+        "53(5)(b) invalidity route. Current version 2025-02-14: "
+        "https://www.elegislation.gov.hk/hk/cap559!en"
     )
 
 
@@ -268,7 +283,8 @@ def test_registered_mark_dispute_requires_complete_minimum_provision_set():
     partial = _authority_message()
     payload = json.loads(partial["content"])
     payload["requested_provisions"] = [
-        {"provision": provision, "found": True} for provision in ("44", "52", "53")
+        {"provision": provision, "found": True}
+        for provision in ("44", "45", "52", "53")
     ]
     partial["content"] = json.dumps(payload)
     decision = evaluate_hk_legal_answer(
@@ -285,7 +301,8 @@ def test_exact_long_reported_prompt_is_still_a_registered_mark_dispute():
     partial = _authority_message()
     payload = json.loads(partial["content"])
     payload["requested_provisions"] = [
-        {"provision": provision, "found": True} for provision in ("44", "52", "53")
+        {"provision": provision, "found": True}
+        for provision in ("44", "45", "52", "53")
     ]
     partial["content"] = json.dumps(payload)
     decision = evaluate_hk_legal_answer(
@@ -304,7 +321,7 @@ def test_hkel_timestamp_is_cited_by_its_public_calendar_date():
     payload["version_date"] = "2025-02-14T00:00:00"
     authority["content"] = json.dumps(payload)
     decision = evaluate_hk_legal_answer(
-        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+        messages=[{"role": "user", "content": PROMPT}, authority],
         current_turn_user_idx=0,
         final_response=(
             "Current version 2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
@@ -331,17 +348,43 @@ def test_section_12_6_must_not_be_said_to_bar_section_53_5_b_invalidity():
     assert decision.action == "nudge"
     assert "must not be presented as barring" in decision.message
 
-    corrected = (
-        "Section 12(6) governs refusal at opposition, but does not bar the "
-        "separate section 53(5)(b) invalidity route after registration. "
-        "Current version 2025-02-14: "
-        "https://www.elegislation.gov.hk/hk/cap559!en"
-    )
+    corrected = _registered_famous_mark_answer()
     assert (
         evaluate_hk_legal_answer(
             messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
             current_turn_user_idx=0,
             final_response=corrected,
+            attempts=1,
+        ).action
+        == "pass"
+    )
+
+
+def test_registered_famous_mark_answer_rejects_wrong_remedy_section_titles():
+    authority = _authority_message()
+    wrong = (
+        "Opposition is under section 21. Use rectification for bad faith under "
+        "sections 45 and 52. The 5-year non-use route also uses section 52. "
+        "Section 53 is a court rectification alternative. Current version "
+        "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=wrong,
+        attempts=0,
+    )
+    assert decision.action == "nudge"
+    assert "section 44 is opposition" in decision.message
+    assert "section 45 is withdrawal" in decision.message
+    assert "section 52 is revocation" in decision.message
+    assert "section 53 is declaration of invalidity" in decision.message
+
+    assert (
+        evaluate_hk_legal_answer(
+            messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+            current_turn_user_idx=0,
+            final_response=_registered_famous_mark_answer(),
             attempts=1,
         ).action
         == "pass"
