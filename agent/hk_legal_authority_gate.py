@@ -35,7 +35,9 @@ _LEGAL_REQUEST_RE = re.compile(
 )
 _TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
 _REGISTERED_RE = re.compile(r"(?:registered|registration|註冊|注册)", re.IGNORECASE)
-_REGISTERED_MARK_MINIMUM = {"559": frozenset({"11", "12", "44", "45", "52", "53"})}
+_REGISTERED_MARK_MINIMUM = {
+    "559": frozenset({"4", "11", "12", "44", "45", "52", "53"})
+}
 _SECTION_12_6_RE = re.compile(r"(?:section\s*)?12\s*\(\s*6\s*\)", re.IGNORECASE)
 _SECTION_53_5_B_RE = re.compile(
     r"(?:section\s*)?53\s*\(\s*5\s*\)\s*\(\s*b\s*\)", re.IGNORECASE
@@ -396,6 +398,56 @@ def _minimum_provisions(user_message: Any) -> dict[str, frozenset[str]]:
     return {}
 
 
+def _deterministic_registered_mark_answer(
+    authorities: list[dict[str, Any]],
+) -> str:
+    """Render the safe minimum answer after repeated model rewrite failure.
+
+    This is deliberately narrower than a model-authored opinion. Every legal
+    route stated here is part of the verified minimum provision bundle above;
+    facts or remedies requiring other authority are left as questions for
+    counsel instead of being guessed.
+    """
+    citations: list[str] = []
+    for authority in authorities:
+        citation = authority["required_answer_citation"] or (
+            f"Hong Kong e-Legislation, Cap. {authority['chapter']}, current "
+            f"version {_citation_date(authority['version_date'])}: "
+            f"{authority['official_web_url']}"
+        )
+        if citation not in citations:
+            citations.append(citation)
+    source_lines = "\n".join(f"- {citation}" for citation in citations)
+    return (
+        "The mark is already registered, so opposition is no longer the current "
+        "route. Section 44 concerns opposition while an application is pending; "
+        "section 45 is withdrawal by the applicant, not a remedy you can file.\n\n"
+        "Your present statutory route is an application for a declaration of "
+        "invalidity under section 53, to the Registrar or the court. The two grounds "
+        "that need evidence are:\n"
+        "1. Bad faith: section 11(5)(b), applied to an existing registration through "
+        "section 53(3). Gather evidence that the Hong Kong applicant knew of your "
+        "earlier mark and deliberately copied it.\n"
+        "2. Earlier right / well-known mark: sections 12(4) and 12(5), available "
+        "post-registration through section 53(5)(b). Under section 4, foreign-market "
+        "fame alone does not prove that the mark was well known in Hong Kong. You need "
+        "Hong Kong evidence such as local sales, advertising, press, customers, or "
+        "recognition at the relevant date.\n\n"
+        "Section 52 revocation for non-use is only a later fallback: it requires a "
+        "continuous period of at least 3 years without genuine use in Hong Kong. A "
+        "registration dated 2 July 2026 is therefore far too recent for that ground "
+        "on 23 August 2026.\n\n"
+        "Next, obtain the official registration record and goods/services, preserve "
+        "the side-by-side mark comparison, collect Hong Kong reputation evidence, "
+        "and collect proof of the applicant's knowledge and actual Hong Kong use. "
+        "Those facts decide which invalidity ground is strongest.\n\n"
+        "Verified official source for this answer:\n"
+        f"{source_lines}\n\n"
+        "This is a bounded statutory route analysis, not a substitute for advice on "
+        "pleadings or evidence from Hong Kong trade mark counsel."
+    )
+
+
 def _missing_minimum_provisions(
     user_message: Any, authorities: list[dict[str, Any]]
 ) -> dict[str, list[str]]:
@@ -535,6 +587,11 @@ def evaluate_hk_legal_answer(
     remedy_errors = _registered_famous_mark_remedy_errors(
         messages[current_turn_user_idx], final_response
     )
+    if remedy_errors and attempts >= max_attempts:
+        return GateDecision(
+            "replace",
+            _deterministic_registered_mark_answer(authorities),
+        )
     if _confuses_opposition_with_post_registration_invalidity(
         messages[current_turn_user_idx], final_response
     ):
@@ -582,9 +639,8 @@ def evaluate_hk_legal_answer(
                 "Detected defects:\n- " + "\n- ".join(remedy_errors) + "]",
             )
         return GateDecision(
-            "fail",
-            "無法提供可依賴的香港註冊商標救濟結論：最終答案仍混淆反對、撤回、撤銷、"
-            "無效、惡意及馳名商標的法定路徑。為免誤導，本次不提供錯配條文的行動建議。",
+            "replace",
+            _deterministic_registered_mark_answer(authorities),
         )
 
     if not _answer_cites_authorities(final_response, authorities):

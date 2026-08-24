@@ -722,7 +722,7 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
         "559A Rule 13 request also retrieves the official IPD 'Time limits in the "
         "examination process' manual, so Rule 13 answers must use both law and current "
         "practice guidance. For a dispute where the challenged mark is already "
-        "registered, read Cap. 559 sections 11, 12, 44, 45, 52, and 53 together in "
+        "registered, read Cap. 559 sections 4, 11, 12, 44, 45, 52, and 53 together in "
         "one call: registration ends the opposition-stage route; foreign fame alone "
         "does not establish that a mark is well known in Hong Kong."
     ),

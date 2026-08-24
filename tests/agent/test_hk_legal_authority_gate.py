@@ -44,7 +44,7 @@ def _authority_message():
             ),
             "requested_provisions": [
                 {"provision": provision, "found": True}
-                for provision in ("11", "12", "44", "45", "52", "53")
+                for provision in ("4", "11", "12", "44", "45", "52", "53")
             ],
         }),
     }
@@ -295,7 +295,7 @@ def test_registered_mark_dispute_requires_complete_minimum_provision_set():
         attempts=1,
     )
     assert decision.action == "nudge"
-    assert "['11', '12']" in decision.message
+    assert "['4', '11', '12']" in decision.message
 
 
 def test_exact_long_reported_prompt_is_still_a_registered_mark_dispute():
@@ -313,7 +313,7 @@ def test_exact_long_reported_prompt_is_still_a_registered_mark_dispute():
         attempts=1,
     )
     assert decision.action == "nudge"
-    assert "['11', '12']" in decision.message
+    assert "['4', '11', '12']" in decision.message
 
 
 def test_hkel_timestamp_is_cited_by_its_public_calendar_date():
@@ -424,6 +424,27 @@ def test_registered_mark_answer_rejects_korea_only_fame_as_strong_hk_ground():
     )
     assert decision.action == "nudge"
     assert "Korean fame alone is not enough" in decision.message
+
+
+def test_registered_mark_rewrite_exhaustion_returns_verified_safe_answer():
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_REPORTED_PROMPT},
+            _authority_message(),
+        ],
+        current_turn_user_idx=0,
+        final_response="Opposition may still be open because the brand is famous in Korea.",
+        attempts=3,
+    )
+
+    assert decision.action == "replace"
+    assert "opposition is no longer the current route" in decision.message
+    assert "section 53" in decision.message
+    assert "section 11(5)(b)" in decision.message
+    assert "section 53(5)(b)" in decision.message
+    assert "at least 3 years" in decision.message
+    assert "foreign-market fame alone" in decision.message
+    assert "https://www.elegislation.gov.hk/hk/cap559!en" in decision.message
 
 
 def test_verified_and_cited_answer_passes():

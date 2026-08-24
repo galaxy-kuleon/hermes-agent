@@ -8125,6 +8125,20 @@ def run_conversation(
                     final_msg["content"] = final_response
                     final_msg["finish_reason"] = "hk_legal_authority_unconfirmed"
 
+                if _hk_legal_decision and _hk_legal_decision.action == "replace":
+                    logger.warning(
+                        "HK legal answer replaced with verified deterministic "
+                        "minimum after %d authority nudges (session=%s)",
+                        hk_legal_authority_nudges,
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    final_response = _hk_legal_decision.message
+                    final_msg["content"] = final_response
+                    final_msg["finish_reason"] = "hk_legal_authority_corrected"
+                    agent._emit_status(
+                        "✓ 香港法律答案已由已驗證官方法源產生安全版本"
+                    )
+
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,

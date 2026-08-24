@@ -3117,6 +3117,35 @@ class TestRunConversation:
             for message in result["messages"]
         )
 
+    def test_hk_legal_verified_replacement_is_returned_as_terminal_answer(self, agent):
+        self._setup_agent(agent)
+        candidate = _mock_response(
+            content="unsafe model candidate",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.return_value = candidate
+        from agent.hk_legal_authority_gate import GateDecision
+
+        with (
+            patch(
+                "agent.conversation_loop.evaluate_hk_legal_answer",
+                return_value=GateDecision("replace", "verified safe answer"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Apply Hong Kong Trade Mark law. What remedy do I have?"
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "verified safe answer"
+        assert result["messages"][-1]["content"] == "verified safe answer"
+        assert result["messages"][-1]["finish_reason"] == (
+            "hk_legal_authority_corrected"
+        )
+
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
