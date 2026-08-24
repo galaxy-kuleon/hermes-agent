@@ -128,6 +128,35 @@ def _estate_duty_authority_message(*provisions: str):
     }
 
 
+def _wills_authority_message(*provisions: str):
+    texts = {
+        "4": "4. Wills of persons not of full age.",
+        "5": "5. Signing and witnessing of a will.",
+        "14": "14. Will to be revoked by marriage, except in certain cases.",
+        "15": "15. Effect of dissolution or annulment of marriage.",
+    }
+    return {
+        "role": "tool",
+        "name": "hk_legal_authority",
+        "tool_call_id": "call-wills",
+        "content": json.dumps({
+            "success": True,
+            "cannot_confirm": False,
+            "chapter": "30",
+            "version_date": "2024-08-18T00:00:00",
+            "official_web_url": "https://www.elegislation.gov.hk/hk/cap30!en",
+            "required_answer_citation": (
+                "Hong Kong e-Legislation, Cap. 30, current version "
+                "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+            ),
+            "requested_provisions": [
+                {"provision": provision, "found": True, "text": texts[provision]}
+                for provision in provisions
+            ],
+        }),
+    }
+
+
 def _rule_13_answer():
     return (
         "Rule 13(2) gives 6 months. A request filed within that period may get "
@@ -321,6 +350,7 @@ def test_estate_duty_claim_requires_application_provision_not_short_title():
     decision = evaluate_hk_legal_answer(
         messages=[
             {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
             _estate_duty_authority_message("1"),
         ],
         current_turn_user_idx=0,
@@ -339,25 +369,7 @@ def test_will_template_does_not_trigger_trade_mark_rule_13_practice_gate():
         "Prepare a Hong Kong legal Will under the Wills Ordinance, following "
         "the attached template and best practices."
     )
-    authority = {
-        "role": "tool",
-        "name": "hk_legal_authority",
-        "tool_call_id": "call-wills",
-        "content": json.dumps({
-            "success": True,
-            "cannot_confirm": False,
-            "chapter": "30",
-            "version_date": "2024-08-18T00:00:00",
-            "official_web_url": "https://www.elegislation.gov.hk/hk/cap30!en",
-            "required_answer_citation": (
-                "Hong Kong e-Legislation, Cap. 30, current version "
-                "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
-            ),
-            "requested_provisions": [
-                {"provision": "5", "found": True, "text": "Signing a will."}
-            ],
-        }),
-    }
+    authority = _wills_authority_message("5")
     answer = (
         "The attached Will template follows section 5. Current version "
         "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
@@ -373,6 +385,82 @@ def test_will_template_does_not_trigger_trade_mark_rule_13_practice_gate():
     assert decision.action == "pass"
 
 
+def test_divorced_will_requires_execution_and_divorce_provisions():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Signing and witnessing follow Cap. 30 s. 4. Divorce automatically "
+        "revokes gifts to the former spouse under s. 4. Current version "
+        "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": prompt}, _wills_authority_message("4")],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=0,
+    )
+    assert decision.action == "nudge"
+    assert "chapter='30', provisions=['5', '15']" in decision.message
+    assert (
+        "section 4, which concerns wills made by persons not of full age"
+        in decision.message
+    )
+    assert "Regenerate any affected artifact" in decision.message
+
+
+def test_will_rejects_wrong_sections_after_required_authority_was_read():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Execution requires two witnesses under Cap. 30 s. 4. A divorce "
+        "automatically revokes a disposition to a former spouse under s. 4. "
+        "Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "signing and witnessing requirements" in decision.message
+    assert "effect of divorce" in decision.message
+    assert "regenerate the artifact" in decision.message
+
+
+def test_will_accepts_correct_execution_divorce_and_remarriage_sections():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Signing and witnessing are governed by Cap. 30 section 5. Under "
+        "section 15, dissolution causes an appointment of the former spouse to "
+        "be omitted and a devise or bequest to lapse unless contrary intention "
+        "appears. Remarriage generally revokes the will under section 14, subject "
+        "to its exceptions. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "14", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "pass"
+
+
 def test_estate_duty_abolition_date_must_match_verified_section_2_cutoff():
     prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
     wrong = (
@@ -382,6 +470,7 @@ def test_estate_duty_abolition_date_must_match_verified_section_2_cutoff():
     )
     messages = [
         {"role": "user", "content": prompt},
+        _wills_authority_message("5"),
         _estate_duty_authority_message("2"),
     ]
     decision = evaluate_hk_legal_answer(
@@ -397,7 +486,9 @@ def test_estate_duty_abolition_date_must_match_verified_section_2_cutoff():
     corrected = (
         "Estate duty was abolished for persons dying on or after "
         "11 February 2006. Current version 2022-07-01: "
-        "https://www.elegislation.gov.hk/hk/cap111!en"
+        "https://www.elegislation.gov.hk/hk/cap111!en. "
+        "Cap. 30 current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
     )
     assert (
         evaluate_hk_legal_answer(

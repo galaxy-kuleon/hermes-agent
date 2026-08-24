@@ -37,9 +37,7 @@ _LEGAL_REQUEST_RE = re.compile(
 )
 _TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
 _REGISTERED_RE = re.compile(r"(?:registered|registration|註冊|注册)", re.IGNORECASE)
-_REGISTERED_MARK_MINIMUM = {
-    "559": frozenset({"4", "11", "12", "44", "45", "52", "53"})
-}
+_REGISTERED_MARK_MINIMUM = {"559": frozenset({"4", "11", "12", "44", "45", "52", "53"})}
 _SECTION_12_6_RE = re.compile(r"(?:section\s*)?12\s*\(\s*6\s*\)", re.IGNORECASE)
 _SECTION_53_5_B_RE = re.compile(
     r"(?:section\s*)?53\s*\(\s*5\s*\)\s*\(\s*b\s*\)", re.IGNORECASE
@@ -140,6 +138,33 @@ _ESTATE_DUTY_ABOLITION_RE = re.compile(
     re.IGNORECASE,
 )
 _ESTATE_DUTY_MINIMUM = {"111": frozenset({"2"})}
+_WILL_DOCUMENT_RE = re.compile(
+    r"(?:\blast\s+will\b|\bwills?\s+ordinance\b|\bwill\s+template\b|"
+    r"\btestament(?:ary)?\b|遺囑|遗嘱)",
+    re.IGNORECASE,
+)
+_DIVORCE_RE = re.compile(
+    r"(?:\bdivorc(?:e|ed)\b|\bdissolution\s+of\s+marriage\b|"
+    r"\bannul(?:ment|led)\b|\bformer\s+spouse\b|離婚|离婚|婚姻撤銷|婚姻撤销)",
+    re.IGNORECASE,
+)
+_MARRIAGE_RE = re.compile(
+    r"(?:\b(?:re)?marri(?:age|ed|es|y)\b|結婚|结婚|再婚)", re.IGNORECASE
+)
+_WILL_EXECUTION_RE = re.compile(
+    r"(?:\bsign(?:ed|ing|ature)?\b|\bexecut(?:e|ed|ion)\b|\bwitness(?:ed|es|ing)?\b|"
+    r"簽署|签署|見證|见证)",
+    re.IGNORECASE,
+)
+_WILL_EFFECT_RE = re.compile(
+    r"(?:\brevoke(?:d|s)?\b|\brevocation\b|\blapse[ds]?\b|\bomitt?ed\b|"
+    r"\bdisposition\b|\bappointment\b|\bdevise\b|\bbequest\b|"
+    r"撤銷|撤销|失效|略去|處置|处置|委任|遺贈|遗赠)",
+    re.IGNORECASE,
+)
+_SECTION_5_RE = re.compile(r"(?:(?:section|s\.?)\s*5\b|第\s*5\s*條)", re.IGNORECASE)
+_SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
+_SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -425,6 +450,15 @@ def _minimum_provisions(
     if _ESTATE_DUTY_RE.search(combined):
         for chapter, provisions in _ESTATE_DUTY_MINIMUM.items():
             minimum.setdefault(chapter, set()).update(provisions)
+    # A generated/reviewed will must be checked against the execution provision.
+    # Marital-status effects are separate rules and must never be inferred from
+    # the execution provision or from a model's general legal memory.
+    if _WILL_DOCUMENT_RE.search(text):
+        minimum.setdefault("30", set()).add("5")
+        if _DIVORCE_RE.search(combined):
+            minimum["30"].add("15")
+        if _MARRIAGE_RE.search(combined):
+            minimum["30"].add("14")
     return {chapter: frozenset(provisions) for chapter, provisions in minimum.items()}
 
 
@@ -442,8 +476,7 @@ def _deterministic_registered_mark_answer(
     for authority in authorities:
         if (
             authority["chapter"] != "559"
-            or not set(authority["provisions"])
-            & _REGISTERED_MARK_MINIMUM["559"]
+            or not set(authority["provisions"]) & _REGISTERED_MARK_MINIMUM["559"]
         ):
             continue
         citation = authority["required_answer_citation"] or (
@@ -538,6 +571,35 @@ def _estate_duty_application_error(
     return ""
 
 
+def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
+    """Reject recurrent Cap. 30 category errors in will drafting/review."""
+    if not _WILL_DOCUMENT_RE.search(_message_text(user_message)):
+        return []
+
+    errors: list[str] = []
+    if _WILL_EXECUTION_RE.search(answer) and not _near(
+        answer, _WILL_EXECUTION_RE, _SECTION_5_RE, distance=420
+    ):
+        errors.append(
+            "signing and witnessing requirements must be tied to Cap. 30 section 5"
+        )
+    if _near(answer, _DIVORCE_RE, _WILL_EFFECT_RE, distance=420) and not _near(
+        answer, _DIVORCE_RE, _SECTION_15_RE, distance=420
+    ):
+        errors.append(
+            "the effect of divorce, dissolution, or annulment on a will must be "
+            "tied to Cap. 30 section 15"
+        )
+    if _near(answer, _MARRIAGE_RE, _WILL_EFFECT_RE, distance=420) and not _near(
+        answer, _MARRIAGE_RE, _SECTION_14_RE, distance=420
+    ):
+        errors.append(
+            "the effect of marriage or remarriage on a will must be tied to "
+            "Cap. 30 section 14"
+        )
+    return errors
+
+
 def _confuses_opposition_with_post_registration_invalidity(
     user_message: Any, answer: str
 ) -> bool:
@@ -612,6 +674,14 @@ def evaluate_hk_legal_answer(
                     "Cap. 559 is the Trade Marks Ordinance; read the listed "
                     "provisions for the registered-mark route"
                 )
+            elif chapter == "30":
+                meanings.append(
+                    "Cap. 30 section 5 controls signing and witnessing; section "
+                    "14 controls the effect of marriage; section 15 controls the "
+                    "effect of dissolution or annulment. Do not substitute section "
+                    "4, which concerns wills made by persons not of full age. "
+                    "Regenerate any affected artifact after correcting the law"
+                )
         if attempts < max_attempts:
             return GateDecision(
                 "nudge",
@@ -628,9 +698,7 @@ def evaluate_hk_legal_answer(
             "集合。為免誤導，本次不提供未經完整法源支持的建議。",
         )
 
-    estate_duty_error = _estate_duty_application_error(
-        final_response, authorities
-    )
+    estate_duty_error = _estate_duty_application_error(final_response, authorities)
     if estate_duty_error:
         section_text = _estate_duty_application_text(authorities)
         if attempts < max_attempts:
@@ -651,6 +719,30 @@ def evaluate_hk_legal_answer(
             "fail",
             "無法提供可依賴的香港遺產稅結論：最終答案未能正確保留《遺產稅條例》"
             "第2條所載的適用截止日期。為免誤導，本次不提供日期錯誤的法律結論。",
+        )
+
+    wills_errors = _wills_semantic_errors(
+        messages[current_turn_user_idx], final_response
+    )
+    if wills_errors:
+        if attempts < max_attempts:
+            return GateDecision(
+                "nudge",
+                "[System: Reject and rewrite the complete will answer. The current-turn "
+                "official Cap. 30 provisions were read, but the candidate confused "
+                "distinct statutory rules. Section 5 governs signing and witnessing; "
+                "section 14 governs the effect of marriage; section 15 governs the "
+                "effect of dissolution or annulment. Section 4 concerns wills made "
+                "by persons not of full age. Correct every affected statement in the "
+                "answer and generated document, regenerate the artifact, and preserve "
+                "the official URL and version citation.\nDetected defects:\n- "
+                + "\n- ".join(wills_errors)
+                + "]",
+            )
+        return GateDecision(
+            "fail",
+            "無法提供可依賴的香港遺囑結論：最終答案仍混淆《遺囑條例》的簽署、婚姻或"
+            "離婚條文。為免誤導，本次不交付含錯誤法條的答案或文件。",
         )
 
     if _requires_rule_13_practice(messages[current_turn_user_idx]):
@@ -707,9 +799,7 @@ def evaluate_hk_legal_answer(
     remedy_errors = _registered_famous_mark_remedy_errors(
         messages[current_turn_user_idx], final_response
     )
-    registered_mark_rewrite_limit = min(
-        max_attempts, REGISTERED_MARK_REWRITE_NUDGES
-    )
+    registered_mark_rewrite_limit = min(max_attempts, REGISTERED_MARK_REWRITE_NUDGES)
     if remedy_errors and attempts >= registered_mark_rewrite_limit:
         return GateDecision(
             "replace",
