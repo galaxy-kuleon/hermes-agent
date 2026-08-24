@@ -132,8 +132,10 @@ def _wills_authority_message(*provisions: str):
     texts = {
         "4": "4. Wills of persons not of full age.",
         "5": "5. Signing and witnessing of a will.",
+        "10": "10. A disposition to an attesting witness or spouse is void.",
         "14": "14. Will to be revoked by marriage, except in certain cases.",
         "15": "15. Effect of dissolution or annulment of marriage.",
+        "16": "16. A will is construed to speak from the testator's death.",
     }
     return {
         "role": "tool",
@@ -522,8 +524,8 @@ def test_will_accepts_explicit_corrections_of_section_4_and_predeceased_fiction(
     answer = (
         "Signing and witnessing are governed by Cap. 30 section 5. "
         "Section 4 concerns wills by persons not of full age and is not relevant "
-        "to signing. Section 15 causes an appointment of the former spouse to be "
-        "omitted and a disposition to that spouse to lapse unless a contrary "
+        "to signing. Section 15 causes an appointment of that spouse as executor "
+        "or trustee to be omitted and a disposition to that spouse to lapse unless a contrary "
         "intention appears. It does not deem the former spouse to have predeceased "
         "the testator. Marriage generally revokes a will under section 14, subject "
         "to its statutory exceptions. Current version 2024-08-18: "
@@ -533,6 +535,47 @@ def test_will_accepts_explicit_corrections_of_section_4_and_predeceased_fiction(
         messages=[
             {"role": "user", "content": prompt},
             _wills_authority_message("5", "14", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "pass", decision
+
+
+def test_will_rejects_section_16_for_interested_witness_rule():
+    prompt = "Prepare a Last Will under the Hong Kong Wills Ordinance."
+    answer = (
+        "Signing and witnessing follow Cap. 30 section 5. Beneficiaries must not "
+        "witness because section 16 voids any legacy to an interested witness. "
+        "Current version 2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "10", "16"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "section 10" in decision.message
+    assert "section 16" in decision.message
+
+
+def test_will_accepts_correct_interested_witness_rule():
+    prompt = "Prepare a Last Will under the Hong Kong Wills Ordinance."
+    answer = (
+        "Signing and witnessing follow Cap. 30 section 5. Under section 10, a "
+        "disposition to an attesting witness or that witness's spouse is void, "
+        "without invalidating the will itself. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "10"),
         ],
         current_turn_user_idx=0,
         final_response=answer,

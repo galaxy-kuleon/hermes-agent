@@ -176,12 +176,14 @@ _FORMER_SPOUSE_PREDECEASED_CORRECTION_RE = re.compile(
 _APPOINTMENT_OMITTED_RE = re.compile(
     r"(?:\bappointment\b.{0,180}\bformer\s+spouse\b.{0,180}\bomitt?ed\b|"
     r"\bformer\s+spouse\b.{0,180}\bappointment\b.{0,180}\bomitt?ed\b|"
+    r"\bappointment\b.{0,180}\b(?:executor|trustee)\b.{0,180}\bomitt?ed\b|"
     r"前配偶.{0,100}(?:遺囑執行人|遗嘱执行人|受託人|受托人).{0,100}(?:略去|刪除|删除))",
     re.IGNORECASE | re.DOTALL,
 )
 _DEVISE_BEQUEST_LAPSE_RE = re.compile(
     r"(?:\bformer\s+spouse\b.{0,240}\b(?:devise|bequest|disposition)\b.{0,140}\blapse[ds]?\b|"
     r"\b(?:devise|bequest|disposition)\b.{0,240}\bformer\s+spouse\b.{0,140}\blapse[ds]?\b|"
+    r"\b(?:devise|bequest|disposition)\b.{0,180}\b(?:that|the)\s+spouse\b.{0,140}\blapse[ds]?\b|"
     r"前配偶.{0,160}(?:遺贈|遗赠).{0,100}(?:失效|無效|无效))",
     re.IGNORECASE | re.DOTALL,
 )
@@ -231,6 +233,28 @@ _SECTION_4_EXECUTION_CLAIM_RE = re.compile(
 _SECTION_5_RE = re.compile(r"(?:(?:section|s\.?)\s*5\b|第\s*5\s*條)", re.IGNORECASE)
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
+_SECTION_10_RE = re.compile(r"(?:(?:section|s\.?)\s*10\b|第\s*10\s*條)", re.IGNORECASE)
+_INTERESTED_WITNESS_RE = re.compile(
+    r"(?:(?:beneficiar(?:y|ies)|interested|gift|legacy|disposition)[^.;:\n]{0,140}"
+    r"(?:attesting\s+)?witness|(?:attesting\s+)?witness[^.;:\n]{0,140}"
+    r"(?:beneficiar(?:y|ies)|interested|gift|legacy|disposition)|"
+    r"(?:受益人|有利害關係).{0,100}(?:見證人|见证人)|"
+    r"(?:見證人|见证人).{0,100}(?:受益人|有利害關係))",
+    re.IGNORECASE,
+)
+_INTERESTED_WITNESS_VOID_RE = re.compile(
+    r"(?:(?:gift|legacy|disposition)[^.;:\n]{0,160}(?:witness|spouse)[^.;:\n]{0,120}\bvoid\b|"
+    r"(?:witness|spouse)[^.;:\n]{0,160}(?:gift|legacy|disposition)[^.;:\n]{0,120}\bvoid\b|"
+    r"(?:受益人|見證人|见证人|配偶).{0,120}(?:遺贈|遗赠|處分|处分).{0,80}"
+    r"(?:無效|无效))",
+    re.IGNORECASE,
+)
+_WRONG_INTERESTED_WITNESS_SECTION_RE = re.compile(
+    r"(?:(?:section|s\.?)\s*16\b.{0,160}(?:gift|legacy|disposition|witness)|"
+    r"(?:gift|legacy|disposition|witness).{0,160}(?:section|s\.?)\s*16\b|"
+    r"第\s*16\s*條.{0,100}(?:遺贈|遗赠|處分|处分|見證|见证))",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -526,6 +550,8 @@ def _minimum_provisions(
             minimum["30"].add("15")
         if _MARRIAGE_RE.search(combined):
             minimum["30"].add("14")
+        if _INTERESTED_WITNESS_RE.search(combined):
+            minimum["30"].add("10")
     return {chapter: frozenset(provisions) for chapter, provisions in minimum.items()}
 
 
@@ -689,6 +715,21 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         if not _STATUTORY_EXCEPTION_RE.search(answer):
             errors.append(
                 "section 14 marriage revocation must preserve its statutory exceptions"
+            )
+    if _INTERESTED_WITNESS_RE.search(answer):
+        if not _SECTION_10_RE.search(answer):
+            errors.append(
+                "gifts to an attesting witness or the witness's spouse must be tied "
+                "to Cap. 30 section 10"
+            )
+        if _WRONG_INTERESTED_WITNESS_SECTION_RE.search(answer):
+            errors.append(
+                "Cap. 30 section 16 must not be used for the interested-witness rule"
+            )
+        if not _INTERESTED_WITNESS_VOID_RE.search(answer):
+            errors.append(
+                "section 10 makes the disposition to an attesting witness or the "
+                "witness's spouse void; it does not invalidate the will itself"
             )
     return errors
 
