@@ -43,6 +43,7 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 # =========================================================================
 
 
+
 class TestGuidanceConstants:
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
@@ -294,6 +295,20 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_skills_are_not_an_exclusive_knowledge_silo(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "legal" / "authority-check"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: authority-check\ndescription: Verify legal authorities\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "not an exclusive knowledge silo" in result
+        assert "scoped Matter context" in result
+        assert "other relevant skills" in result
+        assert "Reconcile conflicts explicitly" in result
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
@@ -1011,5 +1026,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
