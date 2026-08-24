@@ -212,6 +212,13 @@ _PARTICULAR_MARRIAGE_EXCEPTION_RE = re.compile(
     r"\b(?:expecting|contemplation)\b.{0,120}\bmarri(?:age|ed)\b)",
     re.IGNORECASE | re.DOTALL,
 )
+_FALSE_MARRIAGE_EXCEPTION_RE = re.compile(
+    r"(?:\b(?:section|s\.?)\s*14\b|\bmarri(?:age|ed)\b).{0,500}"
+    r"(?:\bpolicy\s+of\s+assurance\b|\bbecoming\s+a\s+parent\b)|"
+    r"(?:\bpolicy\s+of\s+assurance\b|\bbecoming\s+a\s+parent\b).{0,500}"
+    r"(?:\b(?:section|s\.?)\s*14\b|\bmarri(?:age|ed)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _DIVORCE_EFFECT_CLAIM_RE = re.compile(
     r"(?:(?:\bsection\s*15\b|\bs\.?\s*15\b).{0,240}"
     r"(?:\bdivorc(?:e|ed)\b|\bdissolution\b|\bannul(?:ment|led)\b|"
@@ -735,6 +742,11 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         if not (preserves_exceptions_generically or enumerates_both_exception_classes):
             errors.append(
                 "section 14 marriage revocation must preserve its statutory exceptions"
+            )
+        if _FALSE_MARRIAGE_EXCEPTION_RE.search(answer):
+            errors.append(
+                "section 14 does not create a life-policy-trust or becoming-a-parent "
+                "exception to marriage revocation"
             )
     if _INTERESTED_WITNESS_RE.search(answer):
         if not _SECTION_10_RE.search(answer):

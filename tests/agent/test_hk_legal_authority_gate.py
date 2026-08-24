@@ -507,6 +507,35 @@ def test_will_rejects_defective_latest_export_even_when_chat_answer_is_correct()
     )
 
 
+def test_will_rejects_invented_section_14_exceptions_in_export():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Signing and witnessing follow section 5. Section 14 revocation is subject "
+        "to statutory exceptions. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    artifact = (
+        "Section 14 revokes a will on marriage, subject to statutory exceptions, "
+        "including a trust of a policy of assurance and becoming a parent."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "14"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+        exported_artifact_contents=(artifact,),
+    )
+
+    assert decision.action == "nudge"
+    assert any(
+        "life-policy-trust or becoming-a-parent" in error
+        for error in decision.diagnostics
+    )
+
+
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "
