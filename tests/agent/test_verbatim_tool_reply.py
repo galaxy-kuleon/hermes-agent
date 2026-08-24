@@ -1,5 +1,7 @@
 import json
+from types import SimpleNamespace
 
+from agent.conversation_loop import _deliver_verbatim_terminal_reply
 from agent.verbatim_tool_reply import resolve_verbatim_tool_reply
 
 
@@ -84,3 +86,27 @@ def test_prior_turn_reply_cannot_override_current_turn():
     ]
 
     assert resolve_verbatim_tool_reply(messages, allowed_tools={TRUSTED}) is None
+
+
+def test_projects_verbatim_terminal_reply_exactly_once_then_closes_segment():
+    events = []
+    recorded = []
+    agent = SimpleNamespace(
+        session_id="session-1",
+        stream_delta_callback=events.append,
+        _record_streamed_assistant_text=recorded.append,
+    )
+    reply = "status line\n\n[open](/api/exports/result.docx)"
+
+    assert _deliver_verbatim_terminal_reply(agent, reply) is True
+    assert events == [reply, None]
+    assert recorded == [reply]
+
+
+def test_verbatim_terminal_reply_without_stream_consumer_stays_return_only():
+    agent = SimpleNamespace(
+        session_id="session-2",
+        stream_delta_callback=None,
+    )
+
+    assert _deliver_verbatim_terminal_reply(agent, "exact") is False

@@ -108,6 +108,41 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _deliver_verbatim_terminal_reply(agent, reply: str) -> bool:
+    """Project an exact trusted terminal reply to the live text stream.
+
+    A verbatim tool reply is synthesized after the last provider stream has
+    already ended. Returning and persisting it is not enough for streaming
+    clients: earlier tool-progress HTML makes the gateway's empty-stream
+    fallback intentionally ineligible. Emit the reply through the display
+    callback here, byte-for-byte, then close that display segment. ``None``
+    is filtered by the chat-completions gateway and remains only a display
+    boundary signal.
+    """
+    if not isinstance(reply, str) or not reply:
+        return False
+
+    callback = getattr(agent, "stream_delta_callback", None)
+    if callback is None:
+        return False
+
+    try:
+        callback(reply)
+        callback(None)
+    except Exception:
+        logger.warning(
+            "verbatim terminal reply stream projection failed (session=%s)",
+            getattr(agent, "session_id", None) or "none",
+            exc_info=True,
+        )
+        return False
+
+    record = getattr(agent, "_record_streamed_assistant_text", None)
+    if callable(record):
+        record(reply)
+    return True
+
+
 def _reset_tool_read_dedup_after_context_rewrite(task_id: str | None) -> None:
     """Re-arm exact reads after transcript content has been rewritten.
 
@@ -7389,6 +7424,7 @@ def run_conversation(
                             getattr(agent, "session_id", None) or "none",
                             exc_info=True,
                         )
+                    _deliver_verbatim_terminal_reply(agent, final_response)
                     break
 
                 # Reset per-turn retry counters after successful tool
