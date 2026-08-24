@@ -275,6 +275,14 @@ _SECTION_5_WRONG_MUTUAL_WITNESS_PRESENCE_RE = re.compile(
     r".{0,420}(?:section|s\.?)\s*5\b)",
     re.IGNORECASE | re.DOTALL,
 )
+_SECTION_5_MUTUAL_WITNESS_PRESENCE_CORRECTION_RE = re.compile(
+    r"(?:section|s\.?)\s*5\b.{0,120}"
+    r"(?:does|do|did|is|are|was|were)\s+not\s+require.{0,220}"
+    r"(?:in\s+the\s+presence\s+of\s+(?:the\s+)?other\s+witness|"
+    r"in\s+the\s+presence\s+of\s+each\s+other|"
+    r"in\s+each\s+other['’]s\s+presence)",
+    re.IGNORECASE | re.DOTALL,
+)
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
 _SECTION_10_RE = re.compile(r"(?:(?:section|s\.?)\s*10\b|第\s*10\s*條)", re.IGNORECASE)
@@ -730,7 +738,12 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         errors.append(
             "Cap. 30 section 4 must not be used for signing or witnessing requirements"
         )
-    if _SECTION_5_WRONG_MUTUAL_WITNESS_PRESENCE_RE.search(answer):
+    mutual_presence_claim_text = (
+        _SECTION_5_MUTUAL_WITNESS_PRESENCE_CORRECTION_RE.sub("", answer)
+    )
+    if _SECTION_5_WRONG_MUTUAL_WITNESS_PRESENCE_RE.search(
+        mutual_presence_claim_text
+    ):
         errors.append(
             "Cap. 30 section 5 does not require a witness to sign or acknowledge "
             "in the presence of another witness; signing together may be advised "
@@ -957,8 +970,12 @@ def evaluate_hk_legal_answer(
                 "the official URL and version citation. Keep the client-signature "
                 "artifact simple: it should contain the operative will and attestation "
                 "blocks, not drafting notes, statutory analysis, or an execution "
-                "checklist. Put the legal explanation in the chat answer. If legal "
-                "mechanisms must remain in an artifact, use these exact verified "
+                "checklist. The user asked for a document, not an encyclopedic legal "
+                "memo: omit unrequested marriage, dissolution, witness, and estate-duty "
+                "analysis from the final chat answer. Confirm the clean artifact and "
+                "provide its exact download links. If a legal mechanism is genuinely "
+                "needed to answer the request, keep it in the chat and use these exact "
+                "verified "
                 "minimums: section 10 voids a disposition to an attesting witness or "
                 "that witness's spouse, not the will; section 14 is subject to both "
                 "the power-of-appointment class in subsection (2) and marriage to "

@@ -614,6 +614,7 @@ def test_will_rejects_mutual_witness_presence_as_section_5_minimum():
 
     assert decision.action == "nudge"
     assert "does not require a witness" in decision.message
+    assert "not an encyclopedic legal memo" in decision.message
 
 
 def test_will_allows_mutual_witness_presence_as_cautious_practice_only():
@@ -626,6 +627,27 @@ def test_will_allows_mutual_witness_presence_as_cautious_practice_only():
         "execution practice, I recommend that everyone remain together and sign in "
         "each other's presence. Current version 2024-08-18: "
         "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+
+    assert decision.action == "pass", decision
+
+
+def test_will_allows_explicit_correction_of_mutual_presence_fiction():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Section 5 does NOT require each witness to sign in the presence of the "
+        "other witness. The 'in the presence of each other' wording in the "
+        "attestation is cautious practice, not the statutory minimum. Current "
+        "version 2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
     )
     decision = evaluate_hk_legal_answer(
         messages=[
