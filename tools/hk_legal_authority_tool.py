@@ -61,9 +61,8 @@ _RULE_13_MANUAL_TERMS = (
     "rule 13(3)",
     "6-month period",
     "six-month period",
-    "extension of time",
 )
-MAX_MANUAL_MATCHED_PAGES = 8
+MAX_MANUAL_MATCHED_PAGES = 4
 
 
 @dataclass(frozen=True)
