@@ -212,6 +212,13 @@ _PARTICULAR_MARRIAGE_EXCEPTION_RE = re.compile(
     r"\b(?:expecting|contemplation)\b.{0,120}\bmarri(?:age|ed)\b)",
     re.IGNORECASE | re.DOTALL,
 )
+_MARRIAGE_EXCEPTION_DETAIL_RE = re.compile(
+    r"(?:\bcontemplation\s+of\b.{0,120}\bmarriage\b|"
+    r"\bexpecting\b.{0,120}\bmarri(?:age|ed)\b|"
+    r"\bprovid(?:e|es|ed|ing)\s+for\s+the\s+other\s+party\b|"
+    r"\bpower\s+of\s+appointment\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _FALSE_MARRIAGE_EXCEPTION_RE = re.compile(
     r"(?:\b(?:section|s\.?)\s*14\b|\bmarri(?:age|ed)\b).{0,500}"
     r"(?:\bpolicy\s+of\s+assurance\b|\bbecoming\s+a\s+parent\b)|"
@@ -265,8 +272,13 @@ _INTERESTED_WITNESS_RE = re.compile(
     re.IGNORECASE,
 )
 _INTERESTED_WITNESS_VOID_RE = re.compile(
-    r"(?:(?:gift|legacy|disposition)[^.;:\n]{0,160}(?:witness|spouse)[^.;:\n]{0,120}\bvoid\b|"
-    r"(?:witness|spouse)[^.;:\n]{0,160}(?:gift|legacy|disposition)[^.;:\n]{0,120}\bvoid\b|"
+    r"(?:(?:gift|legacy|disposition)[^.;:\n]{0,80}"
+    r"(?:to|in\s+favou?r\s+of|for\s+the\s+benefit\s+of)[^.;:\n]{0,120}"
+    r"(?:attesting\s+)?witness[^.;:\n]{0,120}\bvoid\b|"
+    r"(?:gift|legacy|disposition)[^.;:\n]{0,80}"
+    r"(?:to|in\s+favou?r\s+of|for\s+the\s+benefit\s+of)[^.;:\n]{0,120}"
+    r"(?:witness(?:'s)?\s+spouse|spouse\s+of\s+(?:such|the)\s+witness)"
+    r"[^.;:\n]{0,120}\bvoid\b|"
     r"(?:受益人|見證人|见证人|配偶).{0,120}(?:遺贈|遗赠|處分|处分).{0,80}"
     r"(?:無效|无效))",
     re.IGNORECASE,
@@ -739,9 +751,18 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
             _POWER_OF_APPOINTMENT_EXCEPTION_RE.search(answer)
             and _PARTICULAR_MARRIAGE_EXCEPTION_RE.search(answer)
         )
-        if not (preserves_exceptions_generically or enumerates_both_exception_classes):
+        describes_exception_details = bool(
+            _MARRIAGE_EXCEPTION_DETAIL_RE.search(answer)
+        )
+        if not preserves_exceptions_generically and not enumerates_both_exception_classes:
             errors.append(
                 "section 14 marriage revocation must preserve its statutory exceptions"
+            )
+        elif describes_exception_details and not enumerates_both_exception_classes:
+            errors.append(
+                "section 14 exception details must include both the power-of-appointment "
+                "class and the particular contemplated-marriage class; do not present "
+                "an incomplete list"
             )
         if _FALSE_MARRIAGE_EXCEPTION_RE.search(answer):
             errors.append(

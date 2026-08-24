@@ -536,6 +536,39 @@ def test_will_rejects_invented_section_14_exceptions_in_export():
     )
 
 
+def test_will_rejects_incomplete_s14_and_inverted_s10_in_export():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Signing and witnessing follow section 5. Section 14 revocation is subject "
+        "to statutory exceptions. Section 10 makes a disposition to an attesting "
+        "witness or that witness's spouse void, not the will. Current version "
+        "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    artifact = (
+        "Section 14 revokes the will on marriage, subject to statutory exceptions, "
+        "where it was made in contemplation of that marriage. Gift to an attesting "
+        "witness (section 10). A disposition by a will made by a beneficiary or the "
+        "beneficiary's spouse is void; the will itself remains valid."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "10", "14"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+        exported_artifact_contents=(artifact,),
+    )
+
+    assert decision.action == "nudge"
+    assert any("incomplete list" in error for error in decision.diagnostics)
+    assert any(
+        "disposition to an attesting witness" in error
+        for error in decision.diagnostics
+    )
+
+
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "
