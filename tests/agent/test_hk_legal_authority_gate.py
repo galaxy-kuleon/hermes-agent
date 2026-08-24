@@ -329,6 +329,48 @@ def test_estate_duty_claim_requires_application_provision_not_short_title():
     )
     assert decision.action == "nudge"
     assert "chapter='111', provisions=['2']" in decision.message
+    assert "Cap. 111 is the Estate Duty Ordinance" in decision.message
+    assert "regenerate the affected artifact" in decision.message
+    assert "trade-mark dispute" not in decision.message
+
+
+def test_will_template_does_not_trigger_trade_mark_rule_13_practice_gate():
+    prompt = (
+        "Prepare a Hong Kong legal Will under the Wills Ordinance, following "
+        "the attached template and best practices."
+    )
+    authority = {
+        "role": "tool",
+        "name": "hk_legal_authority",
+        "tool_call_id": "call-wills",
+        "content": json.dumps({
+            "success": True,
+            "cannot_confirm": False,
+            "chapter": "30",
+            "version_date": "2024-08-18T00:00:00",
+            "official_web_url": "https://www.elegislation.gov.hk/hk/cap30!en",
+            "required_answer_citation": (
+                "Hong Kong e-Legislation, Cap. 30, current version "
+                "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+            ),
+            "requested_provisions": [
+                {"provision": "5", "found": True, "text": "Signing a will."}
+            ],
+        }),
+    }
+    answer = (
+        "The attached Will template follows section 5. Current version "
+        "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": prompt}, authority],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=3,
+    )
+
+    assert decision.action == "pass"
 
 
 def test_estate_duty_abolition_date_must_match_verified_section_2_cutoff():

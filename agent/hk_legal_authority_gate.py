@@ -101,12 +101,12 @@ _FOREIGN_FAME_OVERSTATEMENT_RE = re.compile(
 )
 _PRACTICE_GUIDANCE_RE = re.compile(
     r"(?:working\s+manual|work\s+manual|practice\s+manual|registry\s+manual|"
-    r"extension\s+of\s+time|time\s+limit|deadline|late|forgot|rule\s*13|"
+    r"extension\s+of\s+time|time\s+limit|deadline|\blate\b|forgot|rule\s*13|"
     r"工作手冊|實務手冊|实务手册|延期|期限|逾期)",
     re.IGNORECASE,
 )
 _RULE_13_TIME_RE = re.compile(
-    r"(?:extension\s+of\s+time|time\s+limit|deadline|late|forgot|rule\s*13|"
+    r"(?:extension\s+of\s+time|time\s+limit|deadline|\blate\b|forgot|rule\s*13|"
     r"rule\s*9[56]|延期|期限|逾期)",
     re.IGNORECASE,
 )
@@ -597,19 +597,35 @@ def evaluate_hk_legal_answer(
             f"chapter='{chapter}', provisions={provisions}"
             for chapter, provisions in missing.items()
         )
+        meanings = []
+        for chapter, provisions in missing.items():
+            if chapter == "111" and "2" in provisions:
+                meanings.append(
+                    "Cap. 111 is the Estate Duty Ordinance; section 2 controls "
+                    "its date-of-death application cutoff. If the candidate "
+                    "answer or a generated artifact mentions estate duty, "
+                    "remove any inconsistent date and regenerate the affected "
+                    "artifact after reading section 2"
+                )
+            elif chapter == "559":
+                meanings.append(
+                    "Cap. 559 is the Trade Marks Ordinance; read the listed "
+                    "provisions for the registered-mark route"
+                )
         if attempts < max_attempts:
             return GateDecision(
                 "nudge",
-                "[System: The official lookup was incomplete for this registered "
-                "Hong Kong trade-mark dispute. Use hk_legal_authority to read the "
-                "missing minimum provisions before answering: "
-                f"{calls}. Then give one complete answer grounded in all successful "
+                "[System: The official lookup was incomplete for this Hong Kong "
+                "statutory answer. Use hk_legal_authority to read the missing "
+                f"minimum provisions before answering: {calls}. "
+                + ("Meaning: " + "; ".join(meanings) + ". " if meanings else "")
+                + "Then give one complete answer grounded in all successful "
                 "current-turn results, including each official URL and version date.]",
             )
         return GateDecision(
             "fail",
-            "無法提供可依賴的香港商標法結論：本回合未能完整讀取已註冊商標爭議所需的"
-            "最低官方法源集合。為免誤導，本次不提供不完整的救濟建議。",
+            "無法提供可依賴的香港法例結論：本回合未能完整讀取本題所需的最低官方法源"
+            "集合。為免誤導，本次不提供未經完整法源支持的建議。",
         )
 
     estate_duty_error = _estate_duty_application_error(

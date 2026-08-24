@@ -305,6 +305,7 @@ class TestBuildSkillsSystemPrompt:
 
         result = build_skills_system_prompt()
 
+        assert "user explicitly narrows the permitted sources" in result
         assert "not an exclusive knowledge silo" in result
         assert "scoped Matter context" in result
         assert "other relevant skills" in result
