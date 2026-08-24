@@ -491,6 +491,31 @@ def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect()
     assert decision.action == "pass"
 
 
+def test_will_rejects_operates_as_if_former_spouse_were_dead_fiction():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Signing and witnessing follow Cap. 30 section 5. Under section 15, the "
+        "will operates as if the former spouse were dead. An appointment of that "
+        "spouse as executor or trustee is omitted and a disposition to that spouse "
+        "lapses unless a contrary intention appears. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "does not deem the former spouse" in decision.message
+
+
 def test_will_accepts_correct_execution_divorce_and_remarriage_sections():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "

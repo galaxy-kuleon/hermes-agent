@@ -161,7 +161,9 @@ _FORMER_SPOUSE_PREDECEASED_RE = re.compile(
     r"\btreated\s+as\s+(?:having\s+)?died\b)|"
     r"(?:\bpredeceas(?:e|ed)\b|\btreated\s+as\s+(?:having\s+)?died\b)"
     r".{0,180}\bformer\s+spouse\b|前配偶.{0,100}(?:視為先死|视为先死|"
-    r"視為已死亡|视为已死亡))",
+    r"視為已死亡|视为已死亡)|"
+    r"\b(?:will\s+)?operates?\s+as\s+if\b.{0,120}\bformer\s+spouse\b"
+    r".{0,80}\b(?:were|was|is)\s+dead\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _FORMER_SPOUSE_PREDECEASED_CORRECTION_RE = re.compile(
