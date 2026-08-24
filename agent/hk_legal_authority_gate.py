@@ -410,6 +410,12 @@ def _deterministic_registered_mark_answer(
     """
     citations: list[str] = []
     for authority in authorities:
+        if (
+            authority["chapter"] != "559"
+            or not set(authority["provisions"])
+            & _REGISTERED_MARK_MINIMUM["559"]
+        ):
+            continue
         citation = authority["required_answer_citation"] or (
             f"Hong Kong e-Legislation, Cap. {authority['chapter']}, current "
             f"version {_citation_date(authority['version_date'])}: "
@@ -430,7 +436,8 @@ def _deterministic_registered_mark_answer(
         "earlier mark and deliberately copied it.\n"
         "2. Earlier right / well-known mark: sections 12(4) and 12(5), available "
         "post-registration through section 53(5)(b). Under section 4, foreign-market "
-        "fame alone does not prove that the mark was well known in Hong Kong. You need "
+        "fame, including Korean-market fame, alone does not prove that the mark was "
+        "well known in Hong Kong. You need "
         "Hong Kong evidence such as local sales, advertising, press, customers, or "
         "recognition at the relevant date.\n\n"
         "Section 52 revocation for non-use is only a later fallback: it requires a "

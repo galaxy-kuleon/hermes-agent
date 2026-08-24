@@ -443,8 +443,26 @@ def test_registered_mark_rewrite_exhaustion_returns_verified_safe_answer():
     assert "section 11(5)(b)" in decision.message
     assert "section 53(5)(b)" in decision.message
     assert "at least 3 years" in decision.message
-    assert "foreign-market fame alone" in decision.message
+    assert "Korean-market fame, alone does not prove" in decision.message
     assert "https://www.elegislation.gov.hk/hk/cap559!en" in decision.message
+
+
+def test_registered_mark_safe_answer_omits_unrelied_subsidiary_legislation():
+    rule_authority = _rule_13_authority_message()
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_REPORTED_PROMPT},
+            _authority_message(),
+            rule_authority,
+        ],
+        current_turn_user_idx=0,
+        final_response="Opposition may still be open because the brand is famous in Korea.",
+        attempts=3,
+    )
+
+    assert decision.action == "replace"
+    assert "cap559!en" in decision.message
+    assert "cap559A!en" not in decision.message
 
 
 def test_verified_and_cited_answer_passes():
