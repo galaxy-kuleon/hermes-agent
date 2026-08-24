@@ -1,6 +1,7 @@
 import json
 
 from agent.hk_legal_authority_gate import (
+    MAX_AUTHORITY_NUDGES,
     evaluate_hk_legal_answer,
     is_hk_statutory_query,
     is_hk_statutory_turn,
@@ -569,6 +570,30 @@ def test_will_rejects_incomplete_s14_and_inverted_s10_in_export():
     )
 
 
+def test_operational_attestation_clause_does_not_require_citation_in_artifact():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Signing and witnessing requirements follow section 5. Current version "
+        "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    operative_artifact = (
+        "SIGNED by the testator as his last will in the presence of us both present "
+        "at the same time, who in his presence subscribe our names as witnesses."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+        exported_artifact_contents=(operative_artifact,),
+    )
+
+    assert decision.action == "pass"
+
+
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "
@@ -977,7 +1002,7 @@ def test_retry_exhaustion_fails_closed_instead_of_returning_claims():
         messages=[{"role": "user", "content": PROMPT}],
         current_turn_user_idx=0,
         final_response="Section 47 definitely applies.",
-        attempts=3,
+        attempts=MAX_AUTHORITY_NUDGES,
     )
     assert decision.action == "fail"
     assert "無法提供" in decision.message

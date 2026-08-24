@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-MAX_AUTHORITY_NUDGES = 3
+MAX_AUTHORITY_NUDGES = 5
 REGISTERED_MARK_REWRITE_NUDGES = 1
 
 _HK_RE = re.compile(r"(?:\bhong\s+kong\b|\bhk\b|香港)", re.IGNORECASE)
@@ -151,10 +151,16 @@ _DIVORCE_RE = re.compile(
 _MARRIAGE_RE = re.compile(
     r"(?:\b(?:re)?marri(?:age|ed|es|y)\b|結婚|结婚|再婚)", re.IGNORECASE
 )
-_WILL_EXECUTION_RE = re.compile(
-    r"(?:\bsign(?:ed|ing|ature)?\b|\bexecut(?:e|ed|ion)\b|\bwitness(?:ed|es|ing)?\b|"
-    r"簽署|签署|見證|见证)",
-    re.IGNORECASE,
+_WILL_EXECUTION_REQUIREMENT_RE = re.compile(
+    r"(?:(?:\bmust\b|\brequir(?:e|ed|ement)s?\b|\bgovern(?:ed|s)?\b|"
+    r"\bpursuant\s+to\b|\bin\s+accordance\s+with\b|\bcompliance\b)"
+    r".{0,180}(?:\bsign(?:ed|ing|ature)?\b|\bexecut(?:e|ed|ion)\b|"
+    r"\bwitness(?:ed|es|ing)?\b)|"
+    r"(?:\bsign(?:ed|ing|ature)?\b|\bexecut(?:e|ed|ion)\b|"
+    r"\bwitness(?:ed|es|ing)?\b).{0,180}"
+    r"(?:\bmust\b|\brequir(?:e|ed|ement)s?\b|\bgovern(?:ed|s)?\b|"
+    r"\bpursuant\s+to\b|\bin\s+accordance\s+with\b|\bcompliance\b))",
+    re.IGNORECASE | re.DOTALL,
 )
 _FORMER_SPOUSE_PREDECEASED_RE = re.compile(
     r"(?:\bformer\s+spouse\b.{0,180}(?:\bpredeceas(?:e|ed)\b|"
@@ -704,7 +710,10 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         return []
 
     errors: list[str] = []
-    if _WILL_EXECUTION_RE.search(answer) and not _SECTION_5_RE.search(answer):
+    if (
+        _WILL_EXECUTION_REQUIREMENT_RE.search(answer)
+        and not _SECTION_5_RE.search(answer)
+    ):
         errors.append(
             "signing and witnessing requirements must be tied to Cap. 30 section 5"
         )
@@ -930,7 +939,18 @@ def evaluate_hk_legal_answer(
                 "effect of dissolution or annulment. Section 4 concerns wills made "
                 "by persons not of full age. Correct every affected statement in the "
                 "answer and generated document, regenerate the artifact, and preserve "
-                "the official URL and version citation.\nDetected defects:\n- "
+                "the official URL and version citation. Keep the client-signature "
+                "artifact simple: it should contain the operative will and attestation "
+                "blocks, not drafting notes, statutory analysis, or an execution "
+                "checklist. Put the legal explanation in the chat answer. If legal "
+                "mechanisms must remain in an artifact, use these exact verified "
+                "minimums: section 10 voids a disposition to an attesting witness or "
+                "that witness's spouse, not the will; section 14 is subject to both "
+                "the power-of-appointment class in subsection (2) and the particular "
+                "contemplated-marriage classes in subsections (3)-(4); section 15 "
+                "omits a former spouse's executor/trustee appointment and causes a "
+                "devise or bequest to that spouse to lapse except where the will "
+                "shows a contrary intention.\nDetected defects:\n- "
                 + "\n- ".join(wills_errors)
                 + "]",
                 tuple(wills_errors),
