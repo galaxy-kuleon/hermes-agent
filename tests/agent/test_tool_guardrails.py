@@ -363,7 +363,7 @@ def test_hk_legal_authority_is_registered_as_idempotent():
     assert "block" in actions
 
 
-def test_hk_authority_semantic_subset_is_blocked_after_successful_read():
+def test_hk_authority_same_normalized_set_is_reused_but_narrowing_is_allowed():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
     )
@@ -387,7 +387,19 @@ def test_hk_authority_semantic_subset_is_blocked_after_successful_read():
     )
     duplicate = controller.before_call(
         "hk_legal_authority",
-        {"chapter": "559a", "provisions": ["Sch. 1 rule 13", "section 14(1)"]},
+        {
+            "chapter": "559a",
+            "provisions": [
+                "section 95(1)(d)",
+                "Sch. 1 rule 13",
+                "rule 94",
+                "section 14(1)",
+            ],
+        },
+    )
+    narrowed = controller.before_call(
+        "hk_legal_authority",
+        {"chapter": "559A", "provisions": ["Sch. 1 rule 13"]},
     )
     new_provision = controller.before_call(
         "hk_legal_authority", {"chapter": "559A", "provisions": ["96"]}
@@ -396,6 +408,7 @@ def test_hk_authority_semantic_subset_is_blocked_after_successful_read():
     assert duplicate.action == "reuse"
     assert duplicate.code == "hk_authority_already_read"
     assert "answer the user now" in duplicate.message
+    assert narrowed.action == "allow"
     assert new_provision.action == "allow"
 
 

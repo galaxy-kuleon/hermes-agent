@@ -377,7 +377,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
-        self._hk_legal_coverage: dict[str, set[str]] = {}
+        self._hk_legal_request_sets: dict[str, set[frozenset[str]]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -406,8 +406,8 @@ class ToolCallGuardrailController:
 
         if tool_name == "hk_legal_authority":
             chapter, requested = _hk_authority_request(_coerce_args(args))
-            covered = self._hk_legal_coverage.get(chapter) or set()
-            if requested and requested.issubset(covered):
+            prior_sets = self._hk_legal_request_sets.get(chapter) or set()
+            if requested and requested in prior_sets:
                 return ToolGuardrailDecision(
                     action="reuse",
                     code="hk_authority_already_read",
@@ -539,7 +539,7 @@ class ToolCallGuardrailController:
         if tool_name == "hk_legal_authority":
             chapter, provisions = _successful_hk_authority_result(result)
             if chapter and provisions:
-                self._hk_legal_coverage.setdefault(chapter, set()).update(provisions)
+                self._hk_legal_request_sets.setdefault(chapter, set()).add(provisions)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)

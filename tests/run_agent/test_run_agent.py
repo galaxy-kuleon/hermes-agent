@@ -2349,7 +2349,10 @@ def test_hk_authority_semantic_duplicate_reuses_prior_result_without_halt(
     outcome = tool_executor._run_agent_tool_execution_middleware(
         agent,
         function_name="hk_legal_authority",
-        function_args={"chapter": "559a", "provisions": ["Sch. 1 rule 13"]},
+        function_args={
+            "chapter": "559a",
+            "provisions": ["section 14(1)", "Sch. 1 rule 13"],
+        },
         effective_task_id="task-1",
         tool_call_id="authority-duplicate",
         execute=lambda _args: (_ for _ in ()).throw(

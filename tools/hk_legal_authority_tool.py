@@ -292,10 +292,13 @@ def _rule_13_practice_guidance(opener) -> dict:
         "freshness": freshness,
         "server_version_hint": version_hint,
         "pdf_sha256": digest,
+        "matched_page_text_complete": True,
         "matched_pages": selected,
         "instruction": (
             "This is official practice guidance, not legislation. Cite the official "
-            "manual URL and keep its guidance distinct from the statutory rule."
+            "manual URL and keep its guidance distinct from the statutory rule. The "
+            "matched page text is present and complete below; do not describe it as "
+            "unavailable or truncated."
         ),
     }
 
