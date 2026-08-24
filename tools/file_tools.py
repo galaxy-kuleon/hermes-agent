@@ -3804,6 +3804,101 @@ def _route_exact_skill_file(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _targeted_skill_search_result(
+    routed: str,
+    *,
+    pattern: str,
+    context: int,
+    limit: int,
+    offset: int,
+    output_mode: str,
+) -> str:
+    """Search authoritative skill bytes without reinserting the whole file.
+
+    ``skill_view`` remains the ACL and source-of-truth boundary. Once it has
+    returned the exact requested file, a search tool should do search work:
+    return the matching lines and requested neighbourhood, not a multi-KB file
+    body that forces the model to search it again in its context.
+    """
+    try:
+        source_payload = json.loads(routed)
+    except (TypeError, ValueError):
+        return routed
+    if not isinstance(source_payload, dict):
+        return routed
+    source = source_payload.get("content")
+    if not source_payload.get("success") or not isinstance(source, str):
+        return routed
+
+    try:
+        expression = re.compile(pattern)
+    except re.error as exc:
+        return tool_error(f"Invalid search regex: {exc}")
+
+    offset, limit = normalize_search_pagination(offset, limit)
+    context = max(0, int(context or 0))
+    lines = source.splitlines()
+    all_hits = [
+        (line_number, line)
+        for line_number, line in enumerate(lines, start=1)
+        if expression.search(line)
+    ]
+    selected = all_hits[offset : offset + limit]
+    requested_path = str(
+        (source_payload.get("routing") or {}).get("requested_path") or ""
+    )
+    truncated = offset + len(selected) < len(all_hits)
+
+    result = {
+        "success": True,
+        "name": source_payload.get("name"),
+        "file": source_payload.get("file")
+        or (source_payload.get("routing") or {}).get("file_path"),
+        "total_count": len(all_hits),
+        "offset": offset,
+        "limit": limit,
+        "context": context,
+        "matches": [
+            {"path": requested_path, "line": line_number, "content": line}
+            for line_number, line in selected
+        ],
+        "routing": dict(source_payload.get("routing") or {}),
+        "complete": not truncated,
+        "truncated": truncated,
+        "source_available": True,
+        "authoritative": True,
+    }
+    result["routing"]["note"] = (
+        "Search was evaluated locally against the complete authoritative skill "
+        "file; only exact matches and requested context are returned."
+    )
+
+    if output_mode == "count":
+        result["counts"] = {requested_path: len(all_hits)}
+        result["content_returned"] = False
+        return json.dumps(result, ensure_ascii=False)
+    if output_mode == "files_only":
+        result["files"] = [requested_path] if all_hits else []
+        result["content_returned"] = False
+        return json.dumps(result, ensure_ascii=False)
+
+    windows = []
+    for line_number, _ in selected:
+        start = max(1, line_number - context)
+        end = min(len(lines), line_number + context)
+        if windows and start <= windows[-1][1] + 1:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+    blocks = [
+        "\n".join(f"{number}:{lines[number - 1]}" for number in range(start, end + 1))
+        for start, end in windows
+    ]
+    result["content"] = "\n--\n".join(blocks)
+    result["content_returned"] = bool(blocks)
+    return json.dumps(result, ensure_ascii=False)
+
+
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
@@ -3845,7 +3940,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             if routed_file is None and PurePosixPath(str(routed_path)).name != "SKILL.md":
                 routed = None
         if routed is not None:
-            return routed
+            return _targeted_skill_search_result(
+                routed,
+                pattern=pattern,
+                context=context,
+                limit=limit,
+                offset=offset,
+                output_mode=output_mode,
+            )
 
     try:
         offset, limit = normalize_search_pagination(offset, limit)

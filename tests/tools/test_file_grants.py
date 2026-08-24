@@ -130,24 +130,38 @@ def test_exact_skill_path_is_safely_routed_through_skill_view(
     )
 
 
-def test_exact_skill_search_routes_to_full_skill_view_content(tmp_path):
+def test_exact_skill_search_returns_targeted_authoritative_context(tmp_path):
     allowed = tmp_path / "attached.txt"
     path = "/home/hermes/skills/legal/tw-tmc/references/class-35.md"
 
     with _file_grant_scope("task-1", [str(allowed)]), patch(
         "tools.skills_tool._skill_view_with_bump",
         return_value=json.dumps(
-            {"success": True, "name": "tw-tmc", "content": "351914 jewelry retail"}
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-35.md",
+                "content": "3501 advertising\n351914 jewelry retail\n351915 watches retail\nunrelated tail",
+            }
         ),
     ) as routed, patch(
         "tools.file_tools._get_file_ops",
         side_effect=AssertionError("skill paths must not reach search I/O"),
     ):
         result = json.loads(
-            search_tool("351914", path=path, task_id="task-1")
+            search_tool("351914", path=path, context=1, task_id="task-1")
         )
 
-    assert result["content"] == "351914 jewelry retail"
+    assert result["content"] == (
+        "1:3501 advertising\n2:351914 jewelry retail\n3:351915 watches retail"
+    )
+    assert "unrelated tail" not in result["content"]
+    assert result["matches"] == [
+        {"path": path, "line": 2, "content": "351914 jewelry retail"}
+    ]
+    assert result["total_count"] == 1
+    assert result["authoritative"] is True
+    assert result["source_available"] is True
     assert result["routing"]["from_tool"] == "search_files"
     assert result["routing"]["requested_pattern"] == "351914"
     routed.assert_called_once_with(
@@ -164,7 +178,12 @@ def test_skill_directory_search_joins_literal_file_glob(tmp_path):
     with _file_grant_scope("task-1", [str(allowed)]), patch(
         "tools.skills_tool._skill_view_with_bump",
         return_value=json.dumps(
-            {"success": True, "name": "tw-tmc", "content": "351914 jewelry retail"}
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-35.md",
+                "content": "3501 advertising\n351914 jewelry retail\n351915 watches retail",
+            }
         ),
     ) as routed, patch(
         "tools.file_tools._get_file_ops",
@@ -179,7 +198,7 @@ def test_skill_directory_search_joins_literal_file_glob(tmp_path):
             )
         )
 
-    assert result["content"] == "351914 jewelry retail"
+    assert result["content"] == "2:351914 jewelry retail"
     assert result["routing"]["requested_path"].endswith(
         "/references/class-35.md"
     )
@@ -189,6 +208,27 @@ def test_skill_directory_search_joins_literal_file_glob(tmp_path):
         task_id="task-1",
         force_content=True,
     )
+
+
+def test_exact_skill_search_count_does_not_return_source_body(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    path = "/home/hermes/skills/legal/tw-tmc/references/class-35.md"
+    with _file_grant_scope("task-1", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=json.dumps(
+            {"success": True, "name": "tw-tmc", "content": "351914\n351914\nother"}
+        ),
+    ):
+        result = json.loads(
+            search_tool(
+                "351914", path=path, output_mode="count", task_id="task-1"
+            )
+        )
+
+    assert result["total_count"] == 2
+    assert result["counts"] == {path: 2}
+    assert result["content_returned"] is False
+    assert "content" not in result
 
 
 def test_skill_directory_search_never_substitutes_skill_main_file(tmp_path):
