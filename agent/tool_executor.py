@@ -643,10 +643,16 @@ def _run_agent_tool_execution_middleware(
                 and getattr(guardrail_decision, "action", "") == "reuse"
             ):
                 state["blocked"] = False
+                research_complete = (
+                    getattr(guardrail_decision, "code", "")
+                    == "hk_authority_registered_mark_research_complete"
+                )
                 result = json.dumps(
                     {
                         "success": True,
-                        "already_available": True,
+                        "already_available": not research_complete,
+                        "research_complete": research_complete,
+                        "execution_skipped": True,
                         "tool": function_name,
                         "chapter": final_args.get("chapter"),
                         "requested_provisions": final_args.get("provisions") or [],

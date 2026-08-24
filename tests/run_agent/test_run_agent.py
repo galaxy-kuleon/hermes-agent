@@ -2367,6 +2367,107 @@ def test_hk_authority_semantic_duplicate_reuses_prior_result_without_halt(
     assert controller.halt_decision is None
 
 
+def test_hk_authority_subset_reuses_one_prior_complete_batch(agent, monkeypatch):
+    from agent import tool_executor
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.after_call(
+        "hk_legal_authority",
+        {"chapter": "559", "provisions": ["11", "12", "52", "53"]},
+        json.dumps(
+            {
+                "success": True,
+                "chapter": "559",
+                "requested_provisions": [
+                    {"provision": provision, "found": True}
+                    for provision in ("11", "12", "52", "53")
+                ],
+            }
+        ),
+        failed=False,
+    )
+    agent._tool_guardrails = controller
+    monkeypatch.setattr(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    outcome = tool_executor._run_agent_tool_execution_middleware(
+        agent,
+        function_name="hk_legal_authority",
+        function_args={"chapter": "559", "provisions": ["12", "53"]},
+        effective_task_id="task-1",
+        tool_call_id="authority-subset",
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("covered subset must not dispatch")
+        ),
+    )
+    payload = json.loads(outcome.result)
+
+    assert payload["already_available"] is True
+    assert payload["research_complete"] is False
+    assert payload["execution_skipped"] is True
+
+
+def test_hk_registered_mark_complete_bundle_stops_unrelated_expansion(
+    agent, monkeypatch
+):
+    from agent import tool_executor
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    bundle = ("4", "11", "12", "44", "45", "52", "53")
+    controller.after_call(
+        "hk_legal_authority",
+        {"chapter": "559", "provisions": list(bundle)},
+        json.dumps(
+            {
+                "success": True,
+                "chapter": "559",
+                "requested_provisions": [
+                    {"provision": provision, "found": True}
+                    for provision in bundle
+                ],
+            }
+        ),
+        failed=False,
+    )
+    agent._tool_guardrails = controller
+    monkeypatch.setattr(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    outcome = tool_executor._run_agent_tool_execution_middleware(
+        agent,
+        function_name="hk_legal_authority",
+        function_args={"chapter": "559", "provisions": ["48", "60", "64"]},
+        effective_task_id="task-1",
+        tool_call_id="authority-expansion",
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("completed registered-mark research must not expand")
+        ),
+    )
+    payload = json.loads(outcome.result)
+
+    assert payload["already_available"] is False
+    assert payload["research_complete"] is True
+    assert payload["execution_skipped"] is True
+    assert "answer from sections 4, 11" in payload["instruction"]
+    assert controller.halt_decision is None
+
+
 class TestAgentRuntimePostHookOwnershipSync:
     """Exercise post-hook ownership through both agent-runtime tool paths."""
 

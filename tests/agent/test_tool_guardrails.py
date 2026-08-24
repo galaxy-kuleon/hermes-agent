@@ -363,7 +363,7 @@ def test_hk_legal_authority_is_registered_as_idempotent():
     assert "block" in actions
 
 
-def test_hk_authority_same_normalized_set_is_reused_but_narrowing_is_allowed():
+def test_hk_authority_same_normalized_set_and_narrowing_are_reused():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
     )
@@ -408,7 +408,8 @@ def test_hk_authority_same_normalized_set_is_reused_but_narrowing_is_allowed():
     assert duplicate.action == "reuse"
     assert duplicate.code == "hk_authority_already_read"
     assert "answer the user now" in duplicate.message
-    assert narrowed.action == "allow"
+    assert narrowed.action == "reuse"
+    assert narrowed.code == "hk_authority_already_read"
     assert new_provision.action == "allow"
 
 

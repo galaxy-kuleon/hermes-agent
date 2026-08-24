@@ -27,6 +27,14 @@ _HK_BARE_PROVISION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Policy bundle for the registered-mark remedy gate. Once this exact minimum
+# has been read successfully in a turn, more exploratory Cap. 559 lookups are
+# not additional verification; they are the recurrent local-model loop that
+# swaps the correct ss.52/53 taxonomy for unrelated provisions.
+_HK_REGISTERED_MARK_COMPLETE_BUNDLE = frozenset(
+    {"4", "11", "12", "44", "45", "52", "53"}
+)
+
 
 def _hk_authority_request(args: Mapping[str, Any]) -> tuple[str, frozenset[str]]:
     chapter = str(args.get("chapter") or "").strip().upper()
@@ -378,6 +386,7 @@ class ToolCallGuardrailController:
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._hk_legal_request_sets: dict[str, set[frozenset[str]]] = {}
+        self._hk_legal_covered: dict[str, set[str]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -406,8 +415,8 @@ class ToolCallGuardrailController:
 
         if tool_name == "hk_legal_authority":
             chapter, requested = _hk_authority_request(_coerce_args(args))
-            prior_sets = self._hk_legal_request_sets.get(chapter) or set()
-            if requested and requested in prior_sets:
+            covered = self._hk_legal_covered.get(chapter) or set()
+            if requested and requested.issubset(covered):
                 return ToolGuardrailDecision(
                     action="reuse",
                     code="hk_authority_already_read",
@@ -419,6 +428,24 @@ class ToolCallGuardrailController:
                     ),
                     tool_name=tool_name,
                     count=len(requested),
+                    signature=signature,
+                )
+            if (
+                chapter == "559"
+                and _HK_REGISTERED_MARK_COMPLETE_BUNDLE.issubset(covered)
+            ):
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="hk_authority_registered_mark_research_complete",
+                    message=(
+                        "The complete registered-mark authority bundle was already "
+                        "verified in this turn. Do not expand into unrelated Cap. 559 "
+                        "provisions or re-read the skill; answer from sections 4, 11, "
+                        "12, 44, 45, 52, and 53 now. This is an internal control: do "
+                        "not mention it in the user-visible answer."
+                    ),
+                    tool_name=tool_name,
+                    count=len(covered),
                     signature=signature,
                 )
 
@@ -540,6 +567,7 @@ class ToolCallGuardrailController:
             chapter, provisions = _successful_hk_authority_result(result)
             if chapter and provisions:
                 self._hk_legal_request_sets.setdefault(chapter, set()).add(provisions)
+                self._hk_legal_covered.setdefault(chapter, set()).update(provisions)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
