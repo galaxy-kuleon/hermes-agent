@@ -2239,9 +2239,17 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
-    if stub is not None:
-        return stub
+    # Explicit file-tool routing is a recovery path: the model is asking for
+    # the bytes again because the earlier copy may no longer be usable after
+    # context pruning.  In that path an ``unchanged`` stub is actively
+    # misleading, so callers may require the authoritative content.  This is
+    # deliberately a private handler kwarg; it is not exposed in the model's
+    # skill_view schema and ordinary repeated skill_view calls still dedup.
+    force_content = bool(kw.get("force_content", False))
+    if not force_content:
+        stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+        if stub is not None:
+            return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id
     )

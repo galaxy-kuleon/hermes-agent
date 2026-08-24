@@ -117,11 +117,16 @@ def test_exact_skill_path_is_safely_routed_through_skill_view(
     assert result["success"] is True
     assert result["content"] == "authoritative source"
     assert result["content_returned"] is True
+    assert result["complete"] is True
+    assert result["truncated"] is False
+    assert result["source_available"] is True
+    assert result["authoritative"] is True
     assert result["routing"]["from_tool"] == "read_file"
     assert result["routing"]["to_tool"] == "skill_view"
     routed.assert_called_once_with(
         {"name": expected_name, **({"file_path": expected_file} if expected_file else {})},
         task_id="task-1",
+        force_content=True,
     )
 
 
@@ -148,7 +153,49 @@ def test_exact_skill_search_routes_to_full_skill_view_content(tmp_path):
     routed.assert_called_once_with(
         {"name": "legal/tw-tmc", "file_path": "references/class-35.md"},
         task_id="task-1",
+        force_content=True,
     )
+
+
+def test_exact_skill_route_bypasses_unchanged_dedup(monkeypatch, tmp_path):
+    """An explicit re-read is a recovery request and must return full bytes."""
+    from tools import skills_tool
+
+    calls = []
+
+    monkeypatch.setattr(
+        skills_tool,
+        "_check_skill_view_dedup",
+        lambda *args: json.dumps(
+            {
+                "success": True,
+                "status": "unchanged",
+                "content_returned": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        skills_tool,
+        "skill_view",
+        lambda name, file_path=None, task_id=None: calls.append(
+            (name, file_path, task_id)
+        )
+        or json.dumps(
+            {"success": True, "name": name, "content": "full authoritative bytes"}
+        ),
+    )
+    monkeypatch.setattr(skills_tool, "_record_skill_view", lambda *args: None)
+
+    result = json.loads(
+        skills_tool._skill_view_with_bump(
+            {"name": "tw-tmc", "file_path": "references/class-35.md"},
+            task_id="task-recovery",
+            force_content=True,
+        )
+    )
+
+    assert result["content"] == "full authoritative bytes"
+    assert calls == [("tw-tmc", "references/class-35.md", "task-recovery")]
 
 
 def test_skill_auto_route_preserves_skill_acl_denial(tmp_path):

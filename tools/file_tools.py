@@ -3766,7 +3766,11 @@ def _route_exact_skill_file(
 
     from tools.skills_tool import _skill_view_with_bump
 
-    result = _skill_view_with_bump(target, task_id=task_id)
+    result = _skill_view_with_bump(
+        target,
+        task_id=task_id,
+        force_content=True,
+    )
     try:
         payload = json.loads(result)
     except (TypeError, ValueError):
@@ -3787,7 +3791,16 @@ def _route_exact_skill_file(
             "The complete authoritative skill file is returned; search it in "
             "the supplied content without retrying file tools."
         )
-    payload["content_returned"] = isinstance(payload.get("content"), str)
+    content_returned = isinstance(payload.get("content"), str)
+    payload["content_returned"] = content_returned
+    if payload.get("success") and content_returned:
+        # Make the completeness contract machine-readable and unambiguous.
+        # These fields describe the skill API payload, not a best-effort grep
+        # snippet: the caller has the complete authoritative file bytes.
+        payload["complete"] = True
+        payload["truncated"] = False
+        payload["source_available"] = True
+        payload["authoritative"] = True
     return json.dumps(payload, ensure_ascii=False)
 
 
