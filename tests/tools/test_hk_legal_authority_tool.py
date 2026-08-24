@@ -154,12 +154,43 @@ def test_extract_provisions_does_not_confuse_revocation_and_invalidity():
     assert rows[2] == {"provision": "999", "found": False}
 
 
-def test_full_tool_retains_versioned_xml_and_reports_authority(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ("section 53(5)(b)", "53"),
+        ("rule 52", "52"),
+        ("Sch. 1 rule 53", "53"),
+        ("schedule 1, r. 52", "52"),
+    ],
+)
+def test_extract_provisions_normalizes_common_legal_labels(requested, expected):
+    row = extract_provisions(AUTHORITY_XML, [requested])[0]
+
+    assert row["provision"] == expected
+    assert row["found"] is True
+    assert row["normalized_from"] == requested
+
+
+def test_invalid_provision_is_a_controlled_tool_result_before_network():
+    result = json.loads(
+        hk_legal_authority("559A", ["schedule unknown rule maybe"], opener=None)
+    )
+
+    assert result["success"] is False
+    assert result["cannot_confirm"] is True
+    assert "invalid provision" in result["error"]
+    assert result["instruction"].startswith("Correct the provision label")
+
+
+def test_full_tool_retains_versioned_xml_and_reports_authority(
+    monkeypatch, tmp_path, caplog
+):
     member = r"cap_559_en_c\cap_559_20250214000000_en_c.xml"
     opener = FakeOpener(make_archive(member, AUTHORITY_XML))
     monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
 
-    result = json.loads(hk_legal_authority("559", ["52", "53"], opener=opener))
+    with caplog.at_level("INFO", logger="tools.hk_legal_authority_tool"):
+        result = json.loads(hk_legal_authority("559", ["52", "53"], opener=opener))
 
     assert result["success"] is True
     assert result["cannot_confirm"] is False
@@ -171,9 +202,12 @@ def test_full_tool_retains_versioned_xml_and_reports_authority(monkeypatch, tmp_
         "https://www.elegislation.gov.hk/hk/cap559!en"
     )
     assert result["requested_provisions"][0]["provision"] == "52"
+    assert "retained_cache_path" not in result
     retained = list(tmp_path.glob("cap_559_20250214000000_en_c.xml.*.xml"))
     assert len(retained) == 1
     assert retained[0].read_bytes() == AUTHORITY_XML
+    assert str(retained[0]) in caplog.text
+    assert result["xml_sha256"] in caplog.text
 
 
 def test_network_failure_uses_retained_version_and_labels_it_offline(monkeypatch, tmp_path):

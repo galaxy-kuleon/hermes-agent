@@ -36,6 +36,7 @@ _ALIASES: ContextVar[dict[str, dict[str, str]] | None] = ContextVar(
 # always contain a separator, so the two namespaces cannot collide.
 _HANDLE_RE = re.compile(r"^#?(F\d{1,4})$", re.IGNORECASE)
 _MAX_LISTED_HANDLES = 12
+_SKILL_SUPPORT_DIRS = frozenset({"references", "templates", "scripts", "assets"})
 
 
 def _canonical_path(path: str | Path) -> str:
@@ -180,6 +181,63 @@ def _known_handles_hint(task_id: str) -> str:
     return f" Valid handles this request: {listed}."
 
 
+def _skill_view_hint(path: str | Path) -> str:
+    """Return an exact safe-tool hint for a model-authored skill path.
+
+    Request-scoped OpenWebUI file grants deliberately do not authorize the
+    agent's HOME or skill tree. Models nevertheless sometimes copy an on-disk
+    path from skill content and retry it with ``read_file``/``search_files``.
+    Point them at the already-authorized skill API without weakening the file
+    grant or skill ACL boundary.
+    """
+    normalized = str(path).replace("\\", "/").rstrip("/")
+    while "/./" in normalized:
+        normalized = normalized.replace("/./", "/")
+    if "/user-skills/" in normalized:
+        relative = normalized.split("/user-skills/", 1)[1].strip("/")
+        # OpenWebUI stores private skills as user-skills/<user-id>/<skill>/.
+        # The authenticated user scope is already bound outside this helper;
+        # skill_view expects only the skill-relative part.
+        user_parts = relative.split("/", 1)
+        if len(user_parts) != 2:
+            return ""
+        relative = user_parts[1]
+    elif "/skills/" in normalized:
+        relative = normalized.split("/skills/", 1)[1].strip("/")
+    else:
+        return ""
+    if not relative:
+        return ""
+    parts = [part for part in relative.split("/") if part]
+    if not parts:
+        return ""
+
+    file_path = ""
+    if parts[-1] == "SKILL.md":
+        skill_parts = parts[:-1]
+    else:
+        support_index = next(
+            (index for index, part in enumerate(parts) if part in _SKILL_SUPPORT_DIRS),
+            None,
+        )
+        if support_index is None or support_index == 0:
+            return ""
+        skill_parts = parts[:support_index]
+        file_path = "/".join(parts[support_index:])
+    if not skill_parts:
+        return ""
+
+    skill_name = "/".join(skill_parts)
+    if file_path and parts[-1] not in _SKILL_SUPPORT_DIRS:
+        call = f"skill_view(name={skill_name!r}, file_path={file_path!r})"
+    else:
+        call = f"skill_view(name={skill_name!r})"
+    return (
+        f" This is a skill path: do not retry read_file/search_files. Use {call}; "
+        "skill_view enforces the skill ACL and lists linked files."
+    )
+
+
 def resolve_file_grant(
     path: str | Path,
     *,
@@ -196,7 +254,9 @@ def resolve_file_grant(
     return None, (
         f"Local file access not granted for {operation}: {path!s}. "
         "Use a handle or an exact path supplied in this request's validated "
-        "attached files." + _known_handles_hint(task_key)
+        "attached files."
+        + _skill_view_hint(path)
+        + _known_handles_hint(task_key)
     )
 
 

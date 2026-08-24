@@ -107,6 +107,13 @@ class TestValidateCategory:
 
 
 class TestValidateFrontmatter:
+    def test_schema_matches_create_description_limit(self):
+        from tools import skill_manager_tool
+
+        description = skill_manager_tool.SKILL_MANAGE_SCHEMA["description"]
+        assert f"at most {SKILL_PROMPT_DESC_LIMIT}" in description
+        assert "long descriptions are truncated" not in description
+
     def test_no_frontmatter(self):
         err = _validate_frontmatter("# Just a heading\nSome content.\n")
         assert err == "SKILL.md must start with YAML frontmatter (---). See existing skills for format."

@@ -72,6 +72,41 @@ def test_shared_workspace_search_is_denied_before_search_io(tmp_path):
     assert "not granted" in result["error"].lower()
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (
+            "/home/hermes/skills/legal/tw-tmc/SKILL.md",
+            "skill_view(name='legal/tw-tmc')",
+        ),
+        (
+            "~/skills/tw-tmc/references/class-35.md",
+            "skill_view(name='tw-tmc', file_path='references/class-35.md')",
+        ),
+        (
+            "/home/hermes/user-skills/user-123/tw-item-pick/SKILL.md",
+            "skill_view(name='tw-item-pick')",
+        ),
+        (
+            "/home/hermes/./skills/tw-tmc/references/class-14.md",
+            "skill_view(name='tw-tmc', file_path='references/class-14.md')",
+        ),
+    ],
+)
+def test_ungranted_skill_path_points_to_skill_view_without_relaxing_acl(
+    tmp_path, path, expected
+):
+    allowed = tmp_path / "attached.txt"
+
+    with _file_grant_scope("task-1", [str(allowed)]):
+        result = json.loads(read_file_tool(path, task_id="task-1"))
+
+    assert result["success"] is False
+    assert "not granted" in result["error"].lower()
+    assert "do not retry read_file/search_files" in result["error"]
+    assert expected in result["error"]
+
+
 def test_grants_do_not_leak_to_another_task(tmp_path):
     allowed = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-1" / "allowed.txt"
 

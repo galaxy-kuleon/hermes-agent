@@ -13,6 +13,7 @@ from __future__ import annotations
 import binascii
 import hashlib
 import json
+import logging
 import os
 import re
 import struct
@@ -39,7 +40,14 @@ HKLM_NAMESPACE = "http://www.xml.gov.hk/schemas/hklm/1.0"
 DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
 _CHAPTER_RE = re.compile(r"^[0-9]{1,4}[A-Z]{0,3}$")
 _PROVISION_RE = re.compile(r"^(?:s|r)?([0-9]{1,4}[A-Z]?)$", re.IGNORECASE)
+_LABELED_PROVISION_RE = re.compile(
+    r"^(?:(?:sch(?:edule)?\.?\s*\d+[A-Z]?\s*[,;:\-]?\s*)?)"
+    r"(?:section|sec(?:tion)?|s|rule|r)\.?\s*"
+    r"([0-9]{1,4}[A-Z]?)(?:\s*\([0-9A-Za-z]+\))*\s*$",
+    re.IGNORECASE,
+)
 _SPACE_RE = re.compile(r"\s+")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -311,6 +319,18 @@ def _normalised_itertext(node: ET.Element) -> str:
     return _SPACE_RE.sub(" ", " ".join(node.itertext())).strip()
 
 
+def _normalise_provision_request(value: object) -> tuple[str, str]:
+    """Accept common legal labels while retaining the model's raw input."""
+    raw = str(value).strip()
+    match = _PROVISION_RE.fullmatch(raw) or _LABELED_PROVISION_RE.fullmatch(raw)
+    if not match:
+        raise ValueError(
+            f"invalid provision {value!r}; request a whole section/rule such as "
+            "53, section 53(5)(b), rule 13, or Sch. 1 rule 13"
+        )
+    return match.group(1).upper(), raw
+
+
 def extract_provisions(xml_content: bytes, provisions: Iterable[str]) -> list[dict]:
     """Return requested section/rule bodies with wording preserved, whitespace normalized."""
     root = ET.fromstring(xml_content)
@@ -332,22 +352,23 @@ def extract_provisions(xml_content: bytes, provisions: Iterable[str]) -> list[di
             section_nodes[name] = node
     rows = []
     for requested in provisions:
-        match = _PROVISION_RE.fullmatch(str(requested).strip())
-        if not match:
-            raise ValueError(f"invalid provision {requested!r}; request a section/rule number such as 53 or 13")
-        number = match.group(1).upper()
+        number, raw = _normalise_provision_request(requested)
         node = section_nodes.get(f"s{number}".lower())
         if node is None:
-            rows.append({"provision": number, "found": False})
+            row = {"provision": number, "found": False}
+            if raw.upper() != number:
+                row["normalized_from"] = raw
+            rows.append(row)
             continue
-        rows.append(
-            {
-                "provision": number,
-                "found": True,
-                "text": _normalised_itertext(node),
-                "format_note": "official wording with XML whitespace normalized",
-            }
-        )
+        row = {
+            "provision": number,
+            "found": True,
+            "text": _normalised_itertext(node),
+            "format_note": "official wording with XML whitespace normalized",
+        }
+        if raw.upper() != number:
+            row["normalized_from"] = raw
+        rows.append(row)
     return rows
 
 
@@ -360,6 +381,20 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
                 "cannot_confirm": True,
                 "error": f"provisions must contain 1-{MAX_PROVISIONS} section/rule numbers",
             }
+        )
+    try:
+        for provision in provisions:
+            _normalise_provision_request(provision)
+    except ValueError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "cannot_confirm": True,
+                "chapter": wanted_chapter,
+                "error": str(exc),
+                "instruction": "Correct the provision label and retry before concluding.",
+            },
+            ensure_ascii=False,
         )
     client = opener or _no_proxy_opener()
     freshness = "current_catalog"
@@ -391,6 +426,13 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
     rows = extract_provisions(content, provisions)
     missing = [row["provision"] for row in rows if not row["found"]]
     version_day = version.version_date.split("T", 1)[0]
+    logger.info(
+        "hk_legal_authority_cache chapter=%s freshness=%s path=%s xml_sha256=%s",
+        version.chapter,
+        freshness,
+        cache_path,
+        xml_sha,
+    )
     required_citation = (
         f"Hong Kong e-Legislation, Cap. {version.chapter}, current version "
         f"{version_day}: {version.web_url}"
@@ -419,7 +461,6 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
                 "catalogue archive SHA-256 reported but full archive not downloaded"
             ),
             "xml_sha256": xml_sha,
-            "retained_cache_path": str(cache_path),
             "requested_provisions": rows,
             "missing_provisions": missing,
             "instruction": (
@@ -438,7 +479,9 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
         "HKeL XML, with version, official URL, and source digest. Use this before every "
         "Hong Kong statutory legal conclusion; memory, OpenViking, search snippets, and "
         "prose overviews are not authority. Request whole section/rule numbers, e.g. "
-        "chapter='559', provisions=['52','53'] or chapter='559A', provisions=['13']."
+        "chapter='559', provisions=['52','53'] or chapter='559A', provisions=['13']. "
+        "Common labels such as 'section 53(5)(b)' and 'Sch. 1 rule 13' are "
+        "normalized to the whole provision and preserved in the result trace."
     ),
     "parameters": {
         "type": "object",
@@ -452,7 +495,7 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
                 "items": {"type": "string"},
                 "minItems": 1,
                 "maxItems": MAX_PROVISIONS,
-                "description": "Whole section/rule numbers, without invented subsection text.",
+                "description": "Whole section/rule numbers or common labels such as 'section 53(5)(b)' and 'Sch. 1 rule 13'. The tool reads the whole provision.",
             },
         },
         "required": ["chapter", "provisions"],

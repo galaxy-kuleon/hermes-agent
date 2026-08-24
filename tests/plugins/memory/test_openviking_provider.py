@@ -708,6 +708,38 @@ def test_tool_search_sorts_by_raw_score_across_buckets():
     assert result["total"] == 3
 
 
+def test_tool_search_bounds_deep_abstracts_and_routes_detail_to_read():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {
+        "result": {
+            "resources": [
+                {
+                    "uri": f"viking://resources/{index}",
+                    "score": 1 - (index / 100),
+                    "abstract": str(index) * 5000,
+                }
+                for index in range(12)
+            ],
+            "total": 12,
+        }
+    }
+
+    result = json.loads(provider._tool_search({"query": "law", "mode": "deep"}))
+
+    assert result["returned"] == openviking_module._SEARCH_DEFAULT_LIMIT
+    assert len(result["results"]) == openviking_module._SEARCH_DEFAULT_LIMIT
+    assert sum(len(row["abstract"]) for row in result["results"]) <= (
+        openviking_module._SEARCH_ABSTRACT_TOTAL_CHARS
+    )
+    assert result["truncated_abstracts"] > 0
+    assert "viking_read" in result["guidance"]
+    provider._client.post.assert_called_once_with(
+        "/api/v1/search/search",
+        {"query": "law", "limit": openviking_module._SEARCH_DEFAULT_LIMIT},
+    )
+
+
 def test_tool_add_resource_rejects_hermes_credential_file_upload(tmp_path, monkeypatch):
     import agent.file_safety as fs
 
@@ -762,6 +794,59 @@ def test_tool_add_resource_temp_uploads_request_scoped_attachment_handle(tmp_pat
             "source_name": "law.pdf",
             "temp_file_id": "temp-123",
         },
+    )
+
+
+def test_tool_add_resource_refuses_unsolicited_ingestion_during_research():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "viking_add_resource",
+            {"url": "https://www.elegislation.gov.hk/example"},
+            messages=[
+                {"role": "user", "content": "Can I file this request late?"}
+            ],
+        )
+    )
+
+    assert "error" in result
+    assert "explicit request" in result["error"]
+    assert "do not retry" in result["error"]
+    provider._client.post.assert_not_called()
+
+
+def test_tool_add_resource_allows_explicit_latest_user_ingestion_request():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {
+        "result": {"root_uri": "viking://resources/example"}
+    }
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "viking_add_resource",
+            {"url": "https://example.com/law.pdf"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": "請把這個 URL 加入 OpenViking 知識庫並索引。",
+                }
+            ],
+        )
+    )
+
+    assert result["status"] == "added"
+    provider._client.post.assert_called_once()
+
+
+def test_add_resource_schema_forbids_using_ingestion_as_web_fetch():
+    assert "ONLY when the latest user message explicitly asks" in (
+        openviking_module.ADD_RESOURCE_SCHEMA["description"]
+    )
+    assert "Never call this during ordinary research" in (
+        openviking_module.ADD_RESOURCE_SCHEMA["description"]
     )
 
 

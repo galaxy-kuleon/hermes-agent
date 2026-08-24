@@ -17,6 +17,12 @@ from tools.file_tools import (
 
 
 class TestReadFileHandler:
+    def test_schema_routes_skill_paths_to_skill_view(self):
+        from tools.file_tools import READ_FILE_SCHEMA, SEARCH_FILES_SCHEMA
+
+        assert "NEVER use read_file for SKILL.md" in READ_FILE_SCHEMA["description"]
+        assert "NEVER search a skills directory" in SEARCH_FILES_SCHEMA["description"]
+
     @patch("tools.file_tools._get_file_ops")
     def test_returns_file_content(self, mock_get):
         mock_ops = MagicMock()

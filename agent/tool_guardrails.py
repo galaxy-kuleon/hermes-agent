@@ -35,6 +35,7 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "skill_view",
         "viking_search",
         "viking_browse",
+        "hk_legal_authority",
         "mcp_soc_v2_list_conversions",
         "mcp_soc_v2_conversion_status",
         "web_search",

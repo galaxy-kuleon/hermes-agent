@@ -44,6 +44,15 @@ description: Description for {name}.
     return skill_dir
 
 
+def test_skill_view_schema_is_the_only_skill_file_reader():
+    assert "only tool for reading SKILL.md" in skills_tool_module.SKILL_VIEW_SCHEMA[
+        "description"
+    ]
+    assert "never guess an unlisted path" in skills_tool_module.SKILL_VIEW_SCHEMA[
+        "description"
+    ]
+
+
 def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Path:
     """Create a category symlink under skills_dir pointing outside the tree."""
     external_category = linked_root / category

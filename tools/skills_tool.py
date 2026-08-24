@@ -2082,7 +2082,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "The only tool for reading SKILL.md or anything under a skills directory; never use read_file/search_files for skill paths. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus an exact 'linked_files' inventory. To access one, call again with that exact file_path; never guess an unlisted path.",
     "parameters": {
         "type": "object",
         "properties": {

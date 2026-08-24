@@ -341,6 +341,28 @@ def test_attachments_is_registered_as_idempotent():
     assert "attachments" in IDEMPOTENT_TOOL_NAMES
 
 
+def test_hk_legal_authority_is_registered_as_idempotent():
+    """Repeated official-text reads must not reinsert the same XML forever."""
+    assert "hk_legal_authority" in IDEMPOTENT_TOOL_NAMES
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    args = {"chapter": "559A", "provisions": ["13"]}
+    same_result = '{"success":true,"requested_provisions":[{"provision":"13"}]}'
+    actions = []
+    for _ in range(12):
+        before = controller.before_call("hk_legal_authority", args)
+        actions.append(before.action)
+        if before.action == "block":
+            break
+        controller.after_call(
+            "hk_legal_authority", args, same_result, failed=False
+        )
+
+    assert "block" in actions
+
+
 def test_block_message_tells_the_model_to_answer_not_to_report():
     """A control that halts a loop must not become the answer.
 

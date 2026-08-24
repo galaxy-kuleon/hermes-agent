@@ -3875,7 +3875,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue until coverage is complete before concluding. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted. PDFs always use the stack's Docling text/OCR adapter; converter-produced inline base64 images are permanently removed before model context. Legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB use the optional AnyDoc converter. NOTE: Cannot read standalone images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. NEVER use read_file for SKILL.md or any path under a skills directory; load skill content and linked files with skill_view(name, file_path). Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue until coverage is complete before concluding. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted. PDFs always use the stack's Docling text/OCR adapter; converter-produced inline base64 images are permanently removed before model context. Legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB use the optional AnyDoc converter. NOTE: Cannot read standalone images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -3958,7 +3958,7 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. NEVER search a skills directory; use skills_list for discovery, then skill_view(name) for SKILL.md and its exact linked_files inventory. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
     "parameters": {
         "type": "object",
         "properties": {
