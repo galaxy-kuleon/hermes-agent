@@ -156,16 +156,13 @@ _WILL_EXECUTION_RE = re.compile(
     r"簽署|签署|見證|见证)",
     re.IGNORECASE,
 )
-_WILL_EFFECT_RE = re.compile(
-    r"(?:\brevoke(?:d|s)?\b|\brevocation\b|\blapse[ds]?\b|\bomitt?ed\b|"
-    r"\bdisposition\b|\bappointment\b|\bdevise\b|\bbequest\b|"
-    r"撤銷|撤销|失效|略去|處置|处置|委任|遺贈|遗赠)",
-    re.IGNORECASE,
-)
-_PREDECEASED_RE = re.compile(
-    r"(?:\bpredeceas(?:e|ed)\b|\btreated\s+as\s+(?:having\s+)?died\b|"
-    r"視為先於.{0,20}去世|视为先于.{0,20}去世|視為已死亡|视为已死亡)",
-    re.IGNORECASE,
+_FORMER_SPOUSE_PREDECEASED_RE = re.compile(
+    r"(?:\bformer\s+spouse\b.{0,180}(?:\bpredeceas(?:e|ed)\b|"
+    r"\btreated\s+as\s+(?:having\s+)?died\b)|"
+    r"(?:\bpredeceas(?:e|ed)\b|\btreated\s+as\s+(?:having\s+)?died\b)"
+    r".{0,180}\bformer\s+spouse\b|前配偶.{0,100}(?:視為先死|视为先死|"
+    r"視為已死亡|视为已死亡))",
+    re.IGNORECASE | re.DOTALL,
 )
 _APPOINTMENT_OMITTED_RE = re.compile(
     r"(?:\bappointment\b.{0,180}\bformer\s+spouse\b.{0,180}\bomitt?ed\b|"
@@ -189,6 +186,25 @@ _STATUTORY_EXCEPTION_RE = re.compile(
     r"\bunless\b.{0,160}\b(?:marriage|will)\b|法定例外|除外情況|例外情形)",
     re.IGNORECASE | re.DOTALL,
 )
+_DIVORCE_EFFECT_CLAIM_RE = re.compile(
+    r"(?:(?:\bsection\s*15\b|\bs\.?\s*15\b).{0,240}"
+    r"(?:\bdivorc(?:e|ed)\b|\bdissolution\b|\bannul(?:ment|led)\b|"
+    r"\bformer\s+spouse\b)|"
+    r"(?:\bdivorc(?:e|ed)\b|\bdissolution\b|\bannul(?:ment|led)\b)"
+    r".{0,240}(?:\brevoke|\blapse|\bomitt?ed\b|\btake\s+effect\b|"
+    r"\bsection\s*15\b|\bs\.?\s*15\b)|"
+    r"離婚.{0,160}(?:第\s*15\s*條|撤銷|撤销|失效|略去))",
+    re.IGNORECASE | re.DOTALL,
+)
+_MARRIAGE_EFFECT_CLAIM_RE = re.compile(
+    r"(?:(?:\bsection\s*14\b|\bs\.?\s*14\b).{0,240}"
+    r"\b(?:re)?marri(?:age|ed|es|y)\b|"
+    r"\b(?:re)?marri(?:age|ed|es|y)\b.{0,240}"
+    r"(?:\brevoke|\bsection\s*14\b|\bs\.?\s*14\b)|"
+    r"(?:結婚|结婚|再婚).{0,160}(?:第\s*14\s*條|撤銷|撤销))",
+    re.IGNORECASE | re.DOTALL,
+)
+_SECTION_4_RE = re.compile(r"(?:(?:section|s\.?)\s*4\b|第\s*4\s*條)", re.IGNORECASE)
 _SECTION_5_RE = re.compile(r"(?:(?:section|s\.?)\s*5\b|第\s*5\s*條)", re.IGNORECASE)
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
@@ -198,6 +214,7 @@ _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IG
 class GateDecision:
     action: str
     message: str = ""
+    diagnostics: tuple[str, ...] = ()
 
 
 def _message_text(message: Any) -> str:
@@ -604,20 +621,23 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         return []
 
     errors: list[str] = []
-    if _WILL_EXECUTION_RE.search(answer) and not _near(
-        answer, _WILL_EXECUTION_RE, _SECTION_5_RE, distance=420
-    ):
+    if _WILL_EXECUTION_RE.search(answer) and not _SECTION_5_RE.search(answer):
         errors.append(
             "signing and witnessing requirements must be tied to Cap. 30 section 5"
         )
-    discusses_divorce_effect = _near(answer, _DIVORCE_RE, _WILL_EFFECT_RE, distance=420)
+    if _near(answer, _WILL_EXECUTION_RE, _SECTION_4_RE, distance=240):
+        errors.append(
+            "Cap. 30 section 4 must not be used for signing or witnessing requirements"
+        )
+
+    discusses_divorce_effect = bool(_DIVORCE_EFFECT_CLAIM_RE.search(answer))
     if discusses_divorce_effect:
-        if not _near(answer, _DIVORCE_RE, _SECTION_15_RE, distance=420):
+        if not _SECTION_15_RE.search(answer):
             errors.append(
                 "the effect of divorce, dissolution, or annulment on a will must be "
                 "tied to Cap. 30 section 15"
             )
-        if _near(answer, _DIVORCE_RE, _PREDECEASED_RE, distance=520):
+        if _FORMER_SPOUSE_PREDECEASED_RE.search(answer):
             errors.append(
                 "Cap. 30 section 15 does not deem the former spouse to have "
                 "predeceased the testator"
@@ -633,11 +653,9 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
                 "to that spouse lapses except where the will shows a contrary intention"
             )
 
-    discusses_marriage_effect = _near(
-        answer, _MARRIAGE_RE, _WILL_EFFECT_RE, distance=420
-    )
+    discusses_marriage_effect = bool(_MARRIAGE_EFFECT_CLAIM_RE.search(answer))
     if discusses_marriage_effect:
-        if not _near(answer, _MARRIAGE_RE, _SECTION_14_RE, distance=420):
+        if not _SECTION_14_RE.search(answer):
             errors.append(
                 "the effect of marriage or remarriage on a will must be tied to "
                 "Cap. 30 section 14"
@@ -787,11 +805,13 @@ def evaluate_hk_legal_answer(
                 "the official URL and version citation.\nDetected defects:\n- "
                 + "\n- ".join(wills_errors)
                 + "]",
+                tuple(wills_errors),
             )
         return GateDecision(
             "fail",
             "無法提供可依賴的香港遺囑結論：最終答案仍混淆《遺囑條例》的簽署、婚姻或"
             "離婚條文。為免誤導，本次不交付含錯誤法條的答案或文件。",
+            tuple(wills_errors),
         )
 
     if _requires_rule_13_practice(messages[current_turn_user_idx]):
