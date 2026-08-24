@@ -2313,6 +2313,57 @@ class TestConcurrentToolExecution:
         assert outcome.blocked is False
 
 
+def test_hk_authority_semantic_duplicate_reuses_prior_result_without_halt(
+    agent, monkeypatch
+):
+    from agent import tool_executor
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.after_call(
+        "hk_legal_authority",
+        {"chapter": "559A", "provisions": ["13", "14"]},
+        json.dumps(
+            {
+                "success": True,
+                "chapter": "559A",
+                "requested_provisions": [
+                    {"provision": "13", "found": True},
+                    {"provision": "14", "found": True},
+                ],
+            }
+        ),
+        failed=False,
+    )
+    agent._tool_guardrails = controller
+    monkeypatch.setattr(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    outcome = tool_executor._run_agent_tool_execution_middleware(
+        agent,
+        function_name="hk_legal_authority",
+        function_args={"chapter": "559a", "provisions": ["Sch. 1 rule 13"]},
+        effective_task_id="task-1",
+        tool_call_id="authority-duplicate",
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("semantic duplicate must not dispatch")
+        ),
+    )
+    payload = json.loads(outcome.result)
+
+    assert outcome.blocked is False
+    assert payload["success"] is True
+    assert payload["already_available"] is True
+    assert controller.halt_decision is None
+
+
 class TestAgentRuntimePostHookOwnershipSync:
     """Exercise post-hook ownership through both agent-runtime tool paths."""
 

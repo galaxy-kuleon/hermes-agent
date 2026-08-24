@@ -393,7 +393,7 @@ def test_hk_authority_semantic_subset_is_blocked_after_successful_read():
         "hk_legal_authority", {"chapter": "559A", "provisions": ["96"]}
     )
 
-    assert duplicate.action == "block"
+    assert duplicate.action == "reuse"
     assert duplicate.code == "hk_authority_already_read"
     assert "answer the user now" in duplicate.message
     assert new_provision.action == "allow"
@@ -412,7 +412,7 @@ def test_hk_authority_coverage_resets_for_the_next_user_turn():
         }
     )
     controller.after_call("hk_legal_authority", args, result, failed=False)
-    assert controller.before_call("hk_legal_authority", args).action == "block"
+    assert controller.before_call("hk_legal_authority", args).action == "reuse"
 
     controller.reset_for_turn()
 

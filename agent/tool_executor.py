@@ -638,6 +638,33 @@ def _run_agent_tool_execution_middleware(
 
         if block_message is not None or guardrail_decision is not None:
             _advance_start_order()
+            if (
+                block_message is None
+                and getattr(guardrail_decision, "action", "") == "reuse"
+            ):
+                state["blocked"] = False
+                result = json.dumps(
+                    {
+                        "success": True,
+                        "already_available": True,
+                        "tool": function_name,
+                        "chapter": final_args.get("chapter"),
+                        "requested_provisions": final_args.get("provisions") or [],
+                        "instruction": guardrail_decision.message,
+                    },
+                    ensure_ascii=False,
+                )
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=final_args,
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id,
+                    status="success",
+                    middleware_trace=list(state["middleware_trace"]),
+                )
+                return result
             state["blocked"] = True
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)

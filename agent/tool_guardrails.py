@@ -265,7 +265,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | reuse | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -409,7 +409,7 @@ class ToolCallGuardrailController:
             covered = self._hk_legal_coverage.get(chapter) or set()
             if requested and requested.issubset(covered):
                 return ToolGuardrailDecision(
-                    action="block",
+                    action="reuse",
                     code="hk_authority_already_read",
                     message=(
                         "These official provisions were already read successfully in this "
