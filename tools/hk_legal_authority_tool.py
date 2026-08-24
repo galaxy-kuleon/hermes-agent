@@ -605,6 +605,11 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
             "freshness": freshness,
             "source": "Hong Kong e-Legislation open data, Department of Justice",
             "dataset_url": DATASET_URL,
+            # Put official practice guidance before long provision bodies. Some
+            # local-model transports expose only a leading tool-result slice;
+            # provenance and the matched manual pages must remain visible even
+            # when several full statutory provisions follow.
+            "official_practice_guidance": practice_guidance,
             "chapter": version.chapter,
             "title": version.title,
             "version_date": version.version_date,
@@ -624,7 +629,6 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
             "xml_sha256": xml_sha,
             "requested_provisions": rows,
             "missing_provisions": missing,
-            "official_practice_guidance": practice_guidance,
             "instruction": (
                 "Cite required_answer_citation. OpenViking/search summaries are leads only. "
                 "If cannot_confirm is true, do not state a confident statutory conclusion. "

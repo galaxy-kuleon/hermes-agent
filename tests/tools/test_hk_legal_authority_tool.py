@@ -240,16 +240,18 @@ def test_cap_559a_rule_13_automatically_includes_ipd_manual(monkeypatch, tmp_pat
         lambda _opener: expected_manual,
     )
 
-    result = json.loads(
-        hk_legal_authority(
-            "559A",
-            ["rule 13(1)"],
-            opener=Rule13Opener(make_archive(member, xml)),
-        )
+    raw_result = hk_legal_authority(
+        "559A",
+        ["rule 13(1)"],
+        opener=Rule13Opener(make_archive(member, xml)),
     )
+    result = json.loads(raw_result)
 
     assert result["success"] is True
     assert result["official_practice_guidance"] == [expected_manual]
+    assert raw_result.index('"official_practice_guidance"') < raw_result.index(
+        '"requested_provisions"'
+    )
 
 
 def test_full_tool_retains_versioned_xml_and_reports_authority(
