@@ -3810,12 +3810,40 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     if target == "content":
+        # ``search_files`` commonly supplies a directory in ``path`` and one
+        # literal filename in ``file_glob``.  Route that exact joined file,
+        # not the directory: the skill-path resolver intentionally maps a
+        # directory back to the skill root, which would otherwise return the
+        # unrelated SKILL.md and invite the model to retry different grep
+        # patterns forever.
+        routed_path = path
+        if (
+            file_glob
+            and not any(char in file_glob for char in "*?[")
+            and "/" not in file_glob
+            and "\\" not in file_glob
+        ):
+            routed_path = str(path).rstrip("/\\") + "/" + file_glob
         routed = _route_exact_skill_file(
-            path,
+            routed_path,
             task_id=task_id,
             source_tool="search_files",
             requested_pattern=pattern,
         )
+        if routed is not None:
+            try:
+                routed_payload = json.loads(routed)
+            except (TypeError, ValueError):
+                routed_payload = None
+            routed_file = (
+                routed_payload.get("routing", {}).get("file_path")
+                if isinstance(routed_payload, dict)
+                else None
+            )
+            # A search path without a concrete linked file is a directory,
+            # not an exact source file.  Do not silently substitute SKILL.md.
+            if routed_file is None and PurePosixPath(str(routed_path)).name != "SKILL.md":
+                routed = None
         if routed is not None:
             return routed
 

@@ -157,6 +157,62 @@ def test_exact_skill_search_routes_to_full_skill_view_content(tmp_path):
     )
 
 
+def test_skill_directory_search_joins_literal_file_glob(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    directory = "/home/hermes/skills/legal/tw-tmc/references"
+
+    with _file_grant_scope("task-1", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=json.dumps(
+            {"success": True, "name": "tw-tmc", "content": "351914 jewelry retail"}
+        ),
+    ) as routed, patch(
+        "tools.file_tools._get_file_ops",
+        side_effect=AssertionError("literal skill file glob must not reach file I/O"),
+    ):
+        result = json.loads(
+            search_tool(
+                "351914",
+                path=directory,
+                file_glob="class-35.md",
+                task_id="task-1",
+            )
+        )
+
+    assert result["content"] == "351914 jewelry retail"
+    assert result["routing"]["requested_path"].endswith(
+        "/references/class-35.md"
+    )
+    assert result["routing"]["file_path"] == "references/class-35.md"
+    routed.assert_called_once_with(
+        {"name": "legal/tw-tmc", "file_path": "references/class-35.md"},
+        task_id="task-1",
+        force_content=True,
+    )
+
+
+def test_skill_directory_search_never_substitutes_skill_main_file(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    directory = "/home/hermes/skills/legal/tw-tmc/references"
+
+    with _file_grant_scope("task-1", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=json.dumps(
+            {"success": True, "name": "tw-tmc", "content": "wrong SKILL.md"}
+        ),
+    ), patch(
+        "tools.file_grants.file_grant_error",
+        return_value="skill directory searches require one literal file_glob",
+    ):
+        result = json.loads(
+            search_tool("351914", path=directory, task_id="task-1")
+        )
+
+    assert result["success"] is False
+    assert "literal file_glob" in result["error"]
+    assert "wrong SKILL.md" not in json.dumps(result)
+
+
 def test_exact_skill_route_bypasses_unchanged_dedup(monkeypatch, tmp_path):
     """An explicit re-read is a recovery request and must return full bytes."""
     from tools import skills_tool
