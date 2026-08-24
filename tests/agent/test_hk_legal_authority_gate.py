@@ -463,6 +463,30 @@ def test_will_rejects_predeceased_fiction_and_blanket_marriage_revocation():
     assert "devise or bequest" in decision.message
     assert "statutory exceptions" in decision.message
     assert "regenerate the artifact" in decision.message
+    assert "does not deem the former spouse" in decision.diagnostics[0]
+
+
+def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "I declare that I am divorced and make no appointment or gift to my "
+        "former spouse. If my executor predeceases me, I appoint an alternate. "
+        "Signing and witnessing follow Cap. 30 section 5. Current version "
+        "2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "pass"
 
 
 def test_will_accepts_correct_execution_divorce_and_remarriage_sections():

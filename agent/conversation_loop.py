@@ -8234,6 +8234,19 @@ def run_conversation(
                         hk_legal_authority_nudges,
                         getattr(agent, "session_id", None) or "none",
                     )
+                    logger.warning(
+                        "HK_LEGAL_GATE_EVIDENCE %s",
+                        json.dumps(
+                            {
+                                "action": "nudge",
+                                "attempt": hk_legal_authority_nudges,
+                                "session_id": getattr(agent, "session_id", None),
+                                "diagnostics": list(_hk_legal_decision.diagnostics),
+                                "candidate": final_response or "",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
                     agent._emit_status(
                         "↻ 香港法律答案未通過官方法源閘門 — 正在查核現行法例"
                     )
@@ -8246,6 +8259,19 @@ def run_conversation(
                         "(session=%s)",
                         hk_legal_authority_nudges,
                         getattr(agent, "session_id", None) or "none",
+                    )
+                    logger.error(
+                        "HK_LEGAL_GATE_EVIDENCE %s",
+                        json.dumps(
+                            {
+                                "action": "fail",
+                                "attempt": hk_legal_authority_nudges,
+                                "session_id": getattr(agent, "session_id", None),
+                                "diagnostics": list(_hk_legal_decision.diagnostics),
+                                "candidate": final_response or "",
+                            },
+                            ensure_ascii=False,
+                        ),
                     )
                     final_response = _hk_legal_decision.message
                     final_msg["content"] = final_response
