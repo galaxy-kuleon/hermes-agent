@@ -74,9 +74,10 @@ _THREE_MONTH_RE = re.compile(
 _RULE_13_2_RE = re.compile(r"(?:rule\s*)?13\s*\(\s*2\s*\)", re.IGNORECASE)
 _RULE_13_3_RE = re.compile(r"(?:rule\s*)?13\s*\(\s*3\s*\)", re.IGNORECASE)
 _SKILL_EDIT_RE = re.compile(
-    r"(?:add|update|change|modify|edit|write|patch).{0,100}(?:skill|rules?)|"
-    r"(?:skill|rules?).{0,100}(?:add|update|change|modify|edit|write|patch)|"
-    r"(?:新增|更新|修改|編輯|编辑).{0,100}(?:技能|規則|规则)",
+    r"(?:add|update|change|modify|edit|write|patch).{0,100}\bskill\b|"
+    r"\bskill\b.{0,100}(?:add|update|change|modify|edit|write|patch)|"
+    r"(?:新增|更新|修改|編輯|编辑).{0,100}技能|"
+    r"技能.{0,100}(?:新增|更新|修改|編輯|编辑)",
     re.IGNORECASE | re.DOTALL,
 )
 

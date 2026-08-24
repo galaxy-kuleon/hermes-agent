@@ -20,6 +20,11 @@ EXACT_REPORTED_PROMPT = (
     "Hong Kong, and get registered on 2 July 2026.  Now is 23 August 2026, "
     "what can I do?"
 )
+EXACT_RULE_13_PROMPT = (
+    "apply hong kong trade mark enquiry: If I received a Rule 13(1) Opinion on "
+    "2 January 2026, and I forgot to reply the same until 5 July 2026, can I "
+    "write a letter to seek an extension of time on 5 July 2026?"
+)
 
 
 def _authority_message():
@@ -156,6 +161,11 @@ def test_same_matter_skill_edit_is_not_misclassified_as_legal_answer():
         },
     ]
     assert not is_hk_statutory_turn(messages, 2)
+
+
+def test_rule_13_write_a_letter_prompt_is_not_misclassified_as_skill_edit():
+    messages = [{"role": "user", "content": EXACT_RULE_13_PROMPT}]
+    assert is_hk_statutory_turn(messages, 0)
 
 
 def test_verified_manual_cannot_be_described_as_unread_or_truncated():
