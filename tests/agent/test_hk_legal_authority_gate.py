@@ -118,6 +118,7 @@ def _registered_famous_mark_answer():
         "Section 52 is revocation, including continuous non-use in Hong Kong for at "
         "least 3 years. The section 12(4) well-known-mark and section 53(5)(b) earlier-"
         "right route requires establishing protection as a well-known mark in Hong "
+        "Kong. Fame in Korea alone is not enough to prove well-known status in Hong "
         "Kong. Section 12(6) governs opposition but does not bar the separate section "
         "53(5)(b) invalidity route. Current version 2025-02-14: "
         "https://www.elegislation.gov.hk/hk/cap559!en"
@@ -389,6 +390,40 @@ def test_registered_famous_mark_answer_rejects_wrong_remedy_section_titles():
         ).action
         == "pass"
     )
+
+
+def test_registered_mark_answer_rejects_open_opposition_after_registration():
+    authority = _authority_message()
+    wrong = _registered_famous_mark_answer().replace(
+        "Section 44 governs opposition while the application is pending;",
+        "Check whether the opposition window is still open. If it is open, file "
+        "a notice of opposition under section 44;",
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=wrong,
+        attempts=0,
+    )
+    assert decision.action == "nudge"
+    assert "opposition is no longer a current remedy" in decision.message
+
+
+def test_registered_mark_answer_rejects_korea_only_fame_as_strong_hk_ground():
+    authority = _authority_message()
+    wrong = _registered_famous_mark_answer().replace(
+        "Fame in Korea alone is not enough to prove well-known status in Hong Kong.",
+        "Paris Convention well-known status is the strong case because it is famous "
+        "in Korea.",
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=wrong,
+        attempts=0,
+    )
+    assert decision.action == "nudge"
+    assert "Korean fame alone is not enough" in decision.message
 
 
 def test_verified_and_cited_answer_passes():

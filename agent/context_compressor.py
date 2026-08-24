@@ -1711,6 +1711,53 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             url_desc += f" (+{len(urls) - 1} more)"
         return f"[web_extract] {url_desc} ({content_len:,} chars)"
 
+    if tool_name == "hk_legal_authority":
+        # A generic ``[tool] (N chars result)`` tombstone makes the model
+        # forget which provisions it already verified and repeatedly call the
+        # official source again. Preserve a bounded, evidence-bearing view of
+        # the result instead. The full raw result remains in the append-only
+        # message archive; this is only the active-context projection.
+        try:
+            evidence = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            evidence = {}
+        if isinstance(evidence, dict):
+            citation = str(
+                evidence.get("required_answer_citation")
+                or (evidence.get("answer_evidence") or {}).get(
+                    "statutory_citation", ""
+                )
+            ).strip()
+            status = (
+                "verified"
+                if evidence.get("success") is True
+                and evidence.get("cannot_confirm") is False
+                else "cannot-confirm"
+            )
+            lines = [
+                f"[hk_legal_authority evidence; raw result {content_len:,} chars archived]",
+                f"status={status}; {citation or 'official citation unavailable'}",
+            ]
+            for row in evidence.get("requested_provisions") or []:
+                if not isinstance(row, dict):
+                    continue
+                provision = str(row.get("provision") or "?").strip()
+                if row.get("found") is not True:
+                    lines.append(f"- {provision}: not found")
+                    continue
+                text = " ".join(str(row.get("text") or "").split())
+                # Keep enough official wording to carry subsection-level
+                # meaning (rather than only a section title), while bounding a
+                # broad accidental request. Stable slices make the source
+                # exactly re-requestable by chapter + provision.
+                if len(text) > 1800:
+                    text = text[:1800].rstrip() + " … [verified text continues]"
+                lines.append(f"- {provision}: {text}")
+            missing = evidence.get("missing_provisions") or []
+            if missing:
+                lines.append("missing=" + ", ".join(str(item) for item in missing))
+            return "\n".join(lines)
+
     if tool_name == "delegate_task":
         goal = _str_arg(args, "goal")
         if len(goal) > 60:
@@ -3570,6 +3617,8 @@ class ContextCompressor(ContextEngine):
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
                 return False
             if content.startswith("[Duplicate tool output"):
+                return False
+            if content.startswith("[hk_legal_authority evidence;"):
                 return False
             # Already replaced by a prior prune/pressure pass (1-line summary).
             if content.startswith("[") and " chars)" in content and len(content) < 400:

@@ -72,6 +72,29 @@ _HONG_KONG_WELL_KNOWN_RE = re.compile(
     r"在香港.{0,80}(?:馳名|驰名)|(?:馳名|驰名).{0,80}香港)",
     re.IGNORECASE | re.DOTALL,
 )
+_OPEN_OPPOSITION_RE = re.compile(
+    r"(?:opposition.{0,100}(?:window|period).{0,80}(?:still|may|might|could).{0,30}open|"
+    r"(?:if|whether).{0,80}(?:opposition|window|period).{0,80}(?:open|available)|"
+    r"(?:if|when).{0,40}(?:it|the\s+(?:window|period)).{0,30}(?:is|remains).{0,20}open.{0,80}"
+    r"(?:file|give).{0,30}(?:notice\s+of\s+)?opposition)",
+    re.IGNORECASE | re.DOTALL,
+)
+_FOREIGN_FAME_INSUFFICIENT_RE = re.compile(
+    r"(?=[\s\S]{0,700}(?:Korea|Korean))"
+    r"(?=[\s\S]{0,700}(?:Hong\s+Kong|香港))"
+    r"(?=[\s\S]{0,700}(?:well[- ]known|馳名|驰名))"
+    r"[\s\S]{0,700}(?:not\s+(?:enough|sufficient)|insufficient|does\s+not\s+"
+    r"(?:itself\s+)?(?:establish|prove)|must\s+(?:separately\s+)?(?:establish|prove)|"
+    r"不足以|並不足夠|并不足够|仍須證明|仍须证明)",
+    re.IGNORECASE,
+)
+_FOREIGN_FAME_OVERSTATEMENT_RE = re.compile(
+    r"(?:strong(?:est)?\s+(?:case|ground|route)|decisive|sufficient).{0,260}"
+    r"(?:famous|well[- ]known).{0,160}(?:Korea|Korean)|"
+    r"(?:Korea|Korean).{0,260}(?:famous|well[- ]known).{0,160}"
+    r"(?:strong(?:est)?\s+(?:case|ground|route)|decisive|sufficient)",
+    re.IGNORECASE | re.DOTALL,
+)
 _PRACTICE_GUIDANCE_RE = re.compile(
     r"(?:working\s+manual|work\s+manual|practice\s+manual|registry\s+manual|"
     r"extension\s+of\s+time|time\s+limit|deadline|late|forgot|rule\s*13|"
@@ -341,6 +364,16 @@ def _registered_famous_mark_remedy_errors(user_message: Any, answer: str) -> lis
         errors.append("bad faith must be tied to section 11(5)(b)")
     if not _HONG_KONG_WELL_KNOWN_RE.search(answer):
         errors.append("well-known-mark protection must address Hong Kong")
+    if not _FOREIGN_FAME_INSUFFICIENT_RE.search(answer):
+        errors.append(
+            "Korean fame alone is insufficient; Hong Kong well-known status must be proved"
+        )
+    if _FOREIGN_FAME_OVERSTATEMENT_RE.search(answer):
+        errors.append("Korean fame must not be presented as sufficient or decisive")
+    if _OPEN_OPPOSITION_RE.search(answer):
+        errors.append(
+            "once the mark is registered, opposition is no longer a current remedy"
+        )
     if _near(answer, _OPPOSITION_RE, section_21):
         errors.append("section 21 is not the opposition provision")
     if _mislabels_as_rectification(answer, section_45):
@@ -499,6 +532,9 @@ def evaluate_hk_legal_answer(
                 "知識產權署實務手冊、Rule 13(2) 六個月期限及 Rule 13(3) 三個月機制。",
             )
 
+    remedy_errors = _registered_famous_mark_remedy_errors(
+        messages[current_turn_user_idx], final_response
+    )
     if _confuses_opposition_with_post_registration_invalidity(
         messages[current_turn_user_idx], final_response
     ):
@@ -511,8 +547,14 @@ def evaluate_hk_legal_answer(
                 "barring the separate post-registration invalidity route that "
                 "section 53(5)(b) expressly provides. Either omit the unnecessary "
                 "section 12(6) discussion or explicitly state that it does not bar "
-                "a section 53(5)(b) invalidity application. Preserve the official "
-                "URL and version citation.]",
+                "a section 53(5)(b) invalidity application. Also correct the complete "
+                "registered-mark taxonomy now: registration ends the opposition-stage "
+                "route; sections 52 and 53 are revocation and invalidity respectively; "
+                "bad faith is section 11(5)(b); and Korean fame alone is insufficient "
+                "to prove Hong Kong well-known status. Preserve the official URL and "
+                "version citation.\nDetected defects:\n- "
+                + "\n- ".join(remedy_errors)
+                + "]",
             )
         return GateDecision(
             "fail",
@@ -520,9 +562,6 @@ def evaluate_hk_legal_answer(
             "規則與第53(5)(b)條的註冊後無效申請。為免誤導，本次不提供矛盾的救濟建議。",
         )
 
-    remedy_errors = _registered_famous_mark_remedy_errors(
-        messages[current_turn_user_idx], final_response
-    )
     if remedy_errors:
         if attempts < max_attempts:
             return GateDecision(
@@ -536,7 +575,9 @@ def evaluate_hk_legal_answer(
                 "3 years; section 53 is declaration of invalidity to the Registrar "
                 "or court; bad faith is section 11(5)(b) and supports invalidity via "
                 "section 53(3); a well-known/earlier-right route must explain the "
-                "Hong Kong protection requirement and section 53(5)(b). Preserve the "
+                "Hong Kong protection requirement and section 53(5)(b); Korean fame "
+                "alone is not enough to prove Hong Kong well-known status. Once the "
+                "mark is registered, opposition is no longer a current remedy. Preserve the "
                 "section 12(6) distinction and all official URLs/version dates.\n"
                 "Detected defects:\n- " + "\n- ".join(remedy_errors) + "]",
             )

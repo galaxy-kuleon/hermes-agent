@@ -63,6 +63,89 @@ class TestSummarizeToolResultWebExtract:
         assert summary == "[web_extract] https://example.com/h (500 chars)"
 
 
+class TestSummarizeHongKongLegalAuthority:
+    def test_preserves_verified_citation_and_provision_meaning(self):
+        content = json.dumps(
+            {
+                "success": True,
+                "cannot_confirm": False,
+                "required_answer_citation": (
+                    "Hong Kong e-Legislation, Cap. 559, current version "
+                    "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+                ),
+                "requested_provisions": [
+                    {
+                        "provision": "52",
+                        "found": True,
+                        "text": (
+                            "52. Revocation of registration. The trade mark has not "
+                            "been genuinely used in Hong Kong for a continuous period "
+                            "of at least 3 years."
+                        ),
+                    },
+                    {
+                        "provision": "53",
+                        "found": True,
+                        "text": "53. Declaration of invalidity of registration.",
+                    },
+                ],
+                "missing_provisions": [],
+            }
+        )
+
+        summary = _summarize_tool_result(
+            "hk_legal_authority",
+            json.dumps({"chapter": "559", "provisions": ["52", "53"]}),
+            content,
+        )
+
+        assert summary.startswith("[hk_legal_authority evidence;")
+        assert "status=verified" in summary
+        assert "https://www.elegislation.gov.hk/hk/cap559!en" in summary
+        assert "at least 3 years" in summary
+        assert "Declaration of invalidity" in summary
+
+    def test_verified_projection_survives_later_prune_pass(self, compressor):
+        projection = _summarize_tool_result(
+            "hk_legal_authority",
+            "{}",
+            json.dumps(
+                {
+                    "success": True,
+                    "cannot_confirm": False,
+                    "requested_provisions": [
+                        {"provision": "53", "found": True, "text": "x" * 4000}
+                    ],
+                }
+            ),
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "hkel-1",
+                        "type": "function",
+                        "function": {
+                            "name": "hk_legal_authority",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "hkel-1", "content": projection},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent response"},
+        ]
+
+        pruned, count = compressor._prune_old_tool_results(
+            messages, protect_tail_count=2
+        )
+
+        assert count == 0
+        assert pruned[1]["content"] == projection
+
+
 class TestSummarizeToolResultClarify:
     def test_preserves_resolved_user_response_without_metadata(self):
         content = json.dumps({
