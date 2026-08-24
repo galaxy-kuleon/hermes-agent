@@ -3,6 +3,7 @@ import json
 from agent.hk_legal_authority_gate import (
     evaluate_hk_legal_answer,
     is_hk_statutory_query,
+    is_hk_statutory_turn,
     successful_authorities,
 )
 
@@ -26,24 +27,81 @@ def _authority_message():
         "role": "tool",
         "name": "hk_legal_authority",
         "tool_call_id": "call-1",
-        "content": json.dumps(
-            {
-                "success": True,
-                "cannot_confirm": False,
-                "chapter": "559",
-                "version_date": "2025-02-14",
-                "official_web_url": "https://www.elegislation.gov.hk/hk/cap559!en",
-                "required_answer_citation": (
-                    "Hong Kong e-Legislation, Cap. 559, current version "
-                    "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
-                ),
-                "requested_provisions": [
-                    {"provision": provision, "found": True}
-                    for provision in ("11", "12", "52", "53")
-                ],
-            }
-        ),
+        "content": json.dumps({
+            "success": True,
+            "cannot_confirm": False,
+            "chapter": "559",
+            "version_date": "2025-02-14",
+            "official_web_url": "https://www.elegislation.gov.hk/hk/cap559!en",
+            "required_answer_citation": (
+                "Hong Kong e-Legislation, Cap. 559, current version "
+                "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+            ),
+            "requested_provisions": [
+                {"provision": provision, "found": True}
+                for provision in ("11", "12", "52", "53")
+            ],
+        }),
     }
+
+
+def _rule_13_authority_message():
+    return {
+        "role": "tool",
+        "name": "hk_legal_authority",
+        "tool_call_id": "call-rule-13",
+        "content": json.dumps({
+            "success": True,
+            "cannot_confirm": False,
+            "chapter": "559A",
+            "version_date": "2025-10-01T00:00:00",
+            "official_web_url": "https://www.elegislation.gov.hk/hk/cap559A!en",
+            "required_answer_citation": (
+                "Hong Kong e-Legislation, Cap. 559A, current version "
+                "2025-10-01: https://www.elegislation.gov.hk/hk/cap559A!en"
+            ),
+            "requested_provisions": [
+                {"provision": provision, "found": True}
+                for provision in ("13", "95", "96")
+            ],
+            "official_practice_guidance": [
+                {
+                    "success": True,
+                    "cannot_confirm": False,
+                    "matched_page_text_complete": True,
+                    "title": "Time limits in the examination process",
+                    "official_url": (
+                        "https://www.ipd.gov.hk/filemanager/ipd/common/"
+                        "trade-marks/registry-work-manual/current/eng/"
+                        "time_limits_in_exam_process.pdf"
+                    ),
+                    "pdf_sha256": "b" * 64,
+                    "verified_extracts": [
+                        {
+                            "page": 2,
+                            "text": "The prescribed period expires 6 months thereafter.",
+                        },
+                        {
+                            "page": 2,
+                            "text": "A timely request grants an extension of 3 months.",
+                        },
+                    ],
+                }
+            ],
+        }),
+    }
+
+
+def _rule_13_answer():
+    return (
+        "Rule 13(2) gives 6 months. A request filed within that period may get "
+        "one further 3 months under Rule 13(3). Rules 95 and 96 are distinct. "
+        "Current version 2025-10-01: "
+        "https://www.elegislation.gov.hk/hk/cap559A!en\n"
+        "IPD practice manual: https://www.ipd.gov.hk/filemanager/ipd/common/"
+        "trade-marks/registry-work-manual/current/eng/"
+        "time_limits_in_exam_process.pdf"
+    )
 
 
 def test_query_detection_is_bounded_to_hong_kong_legal_requests():
@@ -64,6 +122,87 @@ Legal framework supplied by the user:
 Remember these project facts and raise any consistency question now.
 """
     assert not is_hk_statutory_query({"content": prompt})
+
+
+def test_same_matter_followup_without_repeating_hong_kong_is_still_gated():
+    messages = [
+        {"role": "user", "content": "Hong Kong trade mark Rule 13 advice?"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {
+            "role": "user",
+            "content": "Did you read the working manual? The time limit is 6 months.",
+        },
+        _rule_13_authority_message(),
+    ]
+    assert is_hk_statutory_turn(messages, 2)
+    assert (
+        evaluate_hk_legal_answer(
+            messages=messages,
+            current_turn_user_idx=2,
+            final_response=_rule_13_answer(),
+            attempts=0,
+        ).action
+        == "pass"
+    )
+
+
+def test_same_matter_skill_edit_is_not_misclassified_as_legal_answer():
+    messages = [
+        {"role": "user", "content": "Hong Kong trade mark Rule 13 advice?"},
+        {"role": "assistant", "content": "Earlier answer"},
+        {
+            "role": "user",
+            "content": "Please add rules to this skill: search laws, then manuals.",
+        },
+    ]
+    assert not is_hk_statutory_turn(messages, 2)
+
+
+def test_verified_manual_cannot_be_described_as_unread_or_truncated():
+    prompt = "Hong Kong trade mark Rule 13 extension of time?"
+    answer = (
+        _rule_13_answer()
+        + " However, I cannot confirm I read the IPD manual because it was truncated."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": prompt}, _rule_13_authority_message()],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=0,
+    )
+    assert decision.action == "nudge"
+    assert "delivered the official IPD manual evidence completely" in decision.message
+    assert "Exact verified extract" in decision.message
+
+
+def test_rule_13_time_answer_requires_manual_url_and_both_time_mechanisms():
+    prompt = "Hong Kong trade mark Rule 13 extension of time?"
+    incomplete = (
+        "Rule 13(3) may help. Current version 2025-10-01: "
+        "https://www.elegislation.gov.hk/hk/cap559A!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": prompt}, _rule_13_authority_message()],
+        current_turn_user_idx=0,
+        final_response=incomplete,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "Rule 13(2)" in decision.message
+    assert "Rule 13(3)" in decision.message
+
+    assert (
+        evaluate_hk_legal_answer(
+            messages=[
+                {"role": "user", "content": prompt},
+                _rule_13_authority_message(),
+            ],
+            current_turn_user_idx=0,
+            final_response=_rule_13_answer(),
+            attempts=1,
+        ).action
+        == "pass"
+    )
 
 
 def test_old_turn_authority_cannot_ground_the_current_turn():
@@ -90,15 +229,13 @@ def test_failed_or_non_official_tool_result_does_not_pass():
         {
             "role": "tool",
             "name": "hk_legal_authority",
-            "content": json.dumps(
-                {
-                    "success": True,
-                    "cannot_confirm": False,
-                    "chapter": "559",
-                    "version_date": "2025-02-14",
-                    "official_web_url": "https://example.com/cap559",
-                }
-            ),
+            "content": json.dumps({
+                "success": True,
+                "cannot_confirm": False,
+                "chapter": "559",
+                "version_date": "2025-02-14",
+                "official_web_url": "https://example.com/cap559",
+            }),
         },
     ]
     assert successful_authorities(messages, current_turn_user_idx=0) == []
@@ -121,16 +258,13 @@ def test_registered_mark_dispute_requires_complete_minimum_provision_set():
     partial = _authority_message()
     payload = json.loads(partial["content"])
     payload["requested_provisions"] = [
-        {"provision": provision, "found": True}
-        for provision in ("44", "52", "53")
+        {"provision": provision, "found": True} for provision in ("44", "52", "53")
     ]
     partial["content"] = json.dumps(payload)
     decision = evaluate_hk_legal_answer(
         messages=[{"role": "user", "content": PROMPT}, partial],
         current_turn_user_idx=0,
-        final_response=(
-            "2025-02-14 https://www.elegislation.gov.hk/hk/cap559!en"
-        ),
+        final_response=("2025-02-14 https://www.elegislation.gov.hk/hk/cap559!en"),
         attempts=1,
     )
     assert decision.action == "nudge"
@@ -141,16 +275,13 @@ def test_exact_long_reported_prompt_is_still_a_registered_mark_dispute():
     partial = _authority_message()
     payload = json.loads(partial["content"])
     payload["requested_provisions"] = [
-        {"provision": provision, "found": True}
-        for provision in ("44", "52", "53")
+        {"provision": provision, "found": True} for provision in ("44", "52", "53")
     ]
     partial["content"] = json.dumps(payload)
     decision = evaluate_hk_legal_answer(
         messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, partial],
         current_turn_user_idx=0,
-        final_response=(
-            "2025-02-14 https://www.elegislation.gov.hk/hk/cap559!en"
-        ),
+        final_response=("2025-02-14 https://www.elegislation.gov.hk/hk/cap559!en"),
         attempts=1,
     )
     assert decision.action == "nudge"
@@ -166,8 +297,7 @@ def test_hkel_timestamp_is_cited_by_its_public_calendar_date():
         messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
         current_turn_user_idx=0,
         final_response=(
-            "Current version 2025-02-14: "
-            "https://www.elegislation.gov.hk/hk/cap559!en"
+            "Current version 2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
         ),
         attempts=1,
     )
@@ -197,12 +327,15 @@ def test_section_12_6_must_not_be_said_to_bar_section_53_5_b_invalidity():
         "Current version 2025-02-14: "
         "https://www.elegislation.gov.hk/hk/cap559!en"
     )
-    assert evaluate_hk_legal_answer(
-        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
-        current_turn_user_idx=0,
-        final_response=corrected,
-        attempts=1,
-    ).action == "pass"
+    assert (
+        evaluate_hk_legal_answer(
+            messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+            current_turn_user_idx=0,
+            final_response=corrected,
+            attempts=1,
+        ).action
+        == "pass"
+    )
 
 
 def test_verified_and_cited_answer_passes():

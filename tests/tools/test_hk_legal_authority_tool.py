@@ -223,9 +223,12 @@ def test_rule_13_manual_returns_only_matching_official_pages(monkeypatch, tmp_pa
 
 
 def test_cap_559a_rule_13_automatically_includes_ipd_manual(monkeypatch, tmp_path):
-    catalog = CATALOG.replace(b"<CapNo>559</CapNo>", b"<CapNo>559A</CapNo>").replace(
-        b"cap_559_en_c", b"cap_559a_en_c"
-    ).replace(b"cap_559_", b"cap_559a_")
+    catalog = (
+        CATALOG
+        .replace(b"<CapNo>559</CapNo>", b"<CapNo>559A</CapNo>")
+        .replace(b"cap_559_en_c", b"cap_559a_en_c")
+        .replace(b"cap_559_", b"cap_559a_")
+    )
     xml = AUTHORITY_XML.replace(b'name="s52"', b'name="s13"', 1)
     member = r"cap_559a_en_c\cap_559a_20250214000000_en_c.xml"
 
@@ -238,7 +241,15 @@ def test_cap_559a_rule_13_automatically_includes_ipd_manual(monkeypatch, tmp_pat
     expected_manual = {
         "success": True,
         "cannot_confirm": False,
+        "source": "Hong Kong Intellectual Property Department",
         "title": "Time limits in the examination process",
+        "official_url": authority_tool.IPD_TIME_LIMITS_MANUAL_URL,
+        "pdf_sha256": "a" * 64,
+        "matched_page_text_complete": True,
+        "verified_extracts": [
+            {"page": 2, "text": "The prescribed period expires 6 months later."},
+            {"page": 2, "text": "A timely request grants 3 further months."},
+        ],
     }
     monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
     monkeypatch.setattr(
@@ -256,6 +267,20 @@ def test_cap_559a_rule_13_automatically_includes_ipd_manual(monkeypatch, tmp_pat
 
     assert result["success"] is True
     assert result["official_practice_guidance"] == [expected_manual]
+    assert result["answer_evidence"]["delivery_status"] == "complete"
+    assert result["answer_evidence"]["verified_practice_guidance"] == [
+        {
+            "status": "verified_read",
+            "source": "Hong Kong Intellectual Property Department",
+            "title": "Time limits in the examination process",
+            "official_url": authority_tool.IPD_TIME_LIMITS_MANUAL_URL,
+            "pdf_sha256": "a" * 64,
+            "verified_extracts": expected_manual["verified_extracts"],
+        }
+    ]
+    assert raw_result.index('"answer_evidence"') < raw_result.index(
+        '"official_practice_guidance"'
+    )
     assert raw_result.index('"official_practice_guidance"') < raw_result.index(
         '"requested_provisions"'
     )
@@ -274,7 +299,9 @@ def test_full_tool_retains_versioned_xml_and_reports_authority(
     assert result["success"] is True
     assert result["cannot_confirm"] is False
     assert result["freshness"] == "current_catalog"
-    assert result["source"] == "Hong Kong e-Legislation open data, Department of Justice"
+    assert (
+        result["source"] == "Hong Kong e-Legislation open data, Department of Justice"
+    )
     assert result["official_web_url"] == "https://www.elegislation.gov.hk/hk/cap559!en"
     assert result["required_answer_citation"] == (
         "Hong Kong e-Legislation, Cap. 559, current version 2025-02-14: "
@@ -289,11 +316,15 @@ def test_full_tool_retains_versioned_xml_and_reports_authority(
     assert result["xml_sha256"] in caplog.text
 
 
-def test_network_failure_uses_retained_version_and_labels_it_offline(monkeypatch, tmp_path):
+def test_network_failure_uses_retained_version_and_labels_it_offline(
+    monkeypatch, tmp_path
+):
     member = r"cap_559_en_c\cap_559_20250214000000_en_c.xml"
     monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
     first = FakeOpener(make_archive(member, AUTHORITY_XML))
-    assert json.loads(hk_legal_authority("559", ["53"], opener=first))["success"] is True
+    assert (
+        json.loads(hk_legal_authority("559", ["53"], opener=first))["success"] is True
+    )
 
     class Offline:
         def open(self, request, timeout):
@@ -309,7 +340,9 @@ def test_missing_provision_forces_cannot_confirm(monkeypatch, tmp_path):
     member = r"cap_559_en_c\cap_559_20250214000000_en_c.xml"
     monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
     result = json.loads(
-        hk_legal_authority("559", ["777"], opener=FakeOpener(make_archive(member, AUTHORITY_XML)))
+        hk_legal_authority(
+            "559", ["777"], opener=FakeOpener(make_archive(member, AUTHORITY_XML))
+        )
     )
     assert result["success"] is False
     assert result["cannot_confirm"] is True

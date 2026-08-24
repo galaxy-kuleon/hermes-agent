@@ -63,6 +63,8 @@ _RULE_13_MANUAL_TERMS = (
     "six-month period",
 )
 MAX_MANUAL_MATCHED_PAGES = 4
+EVIDENCE_DELIVERY_COMPLETE = "complete"
+EVIDENCE_STATUS_VERIFIED_READ = "verified_read"
 _RULE_13_VERIFIED_EXTRACT_BOUNDS = (
     (
         "The prescribed period for taking the above action",
@@ -156,7 +158,9 @@ def _read_response(response) -> bytes:
         return response.read()
 
 
-def _fetch_bytes(opener, url: str, *, byte_range: tuple[int, int] | None = None) -> bytes:
+def _fetch_bytes(
+    opener, url: str, *, byte_range: tuple[int, int] | None = None
+) -> bytes:
     headers = {"User-Agent": "hermes-hk-legal-authority/1"}
     if byte_range is not None:
         headers["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
@@ -277,13 +281,11 @@ def _rule_13_practice_guidance(opener) -> dict:
         lowered = normalized.casefold()
         matched = [term for term in _RULE_13_MANUAL_TERMS if term in lowered]
         if matched:
-            selected.append(
-                {
-                    "page": page_number,
-                    "matched_terms": matched,
-                    "text": normalized,
-                }
-            )
+            selected.append({
+                "page": page_number,
+                "matched_terms": matched,
+                "text": normalized,
+            })
         if len(selected) >= MAX_MANUAL_MATCHED_PAGES:
             break
     logger.info(
@@ -305,9 +307,7 @@ def _rule_13_practice_guidance(opener) -> dict:
                 continue
             excerpt = page_text[start:end].strip()
             if excerpt:
-                verified_extracts.append(
-                    {"page": page["page"], "text": excerpt}
-                )
+                verified_extracts.append({"page": page["page"], "text": excerpt})
     return {
         "success": bool(selected),
         "cannot_confirm": not selected,
@@ -448,7 +448,9 @@ def _cache_path(version: AuthorityVersion, xml_sha256: str) -> Path:
     return _cache_dir() / f"{safe_file}.{xml_sha256}.xml"
 
 
-def _retain_versioned_xml(version: AuthorityVersion, content: bytes) -> tuple[Path, str]:
+def _retain_versioned_xml(
+    version: AuthorityVersion, content: bytes
+) -> tuple[Path, str]:
     digest = hashlib.sha256(content).hexdigest()
     path = _cache_path(version, digest)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -477,7 +479,11 @@ def _cached_version(chapter: str) -> tuple[AuthorityVersion, bytes, str, Path] |
             version_date = _text_ns(meta, f"{{{DC_NAMESPACE}}}date")
             status = _text_ns(meta, f"{{{HKLM_NAMESPACE}}}docStatus")
             title_node = root.find(f".//{{{HKLM_NAMESPACE}}}docTitle")
-            title = _normalised_itertext(title_node) if title_node is not None else f"Cap. {chapter}"
+            title = (
+                _normalised_itertext(title_node)
+                if title_node is not None
+                else f"Cap. {chapter}"
+            )
             version = AuthorityVersion(
                 chapter=chapter,
                 title=title,
@@ -560,14 +566,16 @@ def extract_provisions(xml_content: bytes, provisions: Iterable[str]) -> list[di
 
 def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> str:
     wanted_chapter = str(chapter).strip().upper()
-    if not isinstance(provisions, list) or not provisions or len(provisions) > MAX_PROVISIONS:
-        return json.dumps(
-            {
-                "success": False,
-                "cannot_confirm": True,
-                "error": f"provisions must contain 1-{MAX_PROVISIONS} section/rule numbers",
-            }
-        )
+    if (
+        not isinstance(provisions, list)
+        or not provisions
+        or len(provisions) > MAX_PROVISIONS
+    ):
+        return json.dumps({
+            "success": False,
+            "cannot_confirm": True,
+            "error": f"provisions must contain 1-{MAX_PROVISIONS} section/rule numbers",
+        })
     try:
         for provision in provisions:
             _normalise_provision_request(provision)
@@ -628,8 +636,39 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
         f"Hong Kong e-Legislation, Cap. {version.chapter}, current version "
         f"{version_day}: {version.web_url}"
     )
+    verified_practice_evidence = [
+        {
+            "status": EVIDENCE_STATUS_VERIFIED_READ,
+            "source": row.get("source"),
+            "title": row.get("title"),
+            "official_url": row.get("official_url"),
+            "pdf_sha256": row.get("pdf_sha256"),
+            "verified_extracts": row.get("verified_extracts") or [],
+        }
+        for row in practice_guidance
+        if row.get("success") is True
+        and row.get("cannot_confirm") is False
+        and row.get("matched_page_text_complete") is True
+        and row.get("pdf_sha256")
+        and row.get("verified_extracts")
+    ]
     return json.dumps(
         {
+            # Keep the compact answer contract first. This is the evidence the
+            # model must consume; the complete provision and matched-page text
+            # remain below for deeper inspection and full-fidelity tracing.
+            "answer_evidence": {
+                "delivery_status": EVIDENCE_DELIVERY_COMPLETE,
+                "statutory_citation": required_citation,
+                "verified_practice_guidance": verified_practice_evidence,
+                "instruction": (
+                    "Use this evidence in the user-visible answer. Evidence with "
+                    "status=verified_read was delivered completely in this tool "
+                    "result: do not claim it was unavailable, unread, or truncated. "
+                    "Cite every official URL visibly and keep practice guidance "
+                    "distinct from legislation."
+                ),
+            },
             "success": not missing,
             "cannot_confirm": bool(missing),
             "freshness": freshness,
