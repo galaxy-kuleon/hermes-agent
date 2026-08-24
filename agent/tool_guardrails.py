@@ -10,11 +10,49 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+
+
+_HK_LABELED_PROVISION_RE = re.compile(
+    r"(?:section|sec(?:tion)?|s|rule|r)\.?\s*([0-9]{1,4}[A-Z]?)",
+    re.IGNORECASE,
+)
+_HK_BARE_PROVISION_RE = re.compile(
+    r"^(?:s|r)?([0-9]{1,4}[A-Z]?)(?:\s*\([0-9A-Za-z]+\))*$",
+    re.IGNORECASE,
+)
+
+
+def _hk_authority_request(args: Mapping[str, Any]) -> tuple[str, frozenset[str]]:
+    chapter = str(args.get("chapter") or "").strip().upper()
+    raw_provisions = args.get("provisions")
+    if not chapter or not isinstance(raw_provisions, list):
+        return chapter, frozenset()
+    normalized = set()
+    for raw in raw_provisions:
+        value = str(raw or "").strip()
+        match = _HK_LABELED_PROVISION_RE.search(value) or _HK_BARE_PROVISION_RE.fullmatch(value)
+        if match:
+            normalized.add(match.group(1).upper())
+    return chapter, frozenset(normalized)
+
+
+def _successful_hk_authority_result(result: str | None) -> tuple[str, frozenset[str]]:
+    payload = safe_json_loads(result or "")
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return "", frozenset()
+    chapter = str(payload.get("chapter") or "").strip().upper()
+    provisions = {
+        str(row.get("provision") or "").strip().upper()
+        for row in payload.get("requested_provisions") or []
+        if isinstance(row, dict) and row.get("found") is True
+    }
+    return chapter, frozenset(value for value in provisions if value)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -339,6 +377,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._hk_legal_coverage: dict[str, set[str]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -364,6 +403,24 @@ class ToolCallGuardrailController:
 
         if not self._hard_stops_active():
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        if tool_name == "hk_legal_authority":
+            chapter, requested = _hk_authority_request(_coerce_args(args))
+            covered = self._hk_legal_coverage.get(chapter) or set()
+            if requested and requested.issubset(covered):
+                return ToolGuardrailDecision(
+                    action="block",
+                    code="hk_authority_already_read",
+                    message=(
+                        "These official provisions were already read successfully in this "
+                        "turn. Use the prior full tool result and answer the user now; do not "
+                        "retry the same provisions under another label. This is an internal "
+                        "control: do not mention it in the user-visible answer."
+                    ),
+                    tool_name=tool_name,
+                    count=len(requested),
+                    signature=signature,
+                )
 
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
@@ -478,6 +535,11 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+
+        if tool_name == "hk_legal_authority":
+            chapter, provisions = _successful_hk_authority_result(result)
+            if chapter and provisions:
+                self._hk_legal_coverage.setdefault(chapter, set()).update(provisions)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)

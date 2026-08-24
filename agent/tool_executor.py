@@ -2086,6 +2086,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
+                    messages=messages,
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager

@@ -1571,7 +1571,10 @@ class TestExecuteToolCalls:
         agent._memory_manager = FakeMemoryManager()
         agent._memory_store = object()
 
-        with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps({"success": True}),
+        ) as memory_call:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert len(calls) == 1
@@ -1580,6 +1583,7 @@ class TestExecuteToolCalls:
         assert metadata["old_text"] == old_text
         assert metadata["tool_call_id"] == "mem-1"
         assert messages[-1]["tool_call_id"] == "mem-1"
+        assert memory_call.call_args.kwargs["messages"] is messages
 
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
@@ -2408,6 +2412,30 @@ class TestAgentRuntimePostHookOwnershipSync:
             f"{tool_name}-sequential",
         ]
         assert all(call["tool_name"] == tool_name for call in post_calls)
+
+    def test_concurrent_memory_path_forwards_current_messages(self, agent, monkeypatch):
+        captured = {}
+        current_messages = [{"role": "user", "content": "What happened?"}]
+
+        def fake_memory_tool(**kwargs):
+            captured.update(kwargs)
+            return '{"success":false,"error":"blocked"}'
+
+        monkeypatch.setattr("tools.memory_tool.memory_tool", fake_memory_tool)
+        agent._memory_manager = None
+
+        agent._invoke_tool(
+            "memory",
+            {"action": "add", "target": "memory", "content": "prior answer"},
+            "task-concurrent",
+            tool_call_id="memory-concurrent",
+            messages=current_messages,
+            pre_tool_block_checked=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+
+        assert captured["messages"] is current_messages
 
     def test_post_hook_ownership_contract_lists_exercised_tools(self):
         from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES

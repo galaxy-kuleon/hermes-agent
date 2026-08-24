@@ -363,6 +363,62 @@ def test_hk_legal_authority_is_registered_as_idempotent():
     assert "block" in actions
 
 
+def test_hk_authority_semantic_subset_is_blocked_after_successful_read():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    first_args = {
+        "chapter": "559A",
+        "provisions": ["13", "rule 14", "94", "95"],
+    }
+    first_result = json.dumps(
+        {
+            "success": True,
+            "chapter": "559A",
+            "requested_provisions": [
+                {"provision": value, "found": True}
+                for value in ("13", "14", "94", "95")
+            ],
+        }
+    )
+
+    controller.after_call(
+        "hk_legal_authority", first_args, first_result, failed=False
+    )
+    duplicate = controller.before_call(
+        "hk_legal_authority",
+        {"chapter": "559a", "provisions": ["Sch. 1 rule 13", "section 14(1)"]},
+    )
+    new_provision = controller.before_call(
+        "hk_legal_authority", {"chapter": "559A", "provisions": ["96"]}
+    )
+
+    assert duplicate.action == "block"
+    assert duplicate.code == "hk_authority_already_read"
+    assert "answer the user now" in duplicate.message
+    assert new_provision.action == "allow"
+
+
+def test_hk_authority_coverage_resets_for_the_next_user_turn():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    args = {"chapter": "559A", "provisions": ["13"]}
+    result = json.dumps(
+        {
+            "success": True,
+            "chapter": "559A",
+            "requested_provisions": [{"provision": "13", "found": True}],
+        }
+    )
+    controller.after_call("hk_legal_authority", args, result, failed=False)
+    assert controller.before_call("hk_legal_authority", args).action == "block"
+
+    controller.reset_for_turn()
+
+    assert controller.before_call("hk_legal_authority", args).action == "allow"
+
+
 def test_block_message_tells_the_model_to_answer_not_to_report():
     """A control that halts a loop must not become the answer.
 
