@@ -514,6 +514,33 @@ def test_will_accepts_correct_execution_divorce_and_remarriage_sections():
     assert decision.action == "pass"
 
 
+def test_will_accepts_explicit_corrections_of_section_4_and_predeceased_fiction():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Signing and witnessing are governed by Cap. 30 section 5. "
+        "Section 4 concerns wills by persons not of full age and is not relevant "
+        "to signing. Section 15 causes an appointment of the former spouse to be "
+        "omitted and a disposition to that spouse to lapse unless a contrary "
+        "intention appears. It does not deem the former spouse to have predeceased "
+        "the testator. Marriage generally revokes a will under section 14, subject "
+        "to its statutory exceptions. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "14", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "pass", decision
+
+
 def test_estate_duty_abolition_date_must_match_verified_section_2_cutoff():
     prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
     wrong = (

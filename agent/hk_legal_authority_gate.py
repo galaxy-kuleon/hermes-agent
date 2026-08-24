@@ -164,6 +164,15 @@ _FORMER_SPOUSE_PREDECEASED_RE = re.compile(
     r"視為已死亡|视为已死亡))",
     re.IGNORECASE | re.DOTALL,
 )
+_FORMER_SPOUSE_PREDECEASED_CORRECTION_RE = re.compile(
+    r"(?:\b(?:does|do|did|is|are|was|were)\s+not\b.{0,100}"
+    r"\bformer\s+spouse\b.{0,100}\bpredeceas(?:e|ed)\b|"
+    r"\bformer\s+spouse\b.{0,100}\b(?:is|are|was|were)\s+not\b.{0,80}"
+    r"\bpredeceas(?:e|ed)\b|"
+    r"不(?:會|会|是).{0,80}前配偶.{0,80}(?:視為先死|视为先死|"
+    r"視為已死亡|视为已死亡))",
+    re.IGNORECASE | re.DOTALL,
+)
 _APPOINTMENT_OMITTED_RE = re.compile(
     r"(?:\bappointment\b.{0,180}\bformer\s+spouse\b.{0,180}\bomitt?ed\b|"
     r"\bformer\s+spouse\b.{0,180}\bappointment\b.{0,180}\bomitt?ed\b|"
@@ -171,8 +180,8 @@ _APPOINTMENT_OMITTED_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _DEVISE_BEQUEST_LAPSE_RE = re.compile(
-    r"(?:\bformer\s+spouse\b.{0,240}\b(?:devise|bequest)\b.{0,140}\blapse[ds]?\b|"
-    r"\b(?:devise|bequest)\b.{0,240}\bformer\s+spouse\b.{0,140}\blapse[ds]?\b|"
+    r"(?:\bformer\s+spouse\b.{0,240}\b(?:devise|bequest|disposition)\b.{0,140}\blapse[ds]?\b|"
+    r"\b(?:devise|bequest|disposition)\b.{0,240}\bformer\s+spouse\b.{0,140}\blapse[ds]?\b|"
     r"前配偶.{0,160}(?:遺贈|遗赠).{0,100}(?:失效|無效|无效))",
     re.IGNORECASE | re.DOTALL,
 )
@@ -205,6 +214,20 @@ _MARRIAGE_EFFECT_CLAIM_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _SECTION_4_RE = re.compile(r"(?:(?:section|s\.?)\s*4\b|第\s*4\s*條)", re.IGNORECASE)
+_SECTION_4_EXECUTION_CLAIM_RE = re.compile(
+    r"(?:(?:\bsign(?:ed|ing|ature)?\b|\bexecut(?:e|ed|ion)\b|"
+    r"\bwitness(?:ed|es|ing)?\b)[^.;:\n]{0,100}"
+    r"(?:under|pursuant\s+to|in\s+accordance\s+with|governed\s+by|"
+    r"required\s+by|complies?\s+with)[^.;:\n]{0,60}"
+    r"(?:section|s\.?)\s*4\b|"
+    r"(?:section|s\.?)\s*4\b[^.;:\n]{0,80}"
+    r"(?:governs?|requires?|controls?|sets?\s+out|provides?)[^.;:\n]{0,60}"
+    r"(?:\bsign(?:ed|ing|ature)?\b|\bexecut(?:e|ed|ion)\b|"
+    r"\bwitness(?:ed|es|ing)?\b)|"
+    r"(?:簽署|签署|見證|见证).{0,80}(?:依據|依据|根據|根据)"
+    r".{0,40}第\s*4\s*條)",
+    re.IGNORECASE | re.DOTALL,
+)
 _SECTION_5_RE = re.compile(r"(?:(?:section|s\.?)\s*5\b|第\s*5\s*條)", re.IGNORECASE)
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
@@ -625,7 +648,7 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         errors.append(
             "signing and witnessing requirements must be tied to Cap. 30 section 5"
         )
-    if _near(answer, _WILL_EXECUTION_RE, _SECTION_4_RE, distance=240):
+    if _SECTION_4_EXECUTION_CLAIM_RE.search(answer):
         errors.append(
             "Cap. 30 section 4 must not be used for signing or witnessing requirements"
         )
@@ -637,7 +660,10 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
                 "the effect of divorce, dissolution, or annulment on a will must be "
                 "tied to Cap. 30 section 15"
             )
-        if _FORMER_SPOUSE_PREDECEASED_RE.search(answer):
+        predeceased_claim_text = _FORMER_SPOUSE_PREDECEASED_CORRECTION_RE.sub(
+            "", answer
+        )
+        if _FORMER_SPOUSE_PREDECEASED_RE.search(predeceased_claim_text):
             errors.append(
                 "Cap. 30 section 15 does not deem the former spouse to have "
                 "predeceased the testator"
