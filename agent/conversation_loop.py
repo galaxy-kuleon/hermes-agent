@@ -95,6 +95,7 @@ from agent.hk_legal_authority_gate import (
     MAX_AUTHORITY_NUDGES,
     evaluate_hk_legal_answer,
 )
+from agent.artifact_delivery import ensure_export_links_in_terminal_answer
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
@@ -8263,6 +8264,37 @@ def run_conversation(
                     agent._emit_status(
                         "✓ 香港法律答案已由已驗證官方法源產生安全版本"
                     )
+
+                # A successful export already returned canonical signed links.
+                # Do not ask a language model to remember or reconstruct them:
+                # append missing links deterministically at the response
+                # boundary.  A legal fail/replace may reject the contents of an
+                # earlier artifact, so never surface that artifact in those two
+                # safety outcomes.
+                if not (
+                    _hk_legal_decision
+                    and _hk_legal_decision.action in {"fail", "replace"}
+                ):
+                    final_response, _artifact_suffix = (
+                        ensure_export_links_in_terminal_answer(
+                            final_response or "",
+                            messages,
+                            current_turn_user_idx=current_turn_user_idx,
+                        )
+                    )
+                    if _artifact_suffix:
+                        final_msg["content"] = final_response
+                        try:
+                            agent._fire_stream_delta(_artifact_suffix)
+                            if agent.stream_delta_callback:
+                                agent.stream_delta_callback(None)
+                        except Exception:
+                            logger.warning(
+                                "artifact terminal-link stream projection failed "
+                                "(session=%s); stored response remains complete",
+                                getattr(agent, "session_id", None) or "none",
+                                exc_info=True,
+                            )
 
                 try:
                     from agent.verification_stop import (
