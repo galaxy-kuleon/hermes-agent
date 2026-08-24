@@ -389,6 +389,55 @@ class TestMemoryToolDispatcher:
         assert "the real one" in store.memory_entries
         assert "ignored" not in store.memory_entries
 
+    def test_unrequested_legal_self_critique_is_not_profile_memory(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                content=(
+                    "User correction: Cap. 559A Rule 13 deadline was wrong. "
+                    "Root cause was context compression in my prior answer."
+                ),
+                store=store,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Rule 64 is unrelated. What happened to your analysis?",
+                    }
+                ],
+            )
+        )
+
+        assert result["success"] is False
+        assert "latest user did not ask" in result["error"]
+        assert store.memory_entries == []
+
+    def test_explicit_user_memory_request_can_store_legal_matter_note(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                content="Remember this Matter uses Cap. 559A Rule 13.",
+                store=store,
+                messages=[
+                    {"role": "user", "content": "Please save this fact to memory."}
+                ],
+            )
+        )
+
+        assert result["success"] is True
+        assert any("Remember this Matter" in entry for entry in store.memory_entries)
+
+    def test_proactive_stable_preference_remains_allowed(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                content="The user prefers concise Traditional Chinese replies.",
+                store=store,
+                messages=[{"role": "user", "content": "用繁體中文簡潔回答。"}],
+            )
+        )
+
+        assert result["success"] is True
+
 
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""

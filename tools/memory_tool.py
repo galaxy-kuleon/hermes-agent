@@ -49,6 +49,50 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_EXPLICIT_MEMORY_INTENT_RE = re.compile(
+    r"\b(?:remember|memorize|save|store|record)\b.{0,40}\b(?:memory|preference|fact)\b|"
+    r"\b(?:remember|memorize)\b|記住|記錄|記憶|保存|存入",
+    re.IGNORECASE | re.DOTALL,
+)
+_TASK_OR_MATTER_MEMORY_RE = re.compile(
+    r"\b(?:root cause|context compression|prior answer|previous answer|my mistake|"
+    r"my error|user correction|lesson learned|legal conclusion|case matter)\b|"
+    r"\bcap\.?\s*\d+[a-z]*\b|\b(?:rule|section)\s*\d+|"
+    r"\btrade\s*marks?\b|\btrademark\b|\blegal deadline\b|"
+    r"根因|上下文壓縮|先前答案|我的錯誤|使用者更正|法律結論|案件事實",
+    re.IGNORECASE,
+)
+
+
+def _latest_user_text(messages: Optional[List[Dict[str, Any]]]) -> str:
+    for message in reversed(messages or []):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _unrequested_task_memory_error(
+    messages: Optional[List[Dict[str, Any]]], contents: List[str]
+) -> str | None:
+    """Keep task output and Matter facts in their observable canonical stores.
+
+    Proactive profile memory remains available for durable preferences and
+    environment facts.  The narrow rejection applies only when a model tries
+    to turn legal/task analysis or its own failure post-mortem into profile
+    memory without the latest user explicitly asking for a memory write.
+    """
+    if not messages or _EXPLICIT_MEMORY_INTENT_RE.search(_latest_user_text(messages)):
+        return None
+    payload = "\n".join(str(value or "") for value in contents)
+    if not _TASK_OR_MATTER_MEMORY_RE.search(payload):
+        return None
+    return (
+        "Durable profile memory rejected: the latest user did not ask to save this "
+        "task/legal analysis, Matter fact, or agent self-critique. Keep it in the "
+        "current answer and trace; Matter knowledge is handled by the session context "
+        "engine. Do not retry the memory write."
+    )
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -1100,6 +1144,7 @@ def memory_tool(
     new_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    messages: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1138,6 +1183,16 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        denial = _unrequested_task_memory_error(
+            messages,
+            [
+                str(op.get("content") or op.get("new_text") or op.get("old_text") or "")
+                for op in operations
+                if isinstance(op, dict)
+            ],
+        )
+        if denial:
+            return tool_error(denial, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1160,6 +1215,13 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    denial = _unrequested_task_memory_error(
+        messages,
+        [str(content or old_text or "")],
+    )
+    if denial:
+        return tool_error(denial, success=False)
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
@@ -1301,8 +1363,8 @@ registry.register(
         old_text=args.get("old_text"),
         new_text=args.get("new_text"),
         operations=args.get("operations"),
-        store=kw.get("store")),
+        store=kw.get("store"),
+        messages=kw.get("messages")),
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
