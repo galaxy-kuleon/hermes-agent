@@ -1147,7 +1147,7 @@ def _create_skill(
     draft_dir = root.path / ".drafts" / bare_name
     draft_dir.mkdir(parents=True, exist_ok=True)
     skill_md = draft_dir / "SKILL.md"
-    atomic_write_text(skill_md, content)
+    atomic_write_text(skill_md, content, preserve_mode=True)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(draft_dir)
@@ -1359,13 +1359,13 @@ def _edit_skill(
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    atomic_write_text(skill_md, content)
+    atomic_write_text(skill_md, content, preserve_mode=True)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            atomic_write_text(skill_md, original_content)
+            atomic_write_text(skill_md, original_content, preserve_mode=True)
         return {"success": False, "error": scan_error}
 
     # Extract description from new content for verbose notifications
@@ -1495,12 +1495,12 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
-    atomic_write_text(target, new_content)
+    atomic_write_text(target, new_content, preserve_mode=True)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        atomic_write_text(target, original_content)
+        atomic_write_text(target, original_content, preserve_mode=True)
         return {"success": False, "error": scan_error}
 
     result = {
@@ -1695,13 +1695,13 @@ def _write_file(
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    atomic_write_text(target, file_content)
+    atomic_write_text(target, file_content, preserve_mode=True)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            atomic_write_text(target, original_content)
+            atomic_write_text(target, original_content, preserve_mode=True)
         else:
             target.unlink(missing_ok=True)
         return {"success": False, "error": scan_error}

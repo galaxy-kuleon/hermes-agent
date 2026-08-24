@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -104,6 +105,7 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
         assert stat.S_IMODE(user_root.stat().st_mode) == 0o700
         assert (user_root / ".curator_ledger.jsonl").exists()
         assert not (home / "skills" / ".curator_ledger.jsonl").exists()
+        os.chmod(skill_md, 0o640)
 
         edited = json.loads(
             manager.skill_manage(
@@ -113,12 +115,14 @@ def test_unqualified_create_defaults_to_own_root_and_reader_has_own_full_crud(
             )
         )
         assert edited["success"] is True
+        assert stat.S_IMODE(skill_md.stat().st_mode) == 0o640
         patched = json.loads(
             manager.skill_manage(
                 "patch", "user:alice-skill", old_string="v2", new_string="v3"
             )
         )
         assert patched["success"] is True
+        assert stat.S_IMODE(skill_md.stat().st_mode) == 0o640
         written = json.loads(
             manager.skill_manage(
                 "write_file",
