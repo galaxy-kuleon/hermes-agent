@@ -54,6 +54,7 @@ def test_handoff_context_accepts_minimal_signed_path_metadata(monkeypatch, tmp_p
 
     assert "<files>" not in out
     assert '<attached_files source="openwebui-skip-rag-handoff">' in out
+    assert "do not replace it with a remembered job status" in out
     # Files are addressed by short handle. The signed path must NOT reach the
     # model at all: it is ~190 characters the model can only get wrong, and
     # every path it invented in the live incident was a variation on one it

@@ -1687,7 +1687,9 @@ def _build_handoff_context(
         "read_file extracts text from PDF, DOCX, XLSX, MSG and notebooks. Reading a "
         "file to answer a question is not a conversion request, so do NOT use the "
         "soc_v2 / DOCX-conversion tools unless the user EXPLICITLY asks to convert "
-        "or export something.",
+        "or export something. If the user explicitly names a conversion action "
+        "such as submit_conversion, honor that action for the attached file; do "
+        "not replace it with a remembered job status or job list.",
     ]
     accepted = 0
 
