@@ -195,8 +195,21 @@ _CONTRARY_INTENTION_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _STATUTORY_EXCEPTION_RE = re.compile(
-    r"(?:\bsubject\s+to\b.{0,100}\bexceptions?\b|\bstatutory\s+exceptions?\b|"
-    r"\bunless\b.{0,160}\b(?:marriage|will)\b|法定例外|除外情況|例外情形)",
+    r"(?:\bsubject\s+to\b.{0,100}\b(?:statutory\s+)?exceptions?\b|"
+    r"\bstatutory\s+exceptions?\b|法定例外|除外情況|例外情形)",
+    re.IGNORECASE | re.DOTALL,
+)
+_POWER_OF_APPOINTMENT_EXCEPTION_RE = re.compile(
+    r"(?:\bpower\s+of\s+appointment\b.{0,260}"
+    r"\b(?:personal\s+representatives?|default\s+of\s+appointment)\b|"
+    r"\b(?:personal\s+representatives?|default\s+of\s+appointment)\b.{0,260}"
+    r"\bpower\s+of\s+appointment\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PARTICULAR_MARRIAGE_EXCEPTION_RE = re.compile(
+    r"(?:\b(?:expecting|contemplation)\b.{0,120}\bmarri(?:age|ed)\b.{0,160}"
+    r"\bparticular\s+person\b|\bparticular\s+person\b.{0,160}"
+    r"\b(?:expecting|contemplation)\b.{0,120}\bmarri(?:age|ed)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _DIVORCE_EFFECT_CLAIM_RE = re.compile(
@@ -714,7 +727,12 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
                 "the effect of marriage or remarriage on a will must be tied to "
                 "Cap. 30 section 14"
             )
-        if not _STATUTORY_EXCEPTION_RE.search(answer):
+        preserves_exceptions_generically = bool(_STATUTORY_EXCEPTION_RE.search(answer))
+        enumerates_both_exception_classes = bool(
+            _POWER_OF_APPOINTMENT_EXCEPTION_RE.search(answer)
+            and _PARTICULAR_MARRIAGE_EXCEPTION_RE.search(answer)
+        )
+        if not (preserves_exceptions_generically or enumerates_both_exception_classes):
             errors.append(
                 "section 14 marriage revocation must preserve its statutory exceptions"
             )
@@ -760,6 +778,7 @@ def evaluate_hk_legal_answer(
     final_response: str,
     attempts: int,
     max_attempts: int = MAX_AUTHORITY_NUDGES,
+    exported_artifact_contents: tuple[str, ...] = (),
 ) -> GateDecision:
     """Return pass, nudge, or fail for a candidate final response."""
     if not (0 <= current_turn_user_idx < len(messages)):
@@ -860,6 +879,13 @@ def evaluate_hk_legal_answer(
     wills_errors = _wills_semantic_errors(
         messages[current_turn_user_idx], final_response
     )
+    for artifact_content in exported_artifact_contents:
+        artifact_errors = _wills_semantic_errors(
+            messages[current_turn_user_idx], artifact_content
+        )
+        wills_errors.extend(
+            f"latest exported artifact: {error}" for error in artifact_errors
+        )
     if wills_errors:
         if attempts < max_attempts:
             return GateDecision(

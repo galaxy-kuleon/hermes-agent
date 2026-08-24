@@ -95,7 +95,10 @@ from agent.hk_legal_authority_gate import (
     MAX_AUTHORITY_NUDGES,
     evaluate_hk_legal_answer,
 )
-from agent.artifact_delivery import ensure_export_links_in_terminal_answer
+from agent.artifact_delivery import (
+    ensure_export_links_in_terminal_answer,
+    latest_successful_export_content,
+)
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
@@ -8215,6 +8218,16 @@ def run_conversation(
                     current_turn_user_idx=current_turn_user_idx,
                     final_response=final_response or "",
                     attempts=hk_legal_authority_nudges,
+                    exported_artifact_contents=tuple(
+                        content
+                        for content in (
+                            latest_successful_export_content(
+                                messages,
+                                current_turn_user_idx=current_turn_user_idx,
+                            ),
+                        )
+                        if content
+                    ),
                 )
 
                 if _hk_legal_decision and _hk_legal_decision.action == "nudge":

@@ -314,6 +314,8 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
         formats = _requested_formats(args.get("formats"))
         stem = sanitize_filename_stem(args.get("filename_stem") or args.get("title") or "export")
         markdown = _build_source_markdown(content, str(args.get("title") or ""))
+        source_content_sha256 = _sha256(content.encode("utf-8"))
+        source_markdown_sha256 = _sha256(markdown.encode("utf-8"))
 
         root = _export_root()
         now = _utc_now()
@@ -389,6 +391,8 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
                     "platform": context.get("platform", ""),
                     "session_id": context.get("session_id", ""),
                 },
+                "source_content_sha256": source_content_sha256,
+                "source_markdown_sha256": source_markdown_sha256,
                 "artifacts": artifact_entries,
             }
             _write_atomic_json(artifact_dir / "manifest.json", manifest)
@@ -397,6 +401,8 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
                     "success": True,
                     "artifact_id": artifact_id,
                     "expires_at": expires_at,
+                    "source_content_sha256": source_content_sha256,
+                    "source_markdown_sha256": source_markdown_sha256,
                     "artifacts": [
                         {
                             key_: value

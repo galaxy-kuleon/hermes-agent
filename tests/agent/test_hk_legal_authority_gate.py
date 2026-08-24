@@ -468,6 +468,45 @@ def test_will_rejects_predeceased_fiction_and_blanket_marriage_revocation():
     assert "does not deem the former spouse" in decision.diagnostics[0]
 
 
+def test_will_rejects_defective_latest_export_even_when_chat_answer_is_correct():
+    prompt = (
+        "Prepare a Hong Kong Last Will under the Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Signing and witnessing follow section 5. Section 14 revocation is subject "
+        "to statutory exceptions. Under section 15, the former spouse's appointment "
+        "as executor or trustee is omitted and any devise or bequest to that spouse "
+        "lapses except where the will shows a contrary intention. Section 10 makes "
+        "the disposition to an attesting witness or spouse void, not the will. "
+        "Current version 2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    defective_artifact = (
+        "Signing and witnessing follow section 5. Section 14 revokes a will on "
+        "marriage except where the will says it should not be revoked. Under section "
+        "15, the former spouse's executor appointment is omitted and a devise or "
+        "bequest to that spouse lapses except where the will shows a contrary "
+        "intention. Section 10 makes the disposition to an attesting witness void, "
+        "not the will."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "10", "14", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+        exported_artifact_contents=(defective_artifact,),
+    )
+
+    assert decision.action == "nudge"
+    assert any(
+        error.startswith("latest exported artifact:")
+        for error in decision.diagnostics
+    )
+
+
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "

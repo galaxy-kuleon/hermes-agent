@@ -1,6 +1,9 @@
 import json
 
-from agent.artifact_delivery import ensure_export_links_in_terminal_answer
+from agent.artifact_delivery import (
+    ensure_export_links_in_terminal_answer,
+    latest_successful_export_content,
+)
 
 
 def _export(markdown: str, *, success: bool = True) -> dict:
@@ -77,3 +80,40 @@ def test_appends_only_missing_link_when_export_has_multiple_formats():
     assert answer.count(docx) == 1
     assert answer.count(pdf) == 1
     assert suffix.endswith(pdf)
+
+
+def test_recovers_latest_successful_export_content_by_call_id():
+    first = "first artifact"
+    final = "final artifact"
+    messages = [
+        {"role": "user", "content": "Create it"},
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "export-1",
+                "function": {
+                    "name": "local_document_export",
+                    "arguments": json.dumps({"content_markdown": first}),
+                },
+            }],
+        },
+        _export("[Download first](http://example/first)"),
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "export-2",
+                "function": {
+                    "name": "local_document_export",
+                    "arguments": json.dumps({"content_markdown": final}),
+                },
+            }],
+        },
+        {
+            **_export("[Download final](http://example/final)"),
+            "tool_call_id": "export-2",
+        },
+    ]
+
+    assert latest_successful_export_content(
+        messages, current_turn_user_idx=0
+    ) == final
