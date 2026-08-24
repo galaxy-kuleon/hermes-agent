@@ -662,6 +662,118 @@ def test_will_allows_explicit_correction_of_mutual_presence_fiction():
     assert decision.action == "pass", decision
 
 
+def test_will_uses_deterministic_handoff_when_artifact_is_clean():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Under section 5, each witness must sign in the presence of each other. "
+        "Current version 2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    export_markdown = (
+        "[Download Will.docx](/api/hermes/v1/artifacts/a/Will.docx/download/t/s)\n"
+        "[Download Will.pdf](/api/hermes/v1/artifacts/a/Will.pdf/download/t/s)"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+            {
+                "role": "tool",
+                "name": "local_document_export",
+                "content": json.dumps(
+                    {"success": True, "markdown": export_markdown}
+                ),
+            },
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=2,
+        exported_artifact_contents=(
+            "THIS IS THE LAST WILL. SIGNED by the testator in the presence of "
+            "two witnesses present at the same time.",
+        ),
+    )
+
+    assert decision.action == "replace"
+    assert export_markdown in decision.message
+    assert "current version 2024-08-18" in decision.message
+    assert "each witness must sign" not in decision.message
+
+
+def test_will_does_not_handoff_artifact_containing_lawyer_notes():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Under section 5, each witness must sign in the presence of each other. "
+        "Current version 2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+            {
+                "role": "tool",
+                "name": "local_document_export",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "markdown": "[Download Will.docx](/api/hermes/will.docx)",
+                    }
+                ),
+            },
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=2,
+        exported_artifact_contents=(
+            "THIS IS THE LAST WILL. LAWYER'S NOTE (Not part of the Will).",
+        ),
+    )
+
+    assert decision.action == "nudge"
+    assert any("client-signature artifact" in row for row in decision.diagnostics)
+
+
+def test_will_does_not_invent_alternate_executor_or_gift_fallback():
+    prompt = (
+        "Prepare a Hong Kong Last Will under the Wills Ordinance. Specific "
+        "Bequest: my home to David. Sole Executor: David."
+    )
+    artifact = (
+        "I APPOINT David to be the sole Executor and Trustee. I APPOINT [full "
+        "name of default appointee] of [address] to be Executor and Trustee in "
+        "default of David. I GIVE my home to David absolutely; should he fail "
+        "to survive me, I GIVE the home to Jackson and Eric."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+            {
+                "role": "tool",
+                "name": "local_document_export",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "markdown": "[Download Will.docx](/api/hermes/will.docx)",
+                    }
+                ),
+            },
+        ],
+        current_turn_user_idx=0,
+        final_response=(
+            "Under section 5, each witness must sign in the presence of each other. "
+            "Current version 2024-08-18: "
+            "https://www.elegislation.gov.hk/hk/cap30!en"
+        ),
+        attempts=2,
+        exported_artifact_contents=(artifact,),
+    )
+
+    assert decision.action == "nudge"
+    assert any("alternate or default executor" in row for row in decision.diagnostics)
+    assert any("unresolved name" in row for row in decision.diagnostics)
+    assert any("dispositive fallback" in row for row in decision.diagnostics)
+
+
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "

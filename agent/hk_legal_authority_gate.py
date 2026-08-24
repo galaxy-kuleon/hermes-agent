@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 
 MAX_AUTHORITY_NUDGES = 5
+WILL_ARTIFACT_REWRITE_NUDGES = 2
 REGISTERED_MARK_REWRITE_NUDGES = 1
 
 _HK_RE = re.compile(r"(?:\bhong\s+kong\b|\bhk\b|香港)", re.IGNORECASE)
@@ -141,6 +142,32 @@ _ESTATE_DUTY_MINIMUM = {"111": frozenset({"2"})}
 _WILL_DOCUMENT_RE = re.compile(
     r"(?:\blast\s+will\b|\bwills?\s+ordinance\b|\bwill\s+template\b|"
     r"\btestament(?:ary)?\b|遺囑|遗嘱)",
+    re.IGNORECASE,
+)
+_CLIENT_SIGNATURE_NOTE_RE = re.compile(
+    r"(?:lawyer['’]s\s+note|drafting\s+notes?|legal\s+analysis|"
+    r"execution\s+checklist|not\s+part\s+of\s+the\s+will)",
+    re.IGNORECASE,
+)
+_SOLE_EXECUTOR_RE = re.compile(r"\bsole\s+executor\b", re.IGNORECASE)
+_UNREQUESTED_ALTERNATE_EXECUTOR_RE = re.compile(
+    r"(?:(?:alternate|substitute|in\s+default\s+of).{0,140}"
+    r"(?:executor|trustee)|(?:executor|trustee).{0,140}"
+    r"(?:alternate|substitute|in\s+default\s+of))",
+    re.IGNORECASE | re.DOTALL,
+)
+_UNRESOLVED_DRAFTING_PLACEHOLDER_RE = re.compile(
+    r"(?:\[\s*full\s+name\b|\[\s*address\s*\]|"
+    r"full\s+name\s+of\s+(?:the\s+)?(?:default|alternate|substitute)\s+appointee)",
+    re.IGNORECASE,
+)
+_SURVIVORSHIP_FALLBACK_RE = re.compile(
+    r"\bshould\b.{0,100}\bfail\s+to\s+survive\s+me\b.{0,260}"
+    r"\b(?:give|devise|bequeath)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_SURVIVORSHIP_FALLBACK_REQUEST_RE = re.compile(
+    r"(?:fail\s+to\s+survive|predeceas|substitute|alternate|fallback)",
     re.IGNORECASE,
 )
 _DIVORCE_RE = re.compile(
@@ -824,6 +851,84 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
     return errors
 
 
+def _will_artifact_errors(user_message: Any, artifact: str) -> list[str]:
+    errors = _wills_semantic_errors(user_message, artifact)
+    user_text = _message_text(user_message)
+    if _WILL_DOCUMENT_RE.search(user_text) and _CLIENT_SIGNATURE_NOTE_RE.search(
+        artifact
+    ):
+        errors.append(
+            "the client-signature artifact must contain only the operative will and "
+            "attestation blocks, not lawyer notes, legal analysis, or a checklist"
+        )
+    if (
+        _SOLE_EXECUTOR_RE.search(user_text)
+        and _UNREQUESTED_ALTERNATE_EXECUTOR_RE.search(artifact)
+    ):
+        errors.append(
+            "the artifact must not invent an alternate or default executor when the "
+            "instructions appoint one sole executor"
+        )
+    if _UNRESOLVED_DRAFTING_PLACEHOLDER_RE.search(artifact):
+        errors.append(
+            "the artifact must not contain unresolved name, address, or appointee "
+            "placeholders"
+        )
+    if (
+        _SURVIVORSHIP_FALLBACK_RE.search(artifact)
+        and not _SURVIVORSHIP_FALLBACK_REQUEST_RE.search(user_text)
+    ):
+        errors.append(
+            "the artifact must not invent an alternate beneficiary or dispositive "
+            "fallback that the client's instructions did not provide"
+        )
+    return errors
+
+
+def _latest_export_markdown(messages: list[Any], current_turn_user_idx: int) -> str:
+    latest = ""
+    for message in messages[current_turn_user_idx + 1 :]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "tool" or message.get("name") != "local_document_export":
+            continue
+        try:
+            payload = json.loads(str(message.get("content") or ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            continue
+        markdown = payload.get("markdown")
+        if isinstance(markdown, str) and markdown.strip():
+            latest = markdown.strip()
+    return latest
+
+
+def _deterministic_will_artifact_handoff(
+    messages: list[Any], current_turn_user_idx: int, authorities: list[dict[str, Any]]
+) -> str:
+    links = _latest_export_markdown(messages, current_turn_user_idx)
+    citations = "\n".join(
+        "- "
+        + (
+            authority["required_answer_citation"]
+            or (
+                f"Hong Kong e-Legislation, Cap. {authority['chapter']}, current "
+                f"version {authority['version_date']}: {authority['official_web_url']}"
+            )
+        )
+        for authority in authorities
+    )
+    return (
+        "The requested client-signature Will has been prepared. The files contain "
+        "the operative Will and attestation blocks only; unrequested statutory "
+        "analysis has been omitted from the document and this handoff.\n\n"
+        f"{links}\n\nOfficial sources checked during preparation:\n{citations}\n\n"
+        "Please have the final document reviewed by a qualified Hong Kong lawyer "
+        "before execution."
+    )
+
+
 def _confuses_opposition_with_post_registration_invalidity(
     user_message: Any, answer: str
 ) -> bool:
@@ -946,17 +1051,35 @@ def evaluate_hk_legal_answer(
             "第2條所載的適用截止日期。為免誤導，本次不提供日期錯誤的法律結論。",
         )
 
-    wills_errors = _wills_semantic_errors(
+    answer_wills_errors = _wills_semantic_errors(
         messages[current_turn_user_idx], final_response
     )
+    artifact_wills_errors: list[str] = []
     for artifact_content in exported_artifact_contents:
-        artifact_errors = _wills_semantic_errors(
+        artifact_errors = _will_artifact_errors(
             messages[current_turn_user_idx], artifact_content
         )
-        wills_errors.extend(
+        artifact_wills_errors.extend(
             f"latest exported artifact: {error}" for error in artifact_errors
         )
+    wills_errors = answer_wills_errors + artifact_wills_errors
     if wills_errors:
+        will_rewrite_limit = min(max_attempts, WILL_ARTIFACT_REWRITE_NUDGES)
+        export_markdown = _latest_export_markdown(messages, current_turn_user_idx)
+        if (
+            attempts >= will_rewrite_limit
+            and answer_wills_errors
+            and not artifact_wills_errors
+            and exported_artifact_contents
+            and export_markdown
+        ):
+            return GateDecision(
+                "replace",
+                _deterministic_will_artifact_handoff(
+                    messages, current_turn_user_idx, authorities
+                ),
+                tuple(wills_errors),
+            )
         if attempts < max_attempts:
             return GateDecision(
                 "nudge",
