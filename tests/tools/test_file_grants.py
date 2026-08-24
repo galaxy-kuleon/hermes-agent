@@ -73,38 +73,100 @@ def test_shared_workspace_search_is_denied_before_search_io(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("path", "expected"),
+    ("path", "expected_name", "expected_file"),
     [
         (
             "/home/hermes/skills/legal/tw-tmc/SKILL.md",
-            "skill_view(name='legal/tw-tmc')",
+            "legal/tw-tmc",
+            None,
         ),
         (
             "~/skills/tw-tmc/references/class-35.md",
-            "skill_view(name='tw-tmc', file_path='references/class-35.md')",
+            "tw-tmc",
+            "references/class-35.md",
         ),
         (
             "/home/hermes/user-skills/user-123/tw-item-pick/SKILL.md",
-            "skill_view(name='tw-item-pick')",
+            "tw-item-pick",
+            None,
         ),
         (
             "/home/hermes/./skills/tw-tmc/references/class-14.md",
-            "skill_view(name='tw-tmc', file_path='references/class-14.md')",
+            "tw-tmc",
+            "references/class-14.md",
         ),
     ],
 )
-def test_ungranted_skill_path_points_to_skill_view_without_relaxing_acl(
-    tmp_path, path, expected
+def test_exact_skill_path_is_safely_routed_through_skill_view(
+    tmp_path, path, expected_name, expected_file
 ):
     allowed = tmp_path / "attached.txt"
+    skill_payload = json.dumps(
+        {"success": True, "name": expected_name, "content": "authoritative source"}
+    )
 
-    with _file_grant_scope("task-1", [str(allowed)]):
+    with _file_grant_scope("task-1", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=skill_payload,
+    ) as routed, patch(
+        "tools.file_tools._get_file_ops",
+        side_effect=AssertionError("skill paths must not reach file I/O"),
+    ):
+        result = json.loads(read_file_tool(path, task_id="task-1"))
+
+    assert result["success"] is True
+    assert result["content"] == "authoritative source"
+    assert result["content_returned"] is True
+    assert result["routing"]["from_tool"] == "read_file"
+    assert result["routing"]["to_tool"] == "skill_view"
+    routed.assert_called_once_with(
+        {"name": expected_name, **({"file_path": expected_file} if expected_file else {})},
+        task_id="task-1",
+    )
+
+
+def test_exact_skill_search_routes_to_full_skill_view_content(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    path = "/home/hermes/skills/legal/tw-tmc/references/class-35.md"
+
+    with _file_grant_scope("task-1", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=json.dumps(
+            {"success": True, "name": "tw-tmc", "content": "351914 jewelry retail"}
+        ),
+    ) as routed, patch(
+        "tools.file_tools._get_file_ops",
+        side_effect=AssertionError("skill paths must not reach search I/O"),
+    ):
+        result = json.loads(
+            search_tool("351914", path=path, task_id="task-1")
+        )
+
+    assert result["content"] == "351914 jewelry retail"
+    assert result["routing"]["from_tool"] == "search_files"
+    assert result["routing"]["requested_pattern"] == "351914"
+    routed.assert_called_once_with(
+        {"name": "legal/tw-tmc", "file_path": "references/class-35.md"},
+        task_id="task-1",
+    )
+
+
+def test_skill_auto_route_preserves_skill_acl_denial(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    path = "/home/hermes/skills/legal/tw-tmc/references/class-35.md"
+
+    with _file_grant_scope("task-1", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=json.dumps({"success": False, "error": "skill ACL denied"}),
+    ), patch(
+        "tools.file_tools._get_file_ops",
+        side_effect=AssertionError("denied skill paths must not reach file I/O"),
+    ):
         result = json.loads(read_file_tool(path, task_id="task-1"))
 
     assert result["success"] is False
-    assert "not granted" in result["error"].lower()
-    assert "do not retry read_file/search_files" in result["error"]
-    assert expected in result["error"]
+    assert result["error"] == "skill ACL denied"
+    assert result["routing"]["to_tool"] == "skill_view"
 
 
 def test_grants_do_not_leak_to_another_task(tmp_path):

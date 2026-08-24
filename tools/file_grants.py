@@ -181,14 +181,15 @@ def _known_handles_hint(task_id: str) -> str:
     return f" Valid handles this request: {listed}."
 
 
-def _skill_view_hint(path: str | Path) -> str:
-    """Return an exact safe-tool hint for a model-authored skill path.
+def skill_view_target_for_path(path: str | Path) -> dict[str, str] | None:
+    """Return the exact ``skill_view`` arguments for one skill file path.
 
     Request-scoped OpenWebUI file grants deliberately do not authorize the
     agent's HOME or skill tree. Models nevertheless sometimes copy an on-disk
     path from skill content and retry it with ``read_file``/``search_files``.
-    Point them at the already-authorized skill API without weakening the file
-    grant or skill ACL boundary.
+    Keep path parsing here so both the denial hint and the file tools' safe
+    auto-route use the same target. The target is not authorization:
+    ``skill_view`` still enforces the skill ACL when invoked.
     """
     normalized = str(path).replace("\\", "/").rstrip("/")
     while "/./" in normalized:
@@ -200,17 +201,17 @@ def _skill_view_hint(path: str | Path) -> str:
         # skill_view expects only the skill-relative part.
         user_parts = relative.split("/", 1)
         if len(user_parts) != 2:
-            return ""
+            return None
         relative = user_parts[1]
     elif "/skills/" in normalized:
         relative = normalized.split("/skills/", 1)[1].strip("/")
     else:
-        return ""
+        return None
     if not relative:
-        return ""
+        return None
     parts = [part for part in relative.split("/") if part]
     if not parts:
-        return ""
+        return None
 
     file_path = ""
     if parts[-1] == "SKILL.md":
@@ -221,17 +222,31 @@ def _skill_view_hint(path: str | Path) -> str:
             None,
         )
         if support_index is None or support_index == 0:
-            return ""
+            return None
         skill_parts = parts[:support_index]
         file_path = "/".join(parts[support_index:])
     if not skill_parts:
-        return ""
+        return None
 
     skill_name = "/".join(skill_parts)
+    target = {"name": skill_name}
     if file_path and parts[-1] not in _SKILL_SUPPORT_DIRS:
-        call = f"skill_view(name={skill_name!r}, file_path={file_path!r})"
+        target["file_path"] = file_path
+    return target
+
+
+def _skill_view_hint(path: str | Path) -> str:
+    """Return an exact safe-tool hint for a model-authored skill path."""
+    target = skill_view_target_for_path(path)
+    if target is None:
+        return ""
+    if target.get("file_path"):
+        call = (
+            f"skill_view(name={target['name']!r}, "
+            f"file_path={target['file_path']!r})"
+        )
     else:
-        call = f"skill_view(name={skill_name!r})"
+        call = f"skill_view(name={target['name']!r})"
     return (
         f" This is a skill path: do not retry read_file/search_files. Use {call}; "
         "skill_view enforces the skill ACL and lists linked files."

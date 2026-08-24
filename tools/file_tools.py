@@ -2328,6 +2328,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     from tools import request_file_cache
     from tools.file_grants import resolve_grant_alias
 
+    routed = _route_exact_skill_file(
+        path,
+        task_id=task_id,
+        source_tool="read_file",
+    )
+    if routed is not None:
+        return routed
+
     resolved_arg = resolve_grant_alias(path, task_id=task_id)
     handle = str(path).strip() if resolved_arg != str(path) else ""
     requested_offset = offset
@@ -3736,11 +3744,68 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(e))
 
 
+def _route_exact_skill_file(
+    path: str,
+    *,
+    task_id: str,
+    source_tool: str,
+    requested_pattern: str | None = None,
+) -> str | None:
+    """Safely redirect an exact skill-file read to the skill API.
+
+    This does not grant file access. ``skill_view`` performs its normal ACL
+    check, path containment validation, linked-file validation, and output
+    handling. Directory searches and non-skill paths deliberately fall through
+    to the ordinary file-grant boundary.
+    """
+    from tools.file_grants import skill_view_target_for_path
+
+    target = skill_view_target_for_path(path)
+    if target is None:
+        return None
+
+    from tools.skills_tool import _skill_view_with_bump
+
+    result = _skill_view_with_bump(target, task_id=task_id)
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(payload, dict):
+        return result
+    payload["routing"] = {
+        "from_tool": source_tool,
+        "to_tool": "skill_view",
+        "reason": "exact_skill_file_path",
+        "requested_path": str(path),
+        "skill_name": target["name"],
+        "file_path": target.get("file_path"),
+    }
+    if requested_pattern is not None:
+        payload["routing"]["requested_pattern"] = requested_pattern
+        payload["routing"]["note"] = (
+            "The complete authoritative skill file is returned; search it in "
+            "the supplied content without retrying file tools."
+        )
+    payload["content_returned"] = isinstance(payload.get("content"), str)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
                 task_id: str = "default") -> str:
     """Search for content or files."""
+    if target == "content":
+        routed = _route_exact_skill_file(
+            path,
+            task_id=task_id,
+            source_tool="search_files",
+            requested_pattern=pattern,
+        )
+        if routed is not None:
+            return routed
+
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
