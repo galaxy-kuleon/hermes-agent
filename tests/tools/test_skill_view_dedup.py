@@ -62,14 +62,15 @@ class TestSkillViewDedup:
         assert "Step two" in r2.get("content", "")
         assert r2.get("dedup") is None
 
-    def test_linked_file_dedup_is_independent(self, skills_home):
+    def test_explicit_linked_file_reread_returns_full_content(self, skills_home):
         _view("demo-dedup-skill")
-        # First view of a DIFFERENT file within the skill: full content.
+        # Linked references are task data. Explicit re-reads must never point
+        # at distant or pruned content with an unchanged stub.
         r = _view("demo-dedup-skill", file_path="references/guide.md")
         assert "Detailed reference" in r.get("content", "")
-        # Repeat of that file: stub.
         r2 = _view("demo-dedup-skill", file_path="references/guide.md")
-        assert r2.get("dedup") is True
+        assert "Detailed reference" in r2.get("content", "")
+        assert r2.get("dedup") is None
 
     def test_different_tasks_do_not_share_cache(self, skills_home):
         _view("demo-dedup-skill", task="task-A")

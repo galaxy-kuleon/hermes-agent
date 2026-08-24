@@ -2168,6 +2168,12 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
     to this task and is unchanged on disk; None otherwise."""
     if not task_id:
         return None
+    # A linked reference is task data, not merely repeated instructions. When
+    # the model explicitly asks for it again, serve the exact bytes again: the
+    # earlier result may be distant, proactively pruned, or simply no longer
+    # salient. Main SKILL.md remains deduped and compression resets its cache.
+    if file_path:
+        return None
     with _skill_view_tracker_lock:
         cache = _skill_view_tracker.get(str(task_id))
         if not cache:

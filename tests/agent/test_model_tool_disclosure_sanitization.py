@@ -7,6 +7,7 @@ from agent.chat_completion_helpers import build_assistant_message
 from agent.conversation_loop import _is_action_only_after_tool_disclosure
 from agent.message_sanitization import (
     ToolDisclosureStreamScrubber,
+    strip_internal_deliberation_tail,
     strip_model_tool_disclosures,
 )
 
@@ -73,6 +74,29 @@ def test_stream_scrubber_handles_every_opener_chunk_boundary():
         got += scrubber.flush()
         assert got == "Before  After"
         assert scrubber.removed_blocks == 1
+
+
+def test_internal_deliberation_tail_is_removed_at_final_boundary():
+    source = (
+        "Class 14: item list complete.\n\n"
+        "Let's analyze the situation. The user is asking for a retry."
+    )
+    assert strip_internal_deliberation_tail(source) == "Class 14: item list complete."
+    assert strip_internal_deliberation_tail("Let's analyze this public issue.") == (
+        "Let's analyze this public issue."
+    )
+
+
+def test_stream_scrubber_blocks_internal_tail_across_every_chunk_boundary():
+    visible = "Class 14: item list complete."
+    private = "\nLet's analyze the situation. The user needs a response."
+    source = visible + private
+    for split in range(1, len(source)):
+        scrubber = ToolDisclosureStreamScrubber()
+        got = scrubber.feed(source[:split])
+        got += scrubber.feed(source[split:])
+        got += scrubber.flush()
+        assert got == visible
 
 
 def test_history_and_storage_boundaries_strip_but_keep_raw_input_unchanged():

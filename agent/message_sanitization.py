@@ -43,6 +43,19 @@ _DETAILS_TYPE_RE = re.compile(
     r"\btype\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
     re.IGNORECASE,
 )
+_INTERNAL_DELIBERATION_TAIL_RE = re.compile(
+    r"\n(?:let['’]s analyze the situation\.\s+the user\b|"
+    r"we need (?:to )?(?:answer|respond to) the user\b)",
+    re.IGNORECASE,
+)
+_INTERNAL_DELIBERATION_PREFIXES = (
+    "\nlet's analyze the situation. the user",
+    "\nlet’s analyze the situation. the user",
+    "\nwe need answer the user",
+    "\nwe need to answer the user",
+    "\nwe need respond to the user",
+    "\nwe need to respond to the user",
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +122,20 @@ def strip_model_tool_disclosures(text: str) -> ToolDisclosureSanitization:
     )
 
 
+def strip_internal_deliberation_tail(text: str) -> str:
+    """Drop a plain-content private scratchpad appended after a real answer.
+
+    Some local models occasionally switch from a complete user-facing answer
+    into explicit self-addressed planning without using a reasoning channel.
+    Match only high-specificity line-start phrases that name ``the user``;
+    ordinary explanations containing words like "analyze" remain untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return text if isinstance(text, str) else ""
+    marker = _INTERNAL_DELIBERATION_TAIL_RE.search(text)
+    return text[: marker.start()].rstrip() if marker else text
+
+
 class ToolDisclosureStreamScrubber:
     """Incrementally suppress unauthenticated tool disclosures.
 
@@ -120,6 +147,7 @@ class ToolDisclosureStreamScrubber:
     def __init__(self) -> None:
         self._buffer = ""
         self._dropping = False
+        self._dropping_internal = False
         self.removed_blocks = 0
         self.removed_chars = 0
         self.had_unclosed_block = False
@@ -140,6 +168,10 @@ class ToolDisclosureStreamScrubber:
         out: list[str] = []
 
         while self._buffer:
+            if self._dropping_internal:
+                self.removed_chars += len(self._buffer)
+                self._buffer = ""
+                return "".join(out)
             if self._dropping:
                 close = _DETAILS_CLOSE_RE.search(self._buffer)
                 if close is None:
@@ -156,9 +188,26 @@ class ToolDisclosureStreamScrubber:
                 continue
 
             lowered = self._buffer.lower()
-            start = lowered.find(_DETAILS_PREFIX)
+            starts = [
+                pos
+                for pos in (
+                    lowered.find(_DETAILS_PREFIX),
+                    *(
+                        lowered.find(prefix)
+                        for prefix in _INTERNAL_DELIBERATION_PREFIXES
+                    ),
+                )
+                if pos >= 0
+            ]
+            start = min(starts) if starts else -1
             if start < 0:
-                keep = self._boundary_keep(self._buffer)
+                keep = max(
+                    self._boundary_keep(self._buffer),
+                    *(
+                        self._boundary_keep(self._buffer, prefix)
+                        for prefix in _INTERNAL_DELIBERATION_PREFIXES
+                    ),
+                )
                 emit_to = len(self._buffer) - keep
                 out.append(self._buffer[:emit_to])
                 self._buffer = self._buffer[emit_to:]
@@ -166,6 +215,14 @@ class ToolDisclosureStreamScrubber:
 
             out.append(self._buffer[:start])
             self._buffer = self._buffer[start:]
+            if any(
+                self._buffer.lower().startswith(prefix)
+                for prefix in _INTERNAL_DELIBERATION_PREFIXES
+            ):
+                self.removed_chars += len(self._buffer)
+                self._buffer = ""
+                self._dropping_internal = True
+                break
             opening = _DETAILS_OPEN_RE.match(self._buffer)
             if opening is None:
                 # The opener is split across chunks or lacks its closing '>'.
@@ -182,6 +239,12 @@ class ToolDisclosureStreamScrubber:
         return "".join(out)
 
     def flush(self) -> str:
+        if self._dropping_internal:
+            self.had_unclosed_block = True
+            self.removed_chars += len(self._buffer)
+            self._buffer = ""
+            self._dropping_internal = False
+            return ""
         if self._dropping:
             self.had_unclosed_block = True
             self.removed_chars += len(self._buffer)

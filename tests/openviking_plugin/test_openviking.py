@@ -128,6 +128,21 @@ def make_prefetch_provider(monkeypatch, responses, **env):
     return provider
 
 
+def test_system_prompt_does_not_tax_active_chat_followups_with_retrieval():
+    provider = OpenVikingMemoryProvider.__new__(OpenVikingMemoryProvider)
+    provider._endpoint = "http://openviking.test"
+    provider._client = FakeVikingClient(
+        {("/api/v1/fs/ls", (("uri", "viking://"),)): {"result": ["memory"]}}
+    )
+    provider._ensure_client = lambda: provider._client
+
+    block = provider.system_prompt_block()
+
+    assert "Use the active chat first for conversational follow-ups" in block
+    assert "Do not search OpenViking merely because" in block
+    assert "the skill is the canonical durable record" in block
+
+
 def wait_prefetch(provider, query="What should we recall?", session_id="session-test"):
     return provider.prefetch(query, session_id=session_id)
 

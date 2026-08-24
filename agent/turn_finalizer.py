@@ -28,7 +28,10 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
-from agent.message_sanitization import _sanitize_surrogates
+from agent.message_sanitization import (
+    _sanitize_surrogates,
+    strip_internal_deliberation_tail,
+)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -254,6 +257,19 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
+
+    if isinstance(final_response, str):
+        raw_final_response = final_response
+        final_response = strip_internal_deliberation_tail(final_response)
+        if final_response != raw_final_response:
+            for message in reversed(messages):
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and message.get("content") == raw_final_response
+                ):
+                    message["content"] = final_response
+                    break
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
