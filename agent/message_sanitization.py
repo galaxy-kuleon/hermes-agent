@@ -44,8 +44,10 @@ _DETAILS_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 _INTERNAL_DELIBERATION_TAIL_RE = re.compile(
-    r"\n(?:let['’]s analyze the situation\.\s+the user\b|"
-    r"we need (?:to )?(?:answer|respond to) the user\b)",
+    r"(?:\n(?:let['’]s analyze the situation\.\s+the user\b|"
+    r"we need (?:to )?(?:answer|respond to) the user\b)|"
+    r"(?<=[\n.!?。！？])(?:the question from the previous user\s*:|"
+    r"the user['’]s question was (?:as follows|simple)\s*:))",
     re.IGNORECASE,
 )
 _INTERNAL_DELIBERATION_PREFIXES = (
@@ -56,6 +58,14 @@ _INTERNAL_DELIBERATION_PREFIXES = (
     "\nwe need respond to the user",
     "\nwe need to respond to the user",
 )
+_INTERNAL_META_PREFIXES = (
+    "the question from the previous user:",
+    "the user's question was as follows:",
+    "the user’s question was as follows:",
+    "the user's question was simple:",
+    "the user’s question was simple:",
+)
+_INTERNAL_META_BOUNDARY_CHARS = frozenset("\n.!?。！？")
 
 
 @dataclass(frozen=True)
@@ -146,6 +156,7 @@ class ToolDisclosureStreamScrubber:
 
     def __init__(self) -> None:
         self._buffer = ""
+        self._visible_tail = ""
         self._dropping = False
         self._dropping_internal = False
         self.removed_blocks = 0
@@ -166,6 +177,35 @@ class ToolDisclosureStreamScrubber:
             return ""
         self._buffer += chunk
         out: list[str] = []
+
+        def emit(value: str) -> None:
+            if not value:
+                return
+            out.append(value)
+            self._visible_tail = value[-1]
+
+        def meta_starts(lowered: str) -> list[int]:
+            """Find private meta markers only after an answer boundary.
+
+            A response may legitimately begin with "The user's question...".
+            The leak shape is different: the model first emits a complete
+            answer, then starts self-addressed drafting after punctuation.
+            """
+            found: list[int] = []
+            for prefix in _INTERNAL_META_PREFIXES:
+                cursor = 0
+                while True:
+                    pos = lowered.find(prefix, cursor)
+                    if pos < 0:
+                        break
+                    previous = (
+                        self._buffer[pos - 1] if pos > 0 else self._visible_tail
+                    )
+                    if previous in _INTERNAL_META_BOUNDARY_CHARS:
+                        found.append(pos)
+                        break
+                    cursor = pos + 1
+            return found
 
         while self._buffer:
             if self._dropping_internal:
@@ -196,6 +236,7 @@ class ToolDisclosureStreamScrubber:
                         lowered.find(prefix)
                         for prefix in _INTERNAL_DELIBERATION_PREFIXES
                     ),
+                    *meta_starts(lowered),
                 )
                 if pos >= 0
             ]
@@ -205,19 +246,25 @@ class ToolDisclosureStreamScrubber:
                     self._boundary_keep(self._buffer),
                     *(
                         self._boundary_keep(self._buffer, prefix)
-                        for prefix in _INTERNAL_DELIBERATION_PREFIXES
+                        for prefix in (
+                            *_INTERNAL_DELIBERATION_PREFIXES,
+                            *_INTERNAL_META_PREFIXES,
+                        )
                     ),
                 )
                 emit_to = len(self._buffer) - keep
-                out.append(self._buffer[:emit_to])
+                emit(self._buffer[:emit_to])
                 self._buffer = self._buffer[emit_to:]
                 break
 
-            out.append(self._buffer[:start])
+            emit(self._buffer[:start])
             self._buffer = self._buffer[start:]
             if any(
                 self._buffer.lower().startswith(prefix)
-                for prefix in _INTERNAL_DELIBERATION_PREFIXES
+                for prefix in (
+                    *_INTERNAL_DELIBERATION_PREFIXES,
+                    *_INTERNAL_META_PREFIXES,
+                )
             ):
                 self.removed_chars += len(self._buffer)
                 self._buffer = ""
@@ -234,7 +281,7 @@ class ToolDisclosureStreamScrubber:
                 self.removed_chars += len(opening_text)
                 self._dropping = True
             else:
-                out.append(opening_text)
+                emit(opening_text)
 
         return "".join(out)
 
@@ -251,7 +298,9 @@ class ToolDisclosureStreamScrubber:
             self._buffer = ""
             self._dropping = False
             return ""
-        result = strip_model_tool_disclosures(self._buffer)
+        result = strip_model_tool_disclosures(
+            strip_internal_deliberation_tail(self._buffer)
+        )
         self.removed_blocks += result.removed_blocks
         self.removed_chars += result.removed_chars
         self.had_unclosed_block = (

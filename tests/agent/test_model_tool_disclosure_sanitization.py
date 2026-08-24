@@ -99,6 +99,31 @@ def test_stream_scrubber_blocks_internal_tail_across_every_chunk_boundary():
         assert got == visible
 
 
+def test_self_rewrite_meta_tail_is_removed_without_requiring_a_newline():
+    visible = "Good news: no re-upload needed. I verified all 45 files."
+    private = (
+        "The question from the previous user: \"Should I re-upload?\"\n\n"
+        "I've now confirmed the database exists. Reply in plain text.\n\n"
+        "Good news: you don't need to re-upload anything."
+    )
+    source = visible + private
+
+    assert strip_internal_deliberation_tail(source) == visible
+    for split in range(1, len(source)):
+        scrubber = ToolDisclosureStreamScrubber()
+        got = scrubber.feed(source[:split])
+        got += scrubber.feed(source[split:])
+        got += scrubber.flush()
+        assert got == visible
+
+
+def test_meta_phrase_at_start_is_preserved_as_user_facing_prose():
+    source = "The user's question was simple: which class should I select?"
+    assert strip_internal_deliberation_tail(source) == source
+    scrubber = ToolDisclosureStreamScrubber()
+    assert scrubber.feed(source) + scrubber.flush() == source
+
+
 def test_history_and_storage_boundaries_strip_but_keep_raw_input_unchanged():
     fake = (
         "Let me update it. <details type=\"skill_manage\" name=\"x\">"
