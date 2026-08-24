@@ -436,6 +436,35 @@ def test_will_rejects_wrong_sections_after_required_authority_was_read():
     assert "regenerate the artifact" in decision.message
 
 
+def test_will_rejects_predeceased_fiction_and_blanket_marriage_revocation():
+    prompt = (
+        "Prepare a Last Will under the Hong Kong Wills Ordinance. "
+        "Spouse status: divorced."
+    )
+    answer = (
+        "Under Cap. 30 section 15, divorce revokes any disposition or appointment "
+        "for the former spouse, who is treated as having predeceased the testator. "
+        "Remarriage automatically revokes the will under section 14. Signing and "
+        "witnessing follow section 5. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "14", "15"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "does not deem the former spouse to have predeceased" in decision.message
+    assert "executor/trustee appointment is omitted" in decision.message
+    assert "devise or bequest" in decision.message
+    assert "statutory exceptions" in decision.message
+    assert "regenerate the artifact" in decision.message
+
+
 def test_will_accepts_correct_execution_divorce_and_remarriage_sections():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "

@@ -162,6 +162,33 @@ _WILL_EFFECT_RE = re.compile(
     r"撤銷|撤销|失效|略去|處置|处置|委任|遺贈|遗赠)",
     re.IGNORECASE,
 )
+_PREDECEASED_RE = re.compile(
+    r"(?:\bpredeceas(?:e|ed)\b|\btreated\s+as\s+(?:having\s+)?died\b|"
+    r"視為先於.{0,20}去世|视为先于.{0,20}去世|視為已死亡|视为已死亡)",
+    re.IGNORECASE,
+)
+_APPOINTMENT_OMITTED_RE = re.compile(
+    r"(?:\bappointment\b.{0,180}\bformer\s+spouse\b.{0,180}\bomitt?ed\b|"
+    r"\bformer\s+spouse\b.{0,180}\bappointment\b.{0,180}\bomitt?ed\b|"
+    r"前配偶.{0,100}(?:遺囑執行人|遗嘱执行人|受託人|受托人).{0,100}(?:略去|刪除|删除))",
+    re.IGNORECASE | re.DOTALL,
+)
+_DEVISE_BEQUEST_LAPSE_RE = re.compile(
+    r"(?:\bformer\s+spouse\b.{0,240}\b(?:devise|bequest)\b.{0,140}\blapse[ds]?\b|"
+    r"\b(?:devise|bequest)\b.{0,240}\bformer\s+spouse\b.{0,140}\blapse[ds]?\b|"
+    r"前配偶.{0,160}(?:遺贈|遗赠).{0,100}(?:失效|無效|无效))",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTRARY_INTENTION_RE = re.compile(
+    r"(?:\bcontrary\s+intention\b|\bunless\b.{0,120}\bwill\b|"
+    r"遺囑.{0,80}相反意圖|遗嘱.{0,80}相反意图)",
+    re.IGNORECASE | re.DOTALL,
+)
+_STATUTORY_EXCEPTION_RE = re.compile(
+    r"(?:\bsubject\s+to\b.{0,100}\bexceptions?\b|\bstatutory\s+exceptions?\b|"
+    r"\bunless\b.{0,160}\b(?:marriage|will)\b|法定例外|除外情況|例外情形)",
+    re.IGNORECASE | re.DOTALL,
+)
 _SECTION_5_RE = re.compile(r"(?:(?:section|s\.?)\s*5\b|第\s*5\s*條)", re.IGNORECASE)
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
@@ -583,20 +610,42 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         errors.append(
             "signing and witnessing requirements must be tied to Cap. 30 section 5"
         )
-    if _near(answer, _DIVORCE_RE, _WILL_EFFECT_RE, distance=420) and not _near(
-        answer, _DIVORCE_RE, _SECTION_15_RE, distance=420
-    ):
-        errors.append(
-            "the effect of divorce, dissolution, or annulment on a will must be "
-            "tied to Cap. 30 section 15"
-        )
-    if _near(answer, _MARRIAGE_RE, _WILL_EFFECT_RE, distance=420) and not _near(
-        answer, _MARRIAGE_RE, _SECTION_14_RE, distance=420
-    ):
-        errors.append(
-            "the effect of marriage or remarriage on a will must be tied to "
-            "Cap. 30 section 14"
-        )
+    discusses_divorce_effect = _near(answer, _DIVORCE_RE, _WILL_EFFECT_RE, distance=420)
+    if discusses_divorce_effect:
+        if not _near(answer, _DIVORCE_RE, _SECTION_15_RE, distance=420):
+            errors.append(
+                "the effect of divorce, dissolution, or annulment on a will must be "
+                "tied to Cap. 30 section 15"
+            )
+        if _near(answer, _DIVORCE_RE, _PREDECEASED_RE, distance=520):
+            errors.append(
+                "Cap. 30 section 15 does not deem the former spouse to have "
+                "predeceased the testator"
+            )
+        if not (
+            _APPOINTMENT_OMITTED_RE.search(answer)
+            and _DEVISE_BEQUEST_LAPSE_RE.search(answer)
+            and _CONTRARY_INTENTION_RE.search(answer)
+        ):
+            errors.append(
+                "section 15 must state its actual mechanism: a former spouse's "
+                "executor/trustee appointment is omitted, and a devise or bequest "
+                "to that spouse lapses except where the will shows a contrary intention"
+            )
+
+    discusses_marriage_effect = _near(
+        answer, _MARRIAGE_RE, _WILL_EFFECT_RE, distance=420
+    )
+    if discusses_marriage_effect:
+        if not _near(answer, _MARRIAGE_RE, _SECTION_14_RE, distance=420):
+            errors.append(
+                "the effect of marriage or remarriage on a will must be tied to "
+                "Cap. 30 section 14"
+            )
+        if not _STATUTORY_EXCEPTION_RE.search(answer):
+            errors.append(
+                "section 14 marriage revocation must preserve its statutory exceptions"
+            )
     return errors
 
 
