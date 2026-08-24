@@ -108,6 +108,30 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _reset_tool_read_dedup_after_context_rewrite(task_id: str | None) -> None:
+    """Re-arm exact reads after transcript content has been rewritten.
+
+    ``read_file`` and ``skill_view`` dedup stubs are safe only while the full
+    earlier result is still present in model context.  A committed proactive
+    prune is a context boundary just like full compression: old tool bodies can
+    be summarized or replaced, so the next identical read must return content.
+    Keep the resets best-effort so observability/cost guards can never break the
+    conversation loop.
+    """
+    try:
+        from tools.file_tools import reset_file_dedup
+
+        reset_file_dedup(task_id)
+    except Exception:
+        logger.debug("file-read dedup reset after context rewrite failed", exc_info=True)
+    try:
+        from tools.skills_tool import reset_skill_view_dedup
+
+        reset_skill_view_dedup(task_id)
+    except Exception:
+        logger.debug("skill-view dedup reset after context rewrite failed", exc_info=True)
+
+
 def _completed_registered_mark_research_in_batch(
     messages: list[Any], tool_calls: list[Any]
 ) -> bool:
@@ -7534,6 +7558,9 @@ def run_conversation(
                             # this turn's fresh, not-yet-persisted rows into history_ids
                             # and skip writing them.
                             messages = _pruned_msgs
+                            _reset_tool_read_dedup_after_context_rewrite(
+                                effective_task_id
+                            )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

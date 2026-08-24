@@ -92,3 +92,33 @@ class TestSkillViewDedup:
         # conversation_compression imports this lazily; keep the seam stable.
         from tools.skills_tool import reset_skill_view_dedup as f
         f(None)
+
+    def test_proactive_context_rewrite_rearms_full_skill_view(self, skills_home):
+        """A prune cannot leave a stub pointing at content it removed."""
+        from agent.conversation_loop import (
+            _reset_tool_read_dedup_after_context_rewrite,
+        )
+
+        _view("demo-dedup-skill")
+        assert _view("demo-dedup-skill").get("content_returned") is False
+
+        _reset_tool_read_dedup_after_context_rewrite("t-svd")
+
+        refreshed = _view("demo-dedup-skill")
+        assert "Step one" in refreshed.get("content", "")
+        assert refreshed.get("dedup") is None
+
+    def test_proactive_context_rewrite_resets_both_read_caches(self):
+        from unittest.mock import patch
+
+        from agent.conversation_loop import (
+            _reset_tool_read_dedup_after_context_rewrite,
+        )
+
+        with patch("tools.file_tools.reset_file_dedup") as reset_file, patch(
+            "tools.skills_tool.reset_skill_view_dedup"
+        ) as reset_skill:
+            _reset_tool_read_dedup_after_context_rewrite("task-42")
+
+        reset_file.assert_called_once_with("task-42")
+        reset_skill.assert_called_once_with("task-42")
