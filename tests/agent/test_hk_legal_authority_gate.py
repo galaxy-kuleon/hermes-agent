@@ -97,6 +97,37 @@ def _rule_13_authority_message():
     }
 
 
+def _estate_duty_authority_message(*provisions: str):
+    texts = {
+        "1": "1. Short title This Ordinance may be cited as the Estate Duty Ordinance.",
+        "2": (
+            "2. Application This Ordinance shall apply in the case of every "
+            "deceased person who dies on or after 1 January 1916 and before "
+            "11 February 2006."
+        ),
+    }
+    return {
+        "role": "tool",
+        "name": "hk_legal_authority",
+        "tool_call_id": "call-estate-duty",
+        "content": json.dumps({
+            "success": True,
+            "cannot_confirm": False,
+            "chapter": "111",
+            "version_date": "2022-07-01T00:00:00",
+            "official_web_url": "https://www.elegislation.gov.hk/hk/cap111!en",
+            "required_answer_citation": (
+                "Hong Kong e-Legislation, Cap. 111, current version "
+                "2022-07-01: https://www.elegislation.gov.hk/hk/cap111!en"
+            ),
+            "requested_provisions": [
+                {"provision": provision, "found": True, "text": texts[provision]}
+                for provision in provisions
+            ],
+        }),
+    }
+
+
 def _rule_13_answer():
     return (
         "Rule 13(2) gives 6 months. A request filed within that period may get "
@@ -278,6 +309,63 @@ def test_successful_tool_still_requires_visible_url_and_version():
     assert decision.action == "nudge"
     assert "2025-02-14" in decision.message
     assert "https://www.elegislation.gov.hk/hk/cap559!en" in decision.message
+
+
+def test_estate_duty_claim_requires_application_provision_not_short_title():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Estate duty was abolished with effect from 11 November 2018. "
+        "Current version 2022-07-01: "
+        "https://www.elegislation.gov.hk/hk/cap111!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _estate_duty_authority_message("1"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=0,
+    )
+    assert decision.action == "nudge"
+    assert "chapter='111', provisions=['2']" in decision.message
+
+
+def test_estate_duty_abolition_date_must_match_verified_section_2_cutoff():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    wrong = (
+        "Estate duty was abolished with effect from 11 November 2018. "
+        "Current version 2022-07-01: "
+        "https://www.elegislation.gov.hk/hk/cap111!en"
+    )
+    messages = [
+        {"role": "user", "content": prompt},
+        _estate_duty_authority_message("2"),
+    ]
+    decision = evaluate_hk_legal_answer(
+        messages=messages,
+        current_turn_user_idx=0,
+        final_response=wrong,
+        attempts=1,
+    )
+    assert decision.action == "nudge"
+    assert "11 February 2006" in decision.message
+    assert "not the legislation version date" in decision.message
+
+    corrected = (
+        "Estate duty was abolished for persons dying on or after "
+        "11 February 2006. Current version 2022-07-01: "
+        "https://www.elegislation.gov.hk/hk/cap111!en"
+    )
+    assert (
+        evaluate_hk_legal_answer(
+            messages=messages,
+            current_turn_user_idx=0,
+            final_response=corrected,
+            attempts=1,
+        ).action
+        == "pass"
+    )
 
 
 def test_registered_mark_dispute_requires_complete_minimum_provision_set():

@@ -27,11 +27,12 @@ _LEGAL_RE = re.compile(
 )
 _LEGAL_REQUEST_RE = re.compile(
     r"(?:\b(?:advise|advice|analyse|analyze|explain|interpret|apply|challenge|"
+    r"draft|prepare|review|revise|amend|"
     r"oppose|invalidate)\b|\bwhat\s+can\s+i\s+do\b|\bunder\s+(?:the\s+)?law\b|"
     r"\b(?:what|which|how)\b.{0,80}\b(?:law|legal|ordinance|statute|section|"
     r"rule|trade\s*marks?|trademarks?)\b|法律意見|法律分析|如何|怎樣|怎样|怎麼|"
     r"怎么|甚麼|什么|是否|能否|可否|應否|应否|解釋|解释|分析|查核|救濟|救济|"
-    r"侵權|侵权|無效|无效|反對|反对)",
+    r"侵權|侵权|無效|无效|反對|反对|草擬|草拟|擬備|拟备|起草|審閱|审阅)",
     re.IGNORECASE | re.DOTALL,
 )
 _TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
@@ -132,6 +133,13 @@ _SKILL_EDIT_RE = re.compile(
     r"技能.{0,100}(?:新增|更新|修改|編輯|编辑)",
     re.IGNORECASE | re.DOTALL,
 )
+_ESTATE_DUTY_RE = re.compile(r"(?:estate\s+duty|遺產[稅税]|遗产[税稅])", re.IGNORECASE)
+_ESTATE_DUTY_ABOLITION_RE = re.compile(
+    r"(?:abolish(?:ed|ment)?|no\s+estate\s+duty|not\s+subject\s+to\s+estate\s+duty|"
+    r"廢除|废除|取消|不(?:再)?徵收|不(?:再)?征收)",
+    re.IGNORECASE,
+)
+_ESTATE_DUTY_MINIMUM = {"111": frozenset({"2"})}
 
 
 @dataclass(frozen=True)
@@ -236,6 +244,16 @@ def successful_authorities(
                         str(row.get("provision") or "").strip()
                         for row in (result.get("requested_provisions") or [])
                         if isinstance(row, dict) and row.get("found") is True
+                    ),
+                    "provision_texts": tuple(
+                        (
+                            str(row.get("provision") or "").strip(),
+                            str(row.get("text") or "").strip(),
+                        )
+                        for row in (result.get("requested_provisions") or [])
+                        if isinstance(row, dict)
+                        and row.get("found") is True
+                        and str(row.get("provision") or "").strip()
                     ),
                     "practice_guidance": tuple(
                         {
@@ -392,11 +410,22 @@ def _registered_famous_mark_remedy_errors(user_message: Any, answer: str) -> lis
     return errors
 
 
-def _minimum_provisions(user_message: Any) -> dict[str, frozenset[str]]:
+def _minimum_provisions(
+    user_message: Any, final_response: str
+) -> dict[str, frozenset[str]]:
     text = _message_text(user_message)
+    combined = text + "\n" + (final_response or "")
+    minimum: dict[str, set[str]] = {}
     if _TRADE_MARK_RE.search(text) and _REGISTERED_RE.search(text):
-        return _REGISTERED_MARK_MINIMUM
-    return {}
+        for chapter, provisions in _REGISTERED_MARK_MINIMUM.items():
+            minimum.setdefault(chapter, set()).update(provisions)
+    # Estate-duty applicability is determined by the deceased's date of death,
+    # not by Cap. 111's current-version date. Any HK legal answer that introduces
+    # estate duty must therefore read the Ordinance's application provision.
+    if _ESTATE_DUTY_RE.search(combined):
+        for chapter, provisions in _ESTATE_DUTY_MINIMUM.items():
+            minimum.setdefault(chapter, set()).update(provisions)
+    return {chapter: frozenset(provisions) for chapter, provisions in minimum.items()}
 
 
 def _deterministic_registered_mark_answer(
@@ -457,16 +486,56 @@ def _deterministic_registered_mark_answer(
 
 
 def _missing_minimum_provisions(
-    user_message: Any, authorities: list[dict[str, Any]]
+    user_message: Any,
+    final_response: str,
+    authorities: list[dict[str, Any]],
 ) -> dict[str, list[str]]:
     covered: dict[str, set[str]] = {}
     for authority in authorities:
         covered.setdefault(authority["chapter"], set()).update(authority["provisions"])
     return {
         chapter: sorted(required - covered.get(chapter, set()), key=lambda x: int(x))
-        for chapter, required in _minimum_provisions(user_message).items()
+        for chapter, required in _minimum_provisions(
+            user_message, final_response
+        ).items()
         if required - covered.get(chapter, set())
     }
+
+
+def _estate_duty_application_text(
+    authorities: list[dict[str, Any]],
+) -> str:
+    for authority in authorities:
+        if authority.get("chapter") != "111":
+            continue
+        for provision, text in authority.get("provision_texts") or ():
+            if provision == "2" and text:
+                return text
+    return ""
+
+
+def _estate_duty_application_error(
+    answer: str, authorities: list[dict[str, Any]]
+) -> str:
+    if not (
+        _ESTATE_DUTY_RE.search(answer or "")
+        and _ESTATE_DUTY_ABOLITION_RE.search(answer or "")
+    ):
+        return ""
+    section_text = _estate_duty_application_text(authorities)
+    if not section_text:
+        return ""
+    cutoff = re.search(
+        r"\bbefore\s+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4})\b",
+        section_text,
+        re.IGNORECASE,
+    )
+    if cutoff and cutoff.group(1).casefold() not in answer.casefold():
+        return (
+            "estate-duty abolition/application statement does not preserve "
+            f"Cap. 111 section 2's cutoff date {cutoff.group(1)}"
+        )
+    return ""
 
 
 def _confuses_opposition_with_post_registration_invalidity(
@@ -520,7 +589,9 @@ def evaluate_hk_legal_answer(
             "為免誤導，我不會重複未經官方法源確認的條文、期限、表格、費用或救濟建議。",
         )
 
-    missing = _missing_minimum_provisions(messages[current_turn_user_idx], authorities)
+    missing = _missing_minimum_provisions(
+        messages[current_turn_user_idx], final_response, authorities
+    )
     if missing:
         calls = "; ".join(
             f"chapter='{chapter}', provisions={provisions}"
@@ -539,6 +610,31 @@ def evaluate_hk_legal_answer(
             "fail",
             "無法提供可依賴的香港商標法結論：本回合未能完整讀取已註冊商標爭議所需的"
             "最低官方法源集合。為免誤導，本次不提供不完整的救濟建議。",
+        )
+
+    estate_duty_error = _estate_duty_application_error(
+        final_response, authorities
+    )
+    if estate_duty_error:
+        section_text = _estate_duty_application_text(authorities)
+        if attempts < max_attempts:
+            return GateDecision(
+                "nudge",
+                "[System: Reject and rewrite the complete answer. The candidate "
+                "made an estate-duty abolition/application statement that conflicts "
+                "with or omits the controlling cutoff in the current-turn official "
+                "Cap. 111 section 2 evidence. Use the deceased's date-of-death "
+                "cutoff from the provision, not the legislation version date. Remove "
+                "every inconsistent date from the answer and any generated artifact; "
+                "regenerate an artifact if it contains the defect. Preserve the "
+                "official URL and version citation.\n"
+                f"Detected defect: {estate_duty_error}\n"
+                f"Verified section 2 text: {section_text}]",
+            )
+        return GateDecision(
+            "fail",
+            "無法提供可依賴的香港遺產稅結論：最終答案未能正確保留《遺產稅條例》"
+            "第2條所載的適用截止日期。為免誤導，本次不提供日期錯誤的法律結論。",
         )
 
     if _requires_rule_13_practice(messages[current_turn_user_idx]):
