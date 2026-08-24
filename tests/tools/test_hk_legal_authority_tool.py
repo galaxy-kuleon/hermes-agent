@@ -190,7 +190,11 @@ def test_rule_13_manual_returns_only_matching_official_pages(monkeypatch, tmp_pa
         "_pdf_text",
         lambda _content: (
             "cover page\f"
-            "Rule 13(3) permits one extension of time during the 6-month period.\f"
+            "Rule 13(3). The prescribed period for taking the above action expires "
+            "6 months thereafter (prescribed 6-month period). Upon receipt of a "
+            "request on the specified form with the prescribed fee filed within the "
+            "prescribed 6-month period, the Registrar will grant an extension of time "
+            "of 3 months. It should however be noted that it cannot be extended.\f"
             "unrelated page\f"
         ),
     )
@@ -212,6 +216,9 @@ def test_rule_13_manual_returns_only_matching_official_pages(monkeypatch, tmp_pa
     assert result["server_version_hint"] == "Mon, 24 Aug 2026 00:00:00 GMT"
     assert [page["page"] for page in result["matched_pages"]] == [2]
     assert "Rule 13(3)" in result["matched_pages"][0]["text"]
+    assert len(result["verified_extracts"]) == 2
+    assert "expires 6 months" in result["verified_extracts"][0]["text"]
+    assert "specified form" in result["verified_extracts"][1]["text"]
     assert "path" not in json.dumps(result).lower()
 
 

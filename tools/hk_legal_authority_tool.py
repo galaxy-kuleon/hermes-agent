@@ -63,6 +63,16 @@ _RULE_13_MANUAL_TERMS = (
     "six-month period",
 )
 MAX_MANUAL_MATCHED_PAGES = 4
+_RULE_13_VERIFIED_EXTRACT_BOUNDS = (
+    (
+        "The prescribed period for taking the above action",
+        "Upon receipt of a request",
+    ),
+    (
+        "Upon receipt of a request",
+        "It should however be noted",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -283,6 +293,21 @@ def _rule_13_practice_guidance(opener) -> dict:
         path,
         digest,
     )
+    verified_extracts = []
+    for page in selected:
+        page_text = page["text"]
+        for start_marker, end_marker in _RULE_13_VERIFIED_EXTRACT_BOUNDS:
+            start = page_text.find(start_marker)
+            if start < 0:
+                continue
+            end = page_text.find(end_marker, start + len(start_marker))
+            if end < 0:
+                continue
+            excerpt = page_text[start:end].strip()
+            if excerpt:
+                verified_extracts.append(
+                    {"page": page["page"], "text": excerpt}
+                )
     return {
         "success": bool(selected),
         "cannot_confirm": not selected,
@@ -293,12 +318,14 @@ def _rule_13_practice_guidance(opener) -> dict:
         "server_version_hint": version_hint,
         "pdf_sha256": digest,
         "matched_page_text_complete": True,
+        "verified_extracts": verified_extracts,
         "matched_pages": selected,
         "instruction": (
             "This is official practice guidance, not legislation. Cite the official "
             "manual URL and keep its guidance distinct from the statutory rule. The "
-            "matched page text is present and complete below; do not describe it as "
-            "unavailable or truncated."
+            "verified_extracts above are exact text from the current official PDF, and "
+            "the matched page text is complete below. Treat the manual as read in this "
+            "session; do not describe it as unavailable or truncated."
         ),
     }
 
