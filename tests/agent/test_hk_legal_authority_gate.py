@@ -344,10 +344,18 @@ def test_section_12_6_must_not_be_said_to_bar_section_53_5_b_invalidity():
         messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
         current_turn_user_idx=0,
         final_response=misleading,
-        attempts=1,
+        attempts=0,
     )
     assert decision.action == "nudge"
     assert "must not be presented as barring" in decision.message
+
+    exhausted = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": EXACT_REPORTED_PROMPT}, authority],
+        current_turn_user_idx=0,
+        final_response=misleading,
+        attempts=1,
+    )
+    assert exhausted.action == "replace"
 
     corrected = _registered_famous_mark_answer()
     assert (
@@ -445,6 +453,21 @@ def test_registered_mark_rewrite_exhaustion_returns_verified_safe_answer():
     assert "at least 3 years" in decision.message
     assert "Korean-market fame, alone does not prove" in decision.message
     assert "https://www.elegislation.gov.hk/hk/cap559!en" in decision.message
+
+
+def test_registered_mark_second_bad_candidate_uses_verified_safe_answer():
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_REPORTED_PROMPT},
+            _authority_message(),
+        ],
+        current_turn_user_idx=0,
+        final_response="Opposition may still be open because the brand is famous in Korea.",
+        attempts=1,
+    )
+
+    assert decision.action == "replace"
+    assert "Korean-market fame, alone does not prove" in decision.message
 
 
 def test_registered_mark_safe_answer_omits_unrelied_subsidiary_legislation():

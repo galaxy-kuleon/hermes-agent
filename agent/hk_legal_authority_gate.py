@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 
 MAX_AUTHORITY_NUDGES = 3
+REGISTERED_MARK_REWRITE_NUDGES = 1
 
 _HK_RE = re.compile(r"(?:\bhong\s+kong\b|\bhk\b|香港)", re.IGNORECASE)
 _LEGAL_RE = re.compile(
@@ -594,7 +595,10 @@ def evaluate_hk_legal_answer(
     remedy_errors = _registered_famous_mark_remedy_errors(
         messages[current_turn_user_idx], final_response
     )
-    if remedy_errors and attempts >= max_attempts:
+    registered_mark_rewrite_limit = min(
+        max_attempts, REGISTERED_MARK_REWRITE_NUDGES
+    )
+    if remedy_errors and attempts >= registered_mark_rewrite_limit:
         return GateDecision(
             "replace",
             _deterministic_registered_mark_answer(authorities),

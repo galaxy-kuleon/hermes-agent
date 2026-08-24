@@ -3248,6 +3248,83 @@ class TestRunConversation:
         )
 
 
+    def test_hk_completed_research_tool_retry_finalizes_without_another_model_call(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.tools = _make_tool_defs("hk_legal_authority")
+        agent.valid_tool_names = {"hk_legal_authority"}
+        from agent.tool_guardrails import (
+            ToolCallGuardrailConfig,
+            ToolCallGuardrailController,
+        )
+
+        agent._tool_guardrails = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+        )
+        complete_bundle = _mock_tool_call(
+            name="hk_legal_authority",
+            arguments=(
+                '{"chapter":"559","provisions":'
+                '["4","11","12","44","45","52","53"]}'
+            ),
+            call_id="hkel-complete",
+        )
+        needless_expansion = _mock_tool_call(
+            name="hk_legal_authority",
+            arguments='{"chapter":"559","provisions":["83"]}',
+            call_id="hkel-needless",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[complete_bundle],
+            ),
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[needless_expansion],
+            ),
+        ]
+        authority = json.dumps(
+            {
+                "success": True,
+                "cannot_confirm": False,
+                "chapter": "559",
+                "version_date": "2025-02-14",
+                "official_web_url": "https://www.elegislation.gov.hk/hk/cap559!en",
+                "required_answer_citation": (
+                    "Hong Kong e-Legislation, Cap. 559, current version "
+                    "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+                ),
+                "requested_provisions": [
+                    {"provision": provision, "found": True}
+                    for provision in ("4", "11", "12", "44", "45", "52", "53")
+                ],
+            }
+        )
+        with (
+            patch("run_agent.handle_function_call", return_value=authority) as dispatch,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Apply Hong Kong Trade Mark law. I am a famous brand in Korea and "
+                "the virtually identical mark is already registered in Hong Kong. "
+                "What can I do under the law?"
+            )
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["turn_exit_reason"] == (
+            "hk_legal_authority_research_complete"
+        )
+        assert "Korean-market fame, alone does not prove" in result["final_response"]
+        assert dispatch.call_count == 1
+
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

@@ -91,7 +91,10 @@ from agent.retry_utils import (
 )
 from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
-from agent.hk_legal_authority_gate import evaluate_hk_legal_answer
+from agent.hk_legal_authority_gate import (
+    MAX_AUTHORITY_NUDGES,
+    evaluate_hk_legal_answer,
+)
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
@@ -103,6 +106,32 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _completed_registered_mark_research_in_batch(
+    messages: list[Any], tool_calls: list[Any]
+) -> bool:
+    """Return whether this tool batch hit the completed-research control."""
+    call_ids = {str(getattr(call, "id", "") or "") for call in tool_calls}
+    if not call_ids:
+        return False
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        if str(message.get("tool_call_id") or "") not in call_ids:
+            continue
+        try:
+            payload = json.loads(str(message.get("content") or ""))
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("tool") == "hk_legal_authority"
+            and payload.get("research_complete") is True
+            and payload.get("execution_skipped") is True
+        ):
+            return True
+    return False
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
@@ -7252,6 +7281,39 @@ def run_conversation(
                     final_response = ""
                     failed = True
                     break
+
+                if _completed_registered_mark_research_in_batch(
+                    messages, assistant_message.tool_calls
+                ):
+                    _research_complete_decision = evaluate_hk_legal_answer(
+                        messages=messages,
+                        current_turn_user_idx=current_turn_user_idx,
+                        final_response="",
+                        attempts=MAX_AUTHORITY_NUDGES,
+                    )
+                    if _research_complete_decision.action == "replace":
+                        final_response = _research_complete_decision.message
+                        _turn_exit_reason = "hk_legal_authority_research_complete"
+                        append_message(
+                            messages,
+                            {
+                                "role": "assistant",
+                                "content": final_response,
+                                "finish_reason": "hk_legal_authority_corrected",
+                            },
+                        )
+                        agent._emit_status(
+                            "✓ 香港法律研究已完整；已由官方法源產生安全版本"
+                        )
+                        if final_response:
+                            agent._safe_print(f"\n{final_response}\n")
+                            if agent.stream_delta_callback:
+                                try:
+                                    agent.stream_delta_callback(final_response)
+                                    agent.stream_delta_callback(None)
+                                except Exception:
+                                    pass
+                        break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
