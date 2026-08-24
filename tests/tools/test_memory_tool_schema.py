@@ -38,3 +38,11 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
 
 def test_memory_schema_is_json_serializable():
     json.dumps(MEMORY_SCHEMA)
+
+
+def test_memory_schema_keeps_task_errors_and_matter_facts_out_of_profile_memory():
+    description = MEMORY_SCHEMA["description"]
+
+    assert "your own mistakes" in description
+    assert "transient case/matter facts" in description
+    assert "session context engine" in description

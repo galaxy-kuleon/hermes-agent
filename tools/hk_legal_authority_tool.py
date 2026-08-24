@@ -17,6 +17,8 @@ import logging
 import os
 import re
 import struct
+import subprocess
+import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
@@ -33,6 +35,7 @@ DATASET_URL = "https://data.gov.hk/en-data/dataset/hk-doj-hkel-legislation-curre
 OFFICIAL_ARCHIVE_PREFIX = "https://resource.data.one.gov.hk/doj/data/"
 OFFICIAL_WEB_PREFIX = "https://www.elegislation.gov.hk/"
 NETWORK_TIMEOUT_SECONDS = 600
+PDF_TEXT_TIMEOUT_SECONDS = 600
 MAX_PROVISIONS = 10
 MAX_CHAPTER_LENGTH = 8
 ZIP_EOCD_SEARCH_BYTES = 65_557
@@ -48,6 +51,19 @@ _LABELED_PROVISION_RE = re.compile(
 )
 _SPACE_RE = re.compile(r"\s+")
 logger = logging.getLogger(__name__)
+
+IPD_TIME_LIMITS_MANUAL_URL = (
+    "https://www.ipd.gov.hk/filemanager/ipd/common/trade-marks/"
+    "registry-work-manual/current/eng/time_limits_in_exam_process.pdf"
+)
+IPD_TIME_LIMITS_MANUAL_TITLE = "Time limits in the examination process"
+_RULE_13_MANUAL_TERMS = (
+    "rule 13(3)",
+    "6-month period",
+    "six-month period",
+    "extension of time",
+)
+MAX_MANUAL_MATCHED_PAGES = 8
 
 
 @dataclass(frozen=True)
@@ -142,6 +158,147 @@ def _fetch_bytes(opener, url: str, *, byte_range: tuple[int, int] | None = None)
         response.close()
         raise OSError("official archive did not honor the bounded HTTP range request")
     return _read_response(response)
+
+
+def _fetch_official_pdf(opener, url: str) -> tuple[bytes, str]:
+    """Fetch one allowlisted IPD manual and retain its server version hint."""
+    if url != IPD_TIME_LIMITS_MANUAL_URL:
+        raise ValueError("unsupported official IPD manual URL")
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "hermes-hk-legal-authority/1"},
+    )
+    response = opener.open(request, timeout=NETWORK_TIMEOUT_SECONDS)
+    with response:
+        content = response.read()
+        version_hint = (
+            response.headers.get("Last-Modified")
+            or response.headers.get("ETag")
+            or "current-url-no-version-header"
+        )
+    if not content.startswith(b"%PDF-"):
+        raise ValueError("official IPD manual response is not a PDF")
+    return content, version_hint
+
+
+def _pdf_text(pdf_content: bytes) -> str:
+    """Extract page-preserving text with the deployment's Poppler binary."""
+    cache_dir = _cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix="hk-ipd-manual-", suffix=".pdf", dir=cache_dir, delete=False
+    ) as source:
+        source.write(pdf_content)
+        source_path = Path(source.name)
+    try:
+        completed = subprocess.run(
+            ["pdftotext", "-layout", str(source_path), "-"],
+            check=True,
+            capture_output=True,
+            timeout=PDF_TEXT_TIMEOUT_SECONDS,
+        )
+        return completed.stdout.decode("utf-8", errors="replace")
+    finally:
+        source_path.unlink(missing_ok=True)
+
+
+def _manual_cache_path(digest: str) -> Path:
+    return _cache_dir() / f"ipd-time-limits-in-examination.{digest}.pdf"
+
+
+def _retained_manual() -> tuple[bytes, str, Path] | None:
+    for path in sorted(
+        _cache_dir().glob("ipd-time-limits-in-examination.*.pdf"), reverse=True
+    ):
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        digest = hashlib.sha256(content).hexdigest()
+        if path.name == f"ipd-time-limits-in-examination.{digest}.pdf":
+            return content, digest, path
+    return None
+
+
+def _rule_13_practice_guidance(opener) -> dict:
+    """Return official IPD manual pages relevant to Rule 13 time limits."""
+    freshness = "current_ipd_url"
+    try:
+        content, version_hint = _fetch_official_pdf(opener, IPD_TIME_LIMITS_MANUAL_URL)
+        digest = hashlib.sha256(content).hexdigest()
+        path = _manual_cache_path(digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("xb") as output:
+                output.write(content)
+        except FileExistsError:
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise OSError("retained IPD manual cache failed integrity verification")
+    except Exception as exc:
+        retained = _retained_manual()
+        if retained is None:
+            return {
+                "success": False,
+                "cannot_confirm": True,
+                "title": IPD_TIME_LIMITS_MANUAL_TITLE,
+                "official_url": IPD_TIME_LIMITS_MANUAL_URL,
+                "error": f"official IPD manual unavailable and no retained copy exists: {exc}",
+            }
+        content, digest, path = retained
+        freshness = "cached_offline"
+        version_hint = "retained-version"
+
+    try:
+        text = _pdf_text(content)
+    except Exception as exc:
+        return {
+            "success": False,
+            "cannot_confirm": True,
+            "source": "Hong Kong Intellectual Property Department",
+            "title": IPD_TIME_LIMITS_MANUAL_TITLE,
+            "official_url": IPD_TIME_LIMITS_MANUAL_URL,
+            "freshness": freshness,
+            "pdf_sha256": digest,
+            "error": f"official IPD manual PDF text extraction failed: {exc}",
+        }
+    pages = text.split("\f")
+    selected = []
+    for page_number, page in enumerate(pages, start=1):
+        normalized = _SPACE_RE.sub(" ", page).strip()
+        lowered = normalized.casefold()
+        matched = [term for term in _RULE_13_MANUAL_TERMS if term in lowered]
+        if matched:
+            selected.append(
+                {
+                    "page": page_number,
+                    "matched_terms": matched,
+                    "text": normalized,
+                }
+            )
+        if len(selected) >= MAX_MANUAL_MATCHED_PAGES:
+            break
+    logger.info(
+        "hk_ipd_manual_cache title=%s freshness=%s path=%s pdf_sha256=%s",
+        IPD_TIME_LIMITS_MANUAL_TITLE,
+        freshness,
+        path,
+        digest,
+    )
+    return {
+        "success": bool(selected),
+        "cannot_confirm": not selected,
+        "source": "Hong Kong Intellectual Property Department",
+        "title": IPD_TIME_LIMITS_MANUAL_TITLE,
+        "official_url": IPD_TIME_LIMITS_MANUAL_URL,
+        "freshness": freshness,
+        "server_version_hint": version_hint,
+        "pdf_sha256": digest,
+        "matched_pages": selected,
+        "instruction": (
+            "This is official practice guidance, not legislation. Cite the official "
+            "manual URL and keep its guidance distinct from the statutory rule."
+        ),
+    }
 
 
 def _remote_size(opener, url: str) -> int:
@@ -425,6 +582,11 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
 
     rows = extract_provisions(content, provisions)
     missing = [row["provision"] for row in rows if not row["found"]]
+    practice_guidance = []
+    if wanted_chapter == "559A" and any(
+        row["provision"] == "13" and row["found"] for row in rows
+    ):
+        practice_guidance.append(_rule_13_practice_guidance(client))
     version_day = version.version_date.split("T", 1)[0]
     logger.info(
         "hk_legal_authority_cache chapter=%s freshness=%s path=%s xml_sha256=%s",
@@ -463,9 +625,12 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
             "xml_sha256": xml_sha,
             "requested_provisions": rows,
             "missing_provisions": missing,
+            "official_practice_guidance": practice_guidance,
             "instruction": (
                 "Cite required_answer_citation. OpenViking/search summaries are leads only. "
-                "If cannot_confirm is true, do not state a confident statutory conclusion."
+                "If cannot_confirm is true, do not state a confident statutory conclusion. "
+                "When official_practice_guidance is present, read and cite it separately "
+                "from the statutory rule; disclose any manual cannot_confirm result."
             ),
         },
         ensure_ascii=False,
@@ -481,7 +646,10 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
         "prose overviews are not authority. Request whole section/rule numbers, e.g. "
         "chapter='559', provisions=['52','53'] or chapter='559A', provisions=['13']. "
         "Common labels such as 'section 53(5)(b)' and 'Sch. 1 rule 13' are "
-        "normalized to the whole provision and preserved in the result trace."
+        "normalized to the whole provision and preserved in the result trace. A Cap. "
+        "559A Rule 13 request also retrieves the official IPD 'Time limits in the "
+        "examination process' manual, so Rule 13 answers must use both law and current "
+        "practice guidance."
     ),
     "parameters": {
         "type": "object",

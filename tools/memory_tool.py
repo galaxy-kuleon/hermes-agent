@@ -1221,10 +1221,15 @@ MEMORY_SCHEMA = {
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
         "single lone change.\n\n"
-        "WHEN: save proactively when the user states a preference, correction, or personal "
-        "detail, or you learn a stable fact about their environment, conventions, or workflow. "
-        "Priority: user preferences & corrections > environment facts > procedures. The best "
-        "memory stops the user repeating themselves.\n\n"
+        "WHEN: save proactively when the user states a durable personal preference or detail, "
+        "or you learn a stable fact about their environment, conventions, or workflow. "
+        "Priority: user preferences > environment facts > procedures. The best memory stops "
+        "the user repeating themselves.\n\n"
+        "NEVER SAVE: your own mistakes, self-critique, root-cause lessons, corrections to a "
+        "task answer, legal conclusions, source summaries, or transient case/matter facts. "
+        "Those belong in the current answer and trace; Matter knowledge is handled by the "
+        "session context engine. A user correcting your legal deadline is not permission to "
+        "write a durable memory about your error.\n\n"
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
         "removes or shortens enough stale entries and adds the new one together.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
@@ -1300,5 +1305,4 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 

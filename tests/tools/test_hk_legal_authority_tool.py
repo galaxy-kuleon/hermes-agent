@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import tools.hk_legal_authority_tool as authority_tool
 from tools.hk_legal_authority_tool import (
     CATALOG_URL,
     extract_provisions,
@@ -180,6 +181,75 @@ def test_invalid_provision_is_a_controlled_tool_result_before_network():
     assert result["cannot_confirm"] is True
     assert "invalid provision" in result["error"]
     assert result["instruction"].startswith("Correct the provision label")
+
+
+def test_rule_13_manual_returns_only_matching_official_pages(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
+    monkeypatch.setattr(
+        authority_tool,
+        "_pdf_text",
+        lambda _content: (
+            "cover page\f"
+            "Rule 13(3) permits one extension of time during the 6-month period.\f"
+            "unrelated page\f"
+        ),
+    )
+
+    class ManualOpener:
+        def open(self, request, timeout):
+            assert request.full_url == authority_tool.IPD_TIME_LIMITS_MANUAL_URL
+            assert timeout == 600
+            return FakeResponse(
+                b"%PDF-1.7 fake",
+                headers={"Last-Modified": "Mon, 24 Aug 2026 00:00:00 GMT"},
+            )
+
+    result = authority_tool._rule_13_practice_guidance(ManualOpener())
+
+    assert result["success"] is True
+    assert result["cannot_confirm"] is False
+    assert result["official_url"] == authority_tool.IPD_TIME_LIMITS_MANUAL_URL
+    assert result["server_version_hint"] == "Mon, 24 Aug 2026 00:00:00 GMT"
+    assert [page["page"] for page in result["matched_pages"]] == [2]
+    assert "Rule 13(3)" in result["matched_pages"][0]["text"]
+    assert "path" not in json.dumps(result).lower()
+
+
+def test_cap_559a_rule_13_automatically_includes_ipd_manual(monkeypatch, tmp_path):
+    catalog = CATALOG.replace(b"<CapNo>559</CapNo>", b"<CapNo>559A</CapNo>").replace(
+        b"cap_559_en_c", b"cap_559a_en_c"
+    ).replace(b"cap_559_", b"cap_559a_")
+    xml = AUTHORITY_XML.replace(b'name="s52"', b'name="s13"', 1)
+    member = r"cap_559a_en_c\cap_559a_20250214000000_en_c.xml"
+
+    class Rule13Opener(FakeOpener):
+        def open(self, request, timeout):
+            if request.full_url == CATALOG_URL:
+                return FakeResponse(catalog)
+            return super().open(request, timeout)
+
+    expected_manual = {
+        "success": True,
+        "cannot_confirm": False,
+        "title": "Time limits in the examination process",
+    }
+    monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
+    monkeypatch.setattr(
+        authority_tool,
+        "_rule_13_practice_guidance",
+        lambda _opener: expected_manual,
+    )
+
+    result = json.loads(
+        hk_legal_authority(
+            "559A",
+            ["rule 13(1)"],
+            opener=Rule13Opener(make_archive(member, xml)),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["official_practice_guidance"] == [expected_manual]
 
 
 def test_full_tool_retains_versioned_xml_and_reports_authority(
