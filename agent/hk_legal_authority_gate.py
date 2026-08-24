@@ -908,17 +908,18 @@ def _deterministic_will_artifact_handoff(
     messages: list[Any], current_turn_user_idx: int, authorities: list[dict[str, Any]]
 ) -> str:
     links = _latest_export_markdown(messages, current_turn_user_idx)
-    citations = "\n".join(
-        "- "
-        + (
-            authority["required_answer_citation"]
-            or (
-                f"Hong Kong e-Legislation, Cap. {authority['chapter']}, current "
-                f"version {authority['version_date']}: {authority['official_web_url']}"
-            )
+    citation_rows: list[str] = []
+    seen_citations: set[str] = set()
+    for authority in authorities:
+        citation = authority["required_answer_citation"] or (
+            f"Hong Kong e-Legislation, Cap. {authority['chapter']}, current "
+            f"version {authority['version_date']}: {authority['official_web_url']}"
         )
-        for authority in authorities
-    )
+        if citation in seen_citations:
+            continue
+        seen_citations.add(citation)
+        citation_rows.append(f"- {citation}")
+    citations = "\n".join(citation_rows)
     return (
         "The requested client-signature Will has been prepared. The files contain "
         "the operative Will and attestation blocks only; unrequested statutory "

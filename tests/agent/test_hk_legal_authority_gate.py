@@ -676,6 +676,7 @@ def test_will_uses_deterministic_handoff_when_artifact_is_clean():
         messages=[
             {"role": "user", "content": prompt},
             _wills_authority_message("5"),
+            _wills_authority_message("5"),
             {
                 "role": "tool",
                 "name": "local_document_export",
@@ -696,6 +697,7 @@ def test_will_uses_deterministic_handoff_when_artifact_is_clean():
     assert decision.action == "replace"
     assert export_markdown in decision.message
     assert "current version 2024-08-18" in decision.message
+    assert decision.message.count("current version 2024-08-18") == 1
     assert "each witness must sign" not in decision.message
 
 
