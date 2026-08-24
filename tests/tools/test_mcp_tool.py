@@ -47,10 +47,14 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
     return tool
 
 
-def _make_call_result(text="file contents here", is_error=False):
+def _make_call_result(text="file contents here", is_error=False, structured=None):
     """Create a fake MCP CallToolResult."""
     block = SimpleNamespace(text=text)
-    return SimpleNamespace(content=[block], isError=is_error)
+    return SimpleNamespace(
+        content=[block],
+        isError=is_error,
+        structuredContent=structured,
+    )
 
 
 def _make_mock_server(name, session=None, tools=None):
@@ -573,6 +577,29 @@ class TestToolHandler:
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "hello world"
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_identical_text_and_structured_content_are_not_duplicated(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        payload = {"ok": True, "reply_markdown": "ready"}
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result(
+                json.dumps(payload),
+                is_error=False,
+                structured=payload,
+            )
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert result == {"result": payload}
         finally:
             _servers.pop("test_srv", None)
 

@@ -46,6 +46,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.verbatim_tool_reply import resolve_verbatim_tool_reply
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -7273,6 +7274,35 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                # Some trusted tools return a complete user-facing handoff
+                # (for example, an async job's durable status link). When both
+                # the operator allowlist and the result's explicit reply_mode
+                # agree, deliver those exact bytes and end the turn. Sending
+                # the result through another model call wastes latency and can
+                # duplicate or expose its scratch narration. The canonical
+                # assistant/tool rows above remain preserved for observability.
+                _verbatim_reply = resolve_verbatim_tool_reply(messages)
+                if _verbatim_reply is not None:
+                    final_response = _verbatim_reply
+                    _turn_exit_reason = "verbatim_tool_reply"
+                    append_message(
+                        messages,
+                        {"role": "assistant", "content": final_response},
+                    )
+                    agent._session_messages = messages
+                    try:
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except Exception:
+                        logger.warning(
+                            "verbatim tool reply flush failed (session=%s); "
+                            "finalizer will retry",
+                            getattr(agent, "session_id", None) or "none",
+                            exc_info=True,
+                        )
                     break
 
                 # Reset per-turn retry counters after successful tool

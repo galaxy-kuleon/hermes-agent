@@ -6076,12 +6076,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
-                if text_result:
+                text_matches_structured = False
+                if text_result and structured is not None:
+                    try:
+                        text_matches_structured = json.loads(text_result) == structured
+                    except (TypeError, ValueError):
+                        pass
+                if text_matches_structured:
+                    # FastMCP commonly serializes the same typed return twice:
+                    # once as a JSON TextContent block and again as
+                    # structuredContent. Repeating the full object in model
+                    # context wastes tokens and encourages duplicated answers.
+                    payload["result"] = structured
+                elif text_result:
                     payload["result"] = text_result
                 if structured is not None:
-                    if text_result:
+                    if text_result and not text_matches_structured:
                         payload["structuredContent"] = structured
-                    else:
+                    elif not text_matches_structured:
                         payload["result"] = structured
                 if meta is not None:
                     payload["_meta"] = meta

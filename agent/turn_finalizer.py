@@ -661,7 +661,11 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and _turn_exit_reason != "verbatim_tool_reply"
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -708,46 +712,53 @@ def finalize_turn(
     _coverage_snapshot = None
     _coverage_status = "skipped"
     _persistent_body = final_response
-    try:
-        from tools.attachment_ledger import deliver_coverage_to_persistent_body
-
-        _delivered = deliver_coverage_to_persistent_body(
-            final_response=final_response,
-            task_id=effective_task_id,
-            streamed_text="",
-            stream=False,
-            interrupted=bool(interrupted),
-            failed=bool(failed),
-            fail_closed=True,
-        )
-        final_response = _delivered.get("final_response")
-        _coverage_footer = _delivered.get("coverage_footer") or ""
-        _coverage_snapshot = _delivered.get("attachment_coverage")
-        _coverage_status = _delivered.get("coverage_status") or "skipped"
-        _persistent_body = _delivered.get("persistent_assistant_body")
-        if _persistent_body is None:
-            _persistent_body = final_response
-    except Exception as _cov_err:
-        logger.warning("attachment coverage finalizer failed: %s", _cov_err)
+    if _turn_exit_reason == "verbatim_tool_reply":
+        # The trusted tool's complete handoff already names the exact
+        # attachment/job and opted into byte-for-byte delivery. Appending a
+        # generic "unread attachment" footer would contradict a conversion
+        # request and violate the explicit reply contract.
+        _coverage_status = "not_applicable_verbatim_tool_reply"
+    else:
         try:
-            from tools.attachment_ledger import (
-                COVERAGE_UNAVAILABLE_TEXT,
-                is_active as _cov_is_active,
-            )
+            from tools.attachment_ledger import deliver_coverage_to_persistent_body
 
-            # Fail closed for ANY terminal path including interrupted.
-            if _cov_is_active(effective_task_id):
-                _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
-                text = final_response or ""
-                final_response = (
-                    (text.rstrip() + "\n" + _coverage_footer)
-                    if text
-                    else _coverage_footer
-                )
-                _coverage_status = "unavailable"
+            _delivered = deliver_coverage_to_persistent_body(
+                final_response=final_response,
+                task_id=effective_task_id,
+                streamed_text="",
+                stream=False,
+                interrupted=bool(interrupted),
+                failed=bool(failed),
+                fail_closed=True,
+            )
+            final_response = _delivered.get("final_response")
+            _coverage_footer = _delivered.get("coverage_footer") or ""
+            _coverage_snapshot = _delivered.get("attachment_coverage")
+            _coverage_status = _delivered.get("coverage_status") or "skipped"
+            _persistent_body = _delivered.get("persistent_assistant_body")
+            if _persistent_body is None:
                 _persistent_body = final_response
-        except Exception:
-            pass
+        except Exception as _cov_err:
+            logger.warning("attachment coverage finalizer failed: %s", _cov_err)
+            try:
+                from tools.attachment_ledger import (
+                    COVERAGE_UNAVAILABLE_TEXT,
+                    is_active as _cov_is_active,
+                )
+
+                # Fail closed for ANY terminal path including interrupted.
+                if _cov_is_active(effective_task_id):
+                    _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
+                    text = final_response or ""
+                    final_response = (
+                        (text.rstrip() + "\n" + _coverage_footer)
+                        if text
+                        else _coverage_footer
+                    )
+                    _coverage_status = "unavailable"
+                    _persistent_body = final_response
+            except Exception:
+                pass
 
     # Context engine observation hook: notify the active engine that this
     # turn has finished, with the finalized transcript. Complements the
