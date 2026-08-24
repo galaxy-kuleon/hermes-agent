@@ -145,16 +145,16 @@ _WILL_DOCUMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _CLIENT_SIGNATURE_NOTE_RE = re.compile(
-    r"(?:lawyer['’]s\s+note|drafting\s+notes?|legal\s+analysis|"
-    r"execution\s+checklist|not\s+part\s+of\s+the\s+will)",
+    r"(?:lawyer['’]s\s+note|drafting(?:\s+\w+){0,3}\s+notes?|legal\s+analysis|"
+    r"execution\s+checklist|not\s+part\s+of\s+the\s+will|"
+    r"to\s+be\s+removed\s+before\s+execution)",
     re.IGNORECASE,
 )
 _SOLE_EXECUTOR_RE = re.compile(r"\bsole\s+executor\b", re.IGNORECASE)
 _UNREQUESTED_ALTERNATE_EXECUTOR_RE = re.compile(
-    r"(?:(?:alternate|substitute|in\s+default\s+of).{0,140}"
-    r"(?:executor|trustee)|(?:executor|trustee).{0,140}"
-    r"(?:alternate|substitute|in\s+default\s+of))",
-    re.IGNORECASE | re.DOTALL,
+    r"\bI\s+APPOINT\b[^.\n;]{0,260}\b"
+    r"(?:alternate|substitute|in\s+default\s+of)\b",
+    re.IGNORECASE,
 )
 _UNRESOLVED_DRAFTING_PLACEHOLDER_RE = re.compile(
     r"(?:\[\s*full\s+name\b|\[\s*address\s*\]|"
@@ -169,6 +169,12 @@ _SURVIVORSHIP_FALLBACK_RE = re.compile(
 _SURVIVORSHIP_FALLBACK_REQUEST_RE = re.compile(
     r"(?:fail\s+to\s+survive|predeceas|substitute|alternate|fallback)",
     re.IGNORECASE,
+)
+_DUPLICATE_SPECIFIC_PROPERTY_RESIDUE_RE = re.compile(
+    r"\bI\s+GIVE\s+DEVISE\s+and\s+BEQUEATH\b.{0,900}\bthe\s+said\s+Premises\b"
+    r".{0,900}\babsolutely\b.{0,900}\bI\s+GIVE\s+DEVISE\s+and\s+BEQUEATH\b"
+    r".{0,900}\ball\s+my\s+estate\b.{0,500}\bincluding\s+the\s+said\s+Premises\b",
+    re.IGNORECASE | re.DOTALL,
 )
 _DIVORCE_RE = re.compile(
     r"(?:\bdivorc(?:e|ed)\b|\bdissolution\s+of\s+marriage\b|"
@@ -881,6 +887,11 @@ def _will_artifact_errors(user_message: Any, artifact: str) -> list[str]:
         errors.append(
             "the artifact must not invent an alternate beneficiary or dispositive "
             "fallback that the client's instructions did not provide"
+        )
+    if _DUPLICATE_SPECIFIC_PROPERTY_RESIDUE_RE.search(artifact):
+        errors.append(
+            "the artifact must not give the same specifically bequeathed property "
+            "again as an unconditional part of the residuary estate"
         )
     return errors
 

@@ -2,6 +2,7 @@ import json
 
 from agent.hk_legal_authority_gate import (
     MAX_AUTHORITY_NUDGES,
+    _will_artifact_errors,
     evaluate_hk_legal_answer,
     is_hk_statutory_query,
     is_hk_statutory_turn,
@@ -726,7 +727,8 @@ def test_will_does_not_handoff_artifact_containing_lawyer_notes():
         final_response=answer,
         attempts=2,
         exported_artifact_contents=(
-            "THIS IS THE LAST WILL. LAWYER'S NOTE (Not part of the Will).",
+            "THIS IS THE LAST WILL. Drafting and Practice Notes "
+            "(to be removed before execution).",
         ),
     )
 
@@ -774,6 +776,59 @@ def test_will_does_not_invent_alternate_executor_or_gift_fallback():
     assert any("alternate or default executor" in row for row in decision.diagnostics)
     assert any("unresolved name" in row for row in decision.diagnostics)
     assert any("dispositive fallback" in row for row in decision.diagnostics)
+
+
+def test_will_rejects_duplicate_specific_property_in_residue():
+    prompt = (
+        "Prepare a Hong Kong Last Will under the Wills Ordinance. Give the said "
+        "Premises to David and divide the residuary estate equally among my three "
+        "sons. Sole Executor: David."
+    )
+    artifact = (
+        "I APPOINT David to be the sole Executor. I GIVE DEVISE and BEQUEATH "
+        "the said Premises to David absolutely. I GIVE DEVISE and BEQUEATH all "
+        "my estate, including the said Premises, equally among my three sons."
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+            {
+                "role": "tool",
+                "name": "local_document_export",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "markdown": "[Download Will.docx](/api/hermes/will.docx)",
+                    }
+                ),
+            },
+        ],
+        current_turn_user_idx=0,
+        final_response=(
+            "Under section 5, each witness must sign in the presence of each other. "
+            "Current version 2024-08-18: "
+            "https://www.elegislation.gov.hk/hk/cap30!en"
+        ),
+        attempts=2,
+        exported_artifact_contents=(artifact,),
+    )
+
+    assert decision.action == "nudge"
+    assert any("specifically bequeathed" in row for row in decision.diagnostics)
+
+
+def test_will_does_not_treat_no_alternate_executor_note_as_an_appointment():
+    prompt = "Prepare a Hong Kong Last Will. Sole Executor: David."
+    artifact = (
+        "THIS IS THE LAST WILL. I APPOINT David to be the sole Executor. "
+        "No alternate executor has been nominated."
+    )
+
+    assert not any(
+        "alternate or default executor" in row
+        for row in _will_artifact_errors({"content": prompt}, artifact)
+    )
 
 
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
