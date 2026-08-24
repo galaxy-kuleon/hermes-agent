@@ -594,6 +594,52 @@ def test_operational_attestation_clause_does_not_require_citation_in_artifact():
     assert decision.action == "pass"
 
 
+def test_will_rejects_mutual_witness_presence_as_section_5_minimum():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Section 5 of Cap. 30 governs execution: the testator must sign with "
+        "two witnesses present at the same time, and each witness must sign in "
+        "the testator's presence and in the presence of each other. Current "
+        "version 2024-08-18: https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+
+    assert decision.action == "nudge"
+    assert "does not require a witness" in decision.message
+
+
+def test_will_allows_mutual_witness_presence_as_cautious_practice_only():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Under section 5 of Cap. 30, both witnesses must be present when the "
+        "testator signs or acknowledges the signature. A witness may attest and "
+        "sign, or acknowledge that witness's signature, in the testator's presence "
+        "but not necessarily in the presence of the other witness. As cautious "
+        "execution practice, I recommend that everyone remain together and sign in "
+        "each other's presence. Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+
+    assert decision.action == "pass", decision
+
+
 def test_will_does_not_confuse_alternate_executor_survival_with_divorce_effect():
     prompt = (
         "Prepare a Last Will under the Hong Kong Wills Ordinance. "

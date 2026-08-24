@@ -266,6 +266,15 @@ _SECTION_4_EXECUTION_CLAIM_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _SECTION_5_RE = re.compile(r"(?:(?:section|s\.?)\s*5\b|第\s*5\s*條)", re.IGNORECASE)
+_SECTION_5_WRONG_MUTUAL_WITNESS_PRESENCE_RE = re.compile(
+    r"(?:(?:section|s\.?)\s*5\b.{0,420}"
+    r"(?:each\s+witness|witnesses?).{0,180}"
+    r"(?:in\s+the\s+presence\s+of\s+each\s+other|in\s+each\s+other['’]s\s+presence)|"
+    r"(?:each\s+witness|witnesses?).{0,180}"
+    r"(?:in\s+the\s+presence\s+of\s+each\s+other|in\s+each\s+other['’]s\s+presence)"
+    r".{0,420}(?:section|s\.?)\s*5\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
 _SECTION_10_RE = re.compile(r"(?:(?:section|s\.?)\s*10\b|第\s*10\s*條)", re.IGNORECASE)
@@ -721,6 +730,12 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
         errors.append(
             "Cap. 30 section 4 must not be used for signing or witnessing requirements"
         )
+    if _SECTION_5_WRONG_MUTUAL_WITNESS_PRESENCE_RE.search(answer):
+        errors.append(
+            "Cap. 30 section 5 does not require a witness to sign or acknowledge "
+            "in the presence of another witness; signing together may be advised "
+            "as cautious practice but must not be stated as the statutory minimum"
+        )
 
     discusses_divorce_effect = bool(_DIVORCE_EFFECT_CLAIM_RE.search(answer))
     if discusses_divorce_effect:
@@ -946,8 +961,8 @@ def evaluate_hk_legal_answer(
                 "mechanisms must remain in an artifact, use these exact verified "
                 "minimums: section 10 voids a disposition to an attesting witness or "
                 "that witness's spouse, not the will; section 14 is subject to both "
-                "the power-of-appointment class in subsection (2) and the particular "
-                "contemplated-marriage classes in subsections (3)-(4); section 15 "
+                "the power-of-appointment class in subsection (2) and marriage to "
+                "the particular person contemplated in subsections (3)-(4); section 15 "
                 "omits a former spouse's executor/trustee appointment and causes a "
                 "devise or bequest to that spouse to lapse except where the will "
                 "shows a contrary intention.\nDetected defects:\n- "
