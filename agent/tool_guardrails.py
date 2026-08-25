@@ -758,8 +758,8 @@ class ToolCallGuardrailController:
                 action="reuse",
                 code="skill_mutation_intent_required",
                 message=(
-                    "The user did not ask to create, edit, patch, publish, delete, "
-                    "or write a skill in this turn. Skip this mutation and continue "
+                    "The user did not ask to create, edit, import, share, publish, "
+                    "delete, or write a skill in this turn. Skip this mutation and continue "
                     "with read-only skill_view/source calls. Do not claim that the "
                     "skill or its files changed."
                 ),

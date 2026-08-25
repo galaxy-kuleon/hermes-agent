@@ -170,6 +170,23 @@ def test_skill_application_is_read_only_without_explicit_mutation_intent():
     )
 
 
+def test_skill_attachment_import_and_sharing_are_explicit_mutation_intent():
+    assert has_explicit_skill_mutation_intent(
+        "I want to pass the skill to colleague and they do not need to do "
+        "anything to attach the 76PDFs in their session. I also don’t need "
+        "to attach 76PDFs in my other session"
+    )
+    assert has_explicit_skill_mutation_intent(
+        "Import these attachments into the legal skill and share it with colleagues."
+    )
+    assert has_explicit_skill_mutation_intent(
+        "把這些 PDF 匯入技能，然後分享給同事。"
+    )
+    assert not has_explicit_skill_mutation_intent(
+        "Apply the legal skill to answer this question."
+    )
+
+
 def test_referential_confirmation_inherits_recent_skill_mutation_context():
     history = [
         {

@@ -18,13 +18,15 @@ _CLASS_NUMBER_RE = re.compile(r"\b([1-9]|[1-9][0-9])\b")
 _CLASS_PLACEHOLDER_RE = re.compile(r"(?<=class-)N(?=\.)")
 _SKILL_MUTATION_INTENT_RE = re.compile(
     r"(?:\b(?:create|edit|update|modify|patch|change|write|delete|remove|rename|"
-    r"publish|install|sync|save|remember)\b.{0,120}\bskills?\b|"
+    r"publish|share|pass|import|add|attach|include|bundle|install|sync|save|remember)\b.{0,120}\bskills?\b|"
     r"\bskills?\b.{0,120}\b(?:create|edit|update|modify|patch|change|write|"
-    r"delete|remove|rename|publish|install|sync|save)\b|"
+    r"delete|remove|rename|publish|share|pass|import|add|attach|include|bundle|install|sync|save)\b|"
     r"(?:建立|新增|編輯|编辑|修改|更新|修補|删除|刪除|移除|重新命名|發佈|发布|"
+    r"分享|共享|傳給|传给|交給|交给|匯入|导入|導入|加入|附加|打包|包含|"
     r"安裝|安装|同步|儲存|保存|記住).{0,80}(?:技能|skill)|"
     r"(?:技能|skill).{0,80}(?:建立|新增|編輯|编辑|修改|更新|修補|删除|刪除|"
-    r"移除|重新命名|發佈|发布|安裝|安装|同步|儲存|保存))",
+    r"移除|重新命名|發佈|发布|分享|共享|傳給|传给|交給|交给|匯入|导入|"
+    r"導入|加入|附加|打包|包含|安裝|安装|同步|儲存|保存))",
     re.IGNORECASE | re.DOTALL,
 )
 _REFERENTIAL_SKILL_MUTATION_RE = re.compile(
