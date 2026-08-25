@@ -3325,6 +3325,100 @@ class TestRunConversation:
         assert dispatch.call_count == 1
 
 
+    def test_hk_cross_search_manual_finalizes_immediately_after_official_read(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.tools = _make_tool_defs("hk_legal_authority")
+        agent.valid_tool_names = {"hk_legal_authority"}
+        tool_call = _mock_tool_call(
+            name="hk_legal_authority",
+            arguments=(
+                '{"chapter":"559","provisions":["12"],'
+                '"cross_search_classes":[32,43]}'
+            ),
+            call_id="hkel-cross-search",
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        )
+        authority = json.dumps(
+            {
+                "success": True,
+                "cannot_confirm": False,
+                "chapter": "559",
+                "version_date": "2025-02-14",
+                "official_web_url": "https://www.elegislation.gov.hk/hk/cap559!en",
+                "required_answer_citation": (
+                    "Hong Kong e-Legislation, Cap. 559, current version "
+                    "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+                ),
+                "requested_provisions": [{"provision": "12", "found": True}],
+                "official_practice_guidance": [
+                    {
+                        "success": True,
+                        "cannot_confirm": False,
+                        "matched_page_text_complete": True,
+                        "title": "Cross search list",
+                        "official_url": (
+                            "https://www.ipd.gov.hk/filemanager/ipd/common/"
+                            "trade-marks/registry-work-manual/current/eng/"
+                            "Cross_search_list.pdf"
+                        ),
+                        "pdf_sha256": "c" * 64,
+                        "requested_classes": [32, 43],
+                        "classes": [
+                            {
+                                "class": 32,
+                                "found": True,
+                                "cross_search_classes": [30, 33],
+                            },
+                            {
+                                "class": 43,
+                                "found": True,
+                                "cross_search_classes": [29, 30, 39, 42],
+                            },
+                        ],
+                        "verified_extracts": [
+                            {
+                                "page": 20,
+                                "text": "Class 32 Cross search classes : 30, 33",
+                            },
+                            {
+                                "page": 28,
+                                "text": (
+                                    "Class 43 Cross search classes : "
+                                    "29, 30, 39, 42"
+                                ),
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        with (
+            patch("run_agent.handle_function_call", return_value=authority) as dispatch,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Apply Hong Kong Trade Mark Enquiry: will juice be cross-class "
+                "checked with restaurant services?"
+            )
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 1
+        assert result["turn_exit_reason"] == "hk_legal_authority_research_complete"
+        assert result["final_response"].startswith(
+            "No — Classes 32 and 43 are not"
+        )
+        assert "Cross_search_list.pdf" in result["final_response"]
+        assert dispatch.call_count == 1
+
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

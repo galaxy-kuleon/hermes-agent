@@ -429,6 +429,25 @@ def test_cross_search_answer_passes_with_exact_manual_rows_and_citations():
     )
 
 
+def test_cross_search_completed_evidence_can_finalize_without_model_rewrite():
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_CROSS_SEARCH_PROMPT},
+            _cross_search_authority_message(),
+        ],
+        current_turn_user_idx=0,
+        final_response="",
+        attempts=5,
+    )
+
+    assert decision.action == "replace"
+    assert decision.message.startswith("No — Classes 32 and 43 are not")
+    assert "Class 32: cross-search classes 30, 33" in decision.message
+    assert "Class 43: cross-search classes 29, 30, 39, 42" in decision.message
+    assert "Cross_search_list.pdf" in decision.message
+    assert "2025-02-14" in decision.message
+
+
 def test_old_turn_authority_cannot_ground_the_current_turn():
     messages = [
         {"role": "user", "content": "Hong Kong trademark law"},

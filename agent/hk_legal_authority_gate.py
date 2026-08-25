@@ -801,6 +801,54 @@ def _deterministic_registered_mark_answer(
     )
 
 
+def _deterministic_cross_search_answer(
+    authorities: list[dict[str, Any]], requested_classes: tuple[int, int]
+) -> str:
+    guidance = _cross_search_guidance(authorities)
+    rows: dict[int, tuple[int, ...]] = {}
+    manual_url = ""
+    for manual in guidance:
+        manual_url = manual_url or manual["official_url"]
+        for row in manual.get("classes") or ():
+            rows[row["class"]] = row["cross_search_classes"]
+    left, right = requested_classes
+    related = right in rows.get(left, ()) or left in rows.get(right, ())
+    direct = "Yes" if related else "No"
+    relationship = "are" if related else "are not"
+
+    row_lines = []
+    for class_number in requested_classes:
+        related_classes = ", ".join(str(value) for value in rows[class_number])
+        row_lines.append(
+            f"- Class {class_number}: cross-search classes {related_classes or 'none'}"
+        )
+
+    statute_citations = []
+    for authority in authorities:
+        if authority["chapter"] != "559":
+            continue
+        citation = authority["required_answer_citation"] or (
+            f"Hong Kong e-Legislation, Cap. 559, current version "
+            f"{_citation_date(authority['version_date'])}: "
+            f"{authority['official_web_url']}"
+        )
+        if citation not in statute_citations:
+            statute_citations.append(citation)
+
+    sources = [f"Hong Kong IPD, Cross search list: {manual_url}"]
+    sources.extend(statute_citations)
+    return (
+        f"{direct} — Classes {left} and {right} {relationship} a cross-search pair "
+        "in the current Hong Kong IPD list. The exact Registry rows are:\n"
+        + "\n".join(row_lines)
+        + "\n\nThis answers the Registry's cross-search scope. Section 12 separately "
+        "governs the legal effect of identical or similar marks for identical or "
+        "similar goods or services; it does not change the manual's class list.\n\n"
+        "Verified official sources:\n- "
+        + "\n- ".join(sources)
+    )
+
+
 def _missing_minimum_provisions(
     user_message: Any,
     final_response: str,
@@ -1314,9 +1362,10 @@ def evaluate_hk_legal_answer(
                     + "]",
                 )
             return GateDecision(
-                "fail",
-                "無法提供可依賴的香港商標跨類檢索結論：最終答案仍與知識產權署現行"
-                "Cross search list 的已驗證類別資料列矛盾或未作直接回答。",
+                "replace",
+                _deterministic_cross_search_answer(
+                    authorities, (requested_classes[0], requested_classes[1])
+                ),
             )
 
     if _requires_rule_13_practice(messages[current_turn_user_idx]):

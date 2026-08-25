@@ -171,10 +171,10 @@ def _reset_tool_read_dedup_after_context_rewrite(task_id: str | None) -> None:
         logger.debug("skill-view dedup reset after context rewrite failed", exc_info=True)
 
 
-def _completed_registered_mark_research_in_batch(
+def _completed_hk_legal_research_in_batch(
     messages: list[Any], tool_calls: list[Any]
 ) -> bool:
-    """Return whether this tool batch hit the completed-research control."""
+    """Return whether this tool batch now has a terminal official-law bundle."""
     call_ids = {str(getattr(call, "id", "") or "") for call in tool_calls}
     if not call_ids:
         return False
@@ -194,6 +194,28 @@ def _completed_registered_mark_research_in_batch(
             and payload.get("execution_skipped") is True
         ):
             return True
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("success") is not True or payload.get("cannot_confirm") is not False:
+            continue
+        for guidance in payload.get("official_practice_guidance") or ():
+            if not isinstance(guidance, dict):
+                continue
+            requested_classes = guidance.get("requested_classes") or []
+            class_rows = guidance.get("classes") or []
+            if (
+                guidance.get("title") == "Cross search list"
+                and guidance.get("success") is True
+                and guidance.get("cannot_confirm") is False
+                and guidance.get("matched_page_text_complete") is True
+                and len(requested_classes) == 2
+                and len(class_rows) == 2
+                and all(
+                    isinstance(row, dict) and row.get("found") is True
+                    for row in class_rows
+                )
+            ):
+                return True
     return False
 
 
@@ -7345,7 +7367,7 @@ def run_conversation(
                     failed = True
                     break
 
-                if _completed_registered_mark_research_in_batch(
+                if _completed_hk_legal_research_in_batch(
                     messages, assistant_message.tool_calls
                 ):
                     _research_complete_decision = evaluate_hk_legal_answer(
