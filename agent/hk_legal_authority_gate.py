@@ -133,6 +133,15 @@ _CROSS_SEARCH_NEGATIVE_RE = re.compile(
     r".{0,120}(?:\bno\b|\bnot\b|不是|不會|不会|並非|并非)",
     re.IGNORECASE | re.DOTALL,
 )
+_SOURCE_BOUNDARY_FOLLOWUP_RE = re.compile(
+    r"(?:\bskill(?:'s|s)?\b.{0,160}\b(?:knowledge|source|manual)\b|"
+    r"\b(?:knowledge|source|manual)\b.{0,160}\bskill(?:'s|s)?\b|"
+    r"\b(?:ignore|exclude|focus\s+exclusively|only\s+(?:use|utili[sz]e))\b"
+    r".{0,160}\b(?:knowledge|skill|source)\b|"
+    r"技能.{0,160}(?:知識|知识|來源|来源|手冊|手册)|"
+    r"(?:只用|僅用|仅用|忽略|不要用).{0,160}(?:知識|知识|技能|來源|来源))",
+    re.IGNORECASE | re.DOTALL,
+)
 _FALSE_MANUAL_DELIVERY_RE = re.compile(
     r"(?:manual|ipd|working\s+manual|工作手冊|實務手冊|实务手册).{0,160}"
     r"(?:truncat|unavailable|not\s+found|not\s+read|could\s+not\s+read|"
@@ -422,7 +431,9 @@ def is_hk_statutory_turn(messages: list[Any], current_turn_user_idx: int) -> boo
     if is_hk_statutory_query(current):
         return True
     if not (
-        _LEGAL_RE.search(current_text) or _PRACTICE_GUIDANCE_RE.search(current_text)
+        _LEGAL_RE.search(current_text)
+        or _PRACTICE_GUIDANCE_RE.search(current_text)
+        or _SOURCE_BOUNDARY_FOLLOWUP_RE.search(current_text)
     ):
         return False
     prior_text = "\n".join(
@@ -572,6 +583,25 @@ def _requires_rule_13_practice(user_message: Any) -> bool:
 def _requires_cross_search_practice(user_message: Any) -> bool:
     text = _message_text(user_message)
     return bool(_TRADE_MARK_RE.search(text)) and bool(_CROSS_SEARCH_RE.search(text))
+
+
+def _requires_cross_search_turn(
+    messages: list[Any], current_turn_user_idx: int
+) -> bool:
+    current = messages[current_turn_user_idx]
+    if _requires_cross_search_practice(current):
+        return True
+    current_text = _message_text(current)
+    if not _SOURCE_BOUNDARY_FOLLOWUP_RE.search(current_text):
+        return False
+    prior_text = "\n".join(
+        _message_text(message)
+        for message in messages[
+            max(0, current_turn_user_idx - 8) : current_turn_user_idx
+        ]
+        if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
+    )
+    return bool(_TRADE_MARK_RE.search(prior_text) and _CROSS_SEARCH_RE.search(prior_text))
 
 
 def _mentioned_trade_mark_classes(user_message: Any, answer: str) -> tuple[int, ...]:
@@ -1282,7 +1312,7 @@ def evaluate_hk_legal_answer(
             tuple(wills_errors),
         )
 
-    if _requires_cross_search_practice(messages[current_turn_user_idx]):
+    if _requires_cross_search_turn(messages, current_turn_user_idx):
         practice_guidance = _cross_search_guidance(authorities)
         guidance_classes = tuple(
             dict.fromkeys(

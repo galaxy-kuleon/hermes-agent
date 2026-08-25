@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from agent.hk_legal_authority_gate import (
     MAX_AUTHORITY_NUDGES,
     _will_artifact_errors,
@@ -446,6 +448,40 @@ def test_cross_search_completed_evidence_can_finalize_without_model_rewrite():
     assert "Class 43: cross-search classes 29, 30, 39, 42" in decision.message
     assert "Cross_search_list.pdf" in decision.message
     assert "2025-02-14" in decision.message
+
+
+@pytest.mark.parametrize(
+    "followup",
+    [
+        (
+            "i am shocked. When applying the hong kong trade mark enquiry skill, "
+            "you ignore all the other knowledge and only utilize the knowledge "
+            "fed into this skill"
+        ),
+        (
+            "are you kidding me? I have just told you ignore the other knowledge. "
+            "Focus exclusively on the knowledge in the skill"
+        ),
+    ],
+)
+def test_cross_search_source_boundary_followup_inherits_matter(followup):
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_CROSS_SEARCH_PROMPT},
+            {
+                "role": "assistant",
+                "content": "Prior answer about the cross-class question.",
+            },
+            {"role": "user", "content": followup},
+            _cross_search_authority_message(),
+        ],
+        current_turn_user_idx=2,
+        final_response="",
+        attempts=5,
+    )
+
+    assert decision.action == "replace"
+    assert decision.message.startswith("No — Classes 32 and 43 are not")
 
 
 def test_old_turn_authority_cannot_ground_the_current_turn():
