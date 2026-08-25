@@ -85,6 +85,26 @@ def has_explicit_skill_mutation_intent(
         return True
     if not _REFERENTIAL_SKILL_MUTATION_RE.search(current):
         return False
+    return has_referential_skill_mutation_intent(
+        user_message,
+        conversation_history=conversation_history,
+    )
+
+
+def has_referential_skill_mutation_intent(
+    user_message: Any,
+    conversation_history: list[Any] | None = None,
+) -> bool:
+    """Return true only when this turn confirms a recent skill mutation.
+
+    Direct edit requests need no special routing. A referential confirmation
+    must be routed to ``skill_manage`` rather than mistaken for a profile-
+    memory request. A bare ``yes`` remains false unless recent context contains
+    a concrete skill-mutation proposal.
+    """
+    current = _message_text(user_message)
+    if not _REFERENTIAL_SKILL_MUTATION_RE.search(current):
+        return False
     recent = "\n".join(
         _message_text(message)
         for message in (conversation_history or [])[-6:]
@@ -92,6 +112,18 @@ def has_explicit_skill_mutation_intent(
         and message.get("role") in {"user", "assistant"}
     )
     return bool(_SKILL_MUTATION_CONTEXT_RE.search(recent))
+
+
+def referential_skill_mutation_instruction() -> str:
+    """Ephemeral model instruction for an already-authorized confirmation."""
+    return (
+        "[System: The latest user message is a referential confirmation of the "
+        "recently discussed skill mutation. It is explicit authorization for "
+        "this turn. Resolve it with exactly one skill_manage call now. Do not "
+        "route this confirmation to memory or OpenViking, do not ask the user "
+        "to repeat the request, and do not claim a change unless the tool "
+        "receipt proves it. Mandatory safety policy still applies.]"
+    )
 
 
 def _payload(message: Any) -> dict | None:

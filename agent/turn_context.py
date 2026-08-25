@@ -583,6 +583,8 @@ def build_turn_context(
     from agent.hk_legal_authority_gate import is_strict_skill_source_boundary
     from agent.skill_source_gate import (
         has_explicit_skill_mutation_intent,
+        has_referential_skill_mutation_intent,
+        referential_skill_mutation_instruction,
         requested_class_numbers,
     )
 
@@ -606,6 +608,10 @@ def build_turn_context(
     # ungrounded draft as if it were an answer.
     agent._skill_source_stream_hold = strict_skill_source_boundary
     agent._held_skill_source_stream_text = ""
+    referential_skill_mutation = has_referential_skill_mutation_intent(
+        user_message,
+        conversation_history=conversation_history,
+    )
     set_skill_mutation_allowed = getattr(
         agent._tool_guardrails, "set_skill_mutation_allowed", None
     )
@@ -614,8 +620,14 @@ def build_turn_context(
             has_explicit_skill_mutation_intent(
                 user_message,
                 conversation_history=conversation_history,
-            )
+            ),
+            referential=referential_skill_mutation,
         )
+    skill_mutation_instruction = (
+        referential_skill_mutation_instruction()
+        if referential_skill_mutation
+        else ""
+    )
     agent._tool_guardrail_halt_decision = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
@@ -1280,6 +1292,16 @@ def build_turn_context(
                 if plugin_user_context
                 else _gateway_notes
             )
+
+    # A confirmation such as "yes, make it governing rule" is semantically a
+    # skill edit, not a profile-memory write. Keep the stored user text exact
+    # while routing the API copy to the correct mechanism.
+    if skill_mutation_instruction:
+        plugin_user_context = (
+            plugin_user_context + "\n\n" + skill_mutation_instruction
+            if plugin_user_context
+            else skill_mutation_instruction
+        )
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}

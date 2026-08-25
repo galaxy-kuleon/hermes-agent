@@ -4,6 +4,7 @@ from agent.skill_source_gate import (
     MAX_SKILL_SOURCE_NUDGES,
     evaluate_skill_source_contract,
     has_explicit_skill_mutation_intent,
+    has_referential_skill_mutation_intent,
 )
 
 
@@ -189,6 +190,29 @@ def test_referential_confirmation_inherits_recent_skill_mutation_context():
         conversation_history=[{"role": "assistant", "content": "Is that clear?"}],
     )
     assert not has_explicit_skill_mutation_intent("yes")
+
+
+def test_referential_skill_mutation_is_distinct_from_direct_edit():
+    history = [
+        {
+            "role": "assistant",
+            "content": (
+                "I can replace the skill's authority contract with a governing rule."
+            ),
+        }
+    ]
+    assert has_referential_skill_mutation_intent(
+        "yes, make it governing rule, permanent across sessions",
+        conversation_history=history,
+    )
+    assert not has_referential_skill_mutation_intent(
+        "edit the hong-kong-trade-mark-enquiry skill now",
+        conversation_history=history,
+    )
+    assert not has_referential_skill_mutation_intent(
+        "yes",
+        conversation_history=[{"role": "assistant", "content": "Do you agree?"}],
+    )
 
 
 def test_declared_answer_contract_rejects_candidate_dump():

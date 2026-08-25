@@ -493,6 +493,25 @@ def test_skill_mutation_requires_explicit_turn_intent():
     )
 
 
+def test_referential_skill_confirmation_routes_away_from_profile_memory():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_skill_mutation_allowed(True, referential=True)
+
+    for tool_name in ("memory", "viking_remember"):
+        decision = controller.before_call(tool_name, {"content": "save this"})
+        assert decision.action == "reuse"
+        assert decision.code == "referential_skill_mutation_requires_skill_manage"
+
+    assert (
+        controller.before_call(
+            "skill_manage", {"action": "patch", "name": "example"}
+        ).action
+        == "allow"
+    )
+
+
 def test_authorized_skill_mutation_cannot_disable_hk_authority_contract():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"

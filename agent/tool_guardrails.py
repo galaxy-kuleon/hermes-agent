@@ -435,6 +435,7 @@ class ToolCallGuardrailController:
         self._strict_skill_source_loaded: set[tuple[str, str]] = set()
         self._strict_skill_successful_source_calls: set[ToolCallSignature] = set()
         self._skill_mutation_allowed = False
+        self._referential_skill_mutation_required = False
 
     def set_strict_skill_source_boundary(
         self,
@@ -517,9 +518,20 @@ class ToolCallGuardrailController:
         """Backward-compatible wrapper for existing callers and integrations."""
         self.observe_skill_source_result("skill_view", args, result)
 
-    def set_skill_mutation_allowed(self, enabled: bool) -> None:
+    def set_skill_mutation_allowed(
+        self,
+        enabled: bool,
+        *,
+        referential: bool = False,
+    ) -> None:
         """Bind skill writes to explicit user mutation intent for this turn."""
         self._skill_mutation_allowed = bool(enabled)
+        self._referential_skill_mutation_required = bool(enabled and referential)
+
+    @property
+    def referential_skill_mutation_required(self) -> bool:
+        """Whether this turn must resolve a confirmed skill mutation."""
+        return self._referential_skill_mutation_required
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -536,6 +548,23 @@ class ToolCallGuardrailController:
         cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
         if cap_block is not None:
             return cap_block
+
+        if (
+            self._referential_skill_mutation_required
+            and tool_name in {"memory", "viking_remember"}
+        ):
+            return ToolGuardrailDecision(
+                action="reuse",
+                code="referential_skill_mutation_requires_skill_manage",
+                message=(
+                    "This turn confirms a skill mutation, not a profile or "
+                    "OpenViking memory write. Skip this persistence call and "
+                    "resolve the confirmation with exactly one skill_manage "
+                    "call. Do not ask the user to repeat the request."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
 
         if (
             self._strict_skill_source_boundary
