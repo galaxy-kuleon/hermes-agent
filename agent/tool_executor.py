@@ -656,6 +656,10 @@ def _run_agent_tool_execution_middleware(
                     getattr(guardrail_decision, "code", "")
                     == "skill_mutation_intent_required"
                 )
+                authority_contract_mutation_rejected = (
+                    getattr(guardrail_decision, "code", "")
+                    == "authority_contract_mutation_rejected"
+                )
                 result = json.dumps(
                     {
                         "success": True,
@@ -663,11 +667,15 @@ def _run_agent_tool_execution_middleware(
                             research_complete
                             or source_boundary_enforced
                             or skill_mutation_intent_required
+                            or authority_contract_mutation_rejected
                         ),
                         "research_complete": research_complete,
                         "source_boundary_enforced": source_boundary_enforced,
                         "skill_mutation_intent_required": (
                             skill_mutation_intent_required
+                        ),
+                        "authority_contract_mutation_rejected": (
+                            authority_contract_mutation_rejected
                         ),
                         "execution_skipped": True,
                         "tool": function_name,

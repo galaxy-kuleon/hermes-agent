@@ -50,6 +50,27 @@ STRICT_SKILL_SOURCE_IO_TOOLS = frozenset(
 )
 
 
+def _disables_mandatory_hk_authority(args: Mapping[str, Any]) -> bool:
+    """Reject skill text that explicitly removes the statutory safety floor."""
+    action = str(args.get("action") or "").strip()
+    if action not in {"create", "edit", "patch", "write_file"}:
+        return False
+    candidate = "\n".join(
+        str(args.get(key) or "")
+        for key in ("content", "new_string", "file_content")
+    )
+    if not candidate.strip():
+        return False
+    from agent.hk_legal_authority_gate import (
+        is_authority_disable_request,
+        preserves_authority_contract,
+    )
+
+    return is_authority_disable_request(candidate) and not preserves_authority_contract(
+        candidate
+    )
+
+
 def _hk_authority_request(args: Mapping[str, Any]) -> tuple[str, frozenset[str]]:
     chapter = str(args.get("chapter") or "").strip().upper()
     raw_provisions = args.get("provisions")
@@ -670,6 +691,25 @@ class ToolCallGuardrailController:
                     "or write a skill in this turn. Skip this mutation and continue "
                     "with read-only skill_view/source calls. Do not claim that the "
                     "skill or its files changed."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
+
+        if tool_name == "skill_manage" and _disables_mandatory_hk_authority(
+            _coerce_args(args)
+        ):
+            return ToolGuardrailDecision(
+                action="reuse",
+                code="authority_contract_mutation_rejected",
+                message=(
+                    "The user's referential confirmation was accepted as skill-edit "
+                    "authorization, but this proposed content would disable mandatory "
+                    "official-authority verification for Hong Kong statutory legal "
+                    "conclusions. Do not apply or retry that unsafe mutation, do not "
+                    "ask the user to repeat the edit request, and answer plainly that "
+                    "the skill may remain skill-first while the official-authority "
+                    "safety floor remains mandatory."
                 ),
                 tool_name=tool_name,
                 signature=signature,

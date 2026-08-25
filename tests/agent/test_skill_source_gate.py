@@ -169,6 +169,28 @@ def test_skill_application_is_read_only_without_explicit_mutation_intent():
     )
 
 
+def test_referential_confirmation_inherits_recent_skill_mutation_context():
+    history = [
+        {
+            "role": "assistant",
+            "content": (
+                "Do you want me to patch the hong-kong-trade-mark-enquiry "
+                "skill and make this its governing rule?"
+            ),
+        }
+    ]
+
+    assert has_explicit_skill_mutation_intent(
+        "yes, make it governing rule, permanent across sessions",
+        conversation_history=history,
+    )
+    assert not has_explicit_skill_mutation_intent(
+        "yes",
+        conversation_history=[{"role": "assistant", "content": "Is that clear?"}],
+    )
+    assert not has_explicit_skill_mutation_intent("yes")
+
+
 def test_declared_answer_contract_rejects_candidate_dump():
     decision = evaluate_skill_source_contract(
         messages=[

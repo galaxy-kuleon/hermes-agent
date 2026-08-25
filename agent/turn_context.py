@@ -611,7 +611,10 @@ def build_turn_context(
     )
     if callable(set_skill_mutation_allowed):
         set_skill_mutation_allowed(
-            has_explicit_skill_mutation_intent(user_message)
+            has_explicit_skill_mutation_intent(
+                user_message,
+                conversation_history=conversation_history,
+            )
         )
     agent._tool_guardrail_halt_decision = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)

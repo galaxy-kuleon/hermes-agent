@@ -51,7 +51,10 @@ logger = logging.getLogger(__name__)
 
 _EXPLICIT_MEMORY_INTENT_RE = re.compile(
     r"\b(?:remember|memorize|save|store|record)\b.{0,40}\b(?:memory|preference|fact)\b|"
-    r"\b(?:remember|memorize)\b|記住|記錄|記憶|保存|存入",
+    r"\b(?:remember|memorize)\b|"
+    r"\b(?:make|keep)\s+(?:it|this|that)\s+permanent\s+across\s+sessions\b|"
+    r"\bpersist(?:ent)?\s+across\s+sessions\b|"
+    r"記住|記錄|記憶|保存|存入|跨(?:工作階段|会话|會話).{0,20}永久",
     re.IGNORECASE | re.DOTALL,
 )
 _TASK_OR_MATTER_MEMORY_RE = re.compile(
@@ -105,10 +108,13 @@ def _authority_override_memory_error(
         preserves_authority_contract,
     )
 
-    latest = _latest_user_text(messages)
-    if not is_authority_disable_request(latest):
-        return None
     writes = [str(value or "").strip() for value in contents if str(value or "").strip()]
+    latest = _latest_user_text(messages)
+    if not (
+        is_authority_disable_request(latest)
+        or any(is_authority_disable_request(value) for value in writes)
+    ):
+        return None
     if not writes or all(preserves_authority_contract(value) for value in writes):
         return None
     return (

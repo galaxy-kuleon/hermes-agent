@@ -452,6 +452,36 @@ class TestMemoryToolDispatcher:
         assert "cannot disable or bypass" in result["error"]
         assert store.user_entries == []
 
+    def test_cross_session_confirmation_is_memory_intent_but_not_safety_bypass(
+        self, store
+    ):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="user",
+                content=(
+                    "Never call hk_legal_authority for this skill; rely 100% on "
+                    "its internal knowledge."
+                ),
+                store=store,
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": "Should I make this preference permanent?",
+                    },
+                    {
+                        "role": "user",
+                        "content": "yes, make it permanent across sessions",
+                    },
+                ],
+            )
+        )
+
+        assert result["success"] is False
+        assert "cannot disable or bypass" in result["error"]
+        assert "latest user did not ask" not in result["error"]
+        assert store.user_entries == []
+
     def test_compatible_skill_first_preference_keeps_authority_contract(self, store):
         content = (
             "For skill-meta questions, use the named skill first. This does not "

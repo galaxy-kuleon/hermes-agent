@@ -27,6 +27,25 @@ _SKILL_MUTATION_INTENT_RE = re.compile(
     r"移除|重新命名|發佈|发布|安裝|安装|同步|儲存|保存))",
     re.IGNORECASE | re.DOTALL,
 )
+_REFERENTIAL_SKILL_MUTATION_RE = re.compile(
+    r"(?:^|\b)(?:yes|yep|correct|please\s+do|do\s+it|go\s+ahead|proceed)\b|"
+    r"\bmake\s+(?:it|this|that)\s+(?:the\s+)?governing\s+rule\b|"
+    r"\bmake\s+(?:it|this|that)\s+permanent(?:\s+across\s+sessions)?\b|"
+    r"(?:好|是|對|对|可以|請做|请做|照做|繼續|继续|設為|设为).{0,60}"
+    r"(?:永久|規則|规则|技能|skill)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SKILL_MUTATION_CONTEXT_RE = re.compile(
+    r"\bskills?\b.{0,180}\b(?:create|edit|update|modify|patch|change|write|"
+    r"delete|remove|rename|publish|save|governing\s+rule|permanent)\b|"
+    r"\b(?:create|edit|update|modify|patch|change|write|delete|remove|rename|"
+    r"publish|save|governing\s+rule|permanent)\b.{0,180}\bskills?\b|"
+    r"(?:技能|skill).{0,120}(?:建立|新增|編輯|编辑|修改|更新|修補|刪除|"
+    r"删除|移除|規則|规则|永久)|"
+    r"(?:建立|新增|編輯|编辑|修改|更新|修補|刪除|删除|移除|規則|规则|"
+    r"永久).{0,120}(?:技能|skill)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -50,9 +69,29 @@ def _message_text(message: Any) -> str:
     return ""
 
 
-def has_explicit_skill_mutation_intent(user_message: Any) -> bool:
-    """Return whether the user explicitly asked to mutate skill state."""
-    return bool(_SKILL_MUTATION_INTENT_RE.search(_message_text(user_message)))
+def has_explicit_skill_mutation_intent(
+    user_message: Any,
+    conversation_history: list[Any] | None = None,
+) -> bool:
+    """Resolve direct edits and narrow referential confirmations.
+
+    A bare ``yes`` never grants mutation authority by itself. It does count
+    when the recent conversation explicitly proposed or described a skill
+    mutation, so users do not have to repeat the exact edit command that the
+    assistant just asked them to confirm.
+    """
+    current = _message_text(user_message)
+    if _SKILL_MUTATION_INTENT_RE.search(current):
+        return True
+    if not _REFERENTIAL_SKILL_MUTATION_RE.search(current):
+        return False
+    recent = "\n".join(
+        _message_text(message)
+        for message in (conversation_history or [])[-6:]
+        if isinstance(message, dict)
+        and message.get("role") in {"user", "assistant"}
+    )
+    return bool(_SKILL_MUTATION_CONTEXT_RE.search(recent))
 
 
 def _payload(message: Any) -> dict | None:

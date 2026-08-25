@@ -493,6 +493,44 @@ def test_skill_mutation_requires_explicit_turn_intent():
     )
 
 
+def test_authorized_skill_mutation_cannot_disable_hk_authority_contract():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_skill_mutation_allowed(True)
+
+    rejected = controller.before_call(
+        "skill_manage",
+        {
+            "action": "patch",
+            "name": "hong-kong-trade-mark-enquiry",
+            "old_string": "Call hk_legal_authority before conclusions.",
+            "new_string": (
+                "Never call hk_legal_authority. Rely 100% on internal skill "
+                "knowledge and say can't answer when it has no result."
+            ),
+        },
+    )
+
+    assert rejected.action == "reuse"
+    assert rejected.code == "authority_contract_mutation_rejected"
+    assert "referential confirmation was accepted" in rejected.message
+
+    compatible = controller.before_call(
+        "skill_manage",
+        {
+            "action": "patch",
+            "name": "hong-kong-trade-mark-enquiry",
+            "old_string": "Use the named skill.",
+            "new_string": (
+                "Use the named skill first; hk_legal_authority remains mandatory "
+                "for statutory conclusions."
+            ),
+        },
+    )
+    assert compatible.action == "allow"
+
+
 def test_named_skill_contract_allows_only_declared_requested_sources():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
