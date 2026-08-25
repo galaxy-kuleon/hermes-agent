@@ -972,6 +972,38 @@ class TestSkillViewCollisionDetection:
             ),
         )
 
+    def test_caller_owned_skill_shadows_same_named_platform_skill(self, tmp_path):
+        """A user's editable copy is the deterministic bare-name winner."""
+        from agent.skill_namespaces import bind_skill_namespace_user
+
+        platform_dir = tmp_path / "platform"
+        user_base = tmp_path / "user-skills"
+        user_dir = user_base / "alice"
+        platform_dir.mkdir()
+        user_dir.mkdir(parents=True)
+        _make_skill(platform_dir, "shared-law", body="PLATFORM VERSION")
+        _make_skill(user_dir, "shared-law", body="USER WORKING COPY")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", platform_dir),
+            patch(
+                "agent.skill_namespaces.get_user_skills_base_dir",
+                return_value=user_base,
+            ),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            bind_skill_namespace_user("alice"),
+        ):
+            bare = json.loads(skill_view("shared-law"))
+            platform = json.loads(skill_view("platform:shared-law"))
+
+        assert bare["success"] is True
+        assert bare["namespace"] == "user"
+        assert bare["qualified_name"] == "user:shared-law"
+        assert "USER WORKING COPY" in bare["content"]
+        assert platform["success"] is True
+        assert platform["namespace"] == "platform"
+        assert "PLATFORM VERSION" in platform["content"]
+
     def test_nested_local_collides_with_top_level_external(self, tmp_path):
         """The original bug scenario: nested local + top-level external,
         same name. Now refuses with both paths surfaced."""

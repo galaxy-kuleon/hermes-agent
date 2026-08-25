@@ -1547,6 +1547,43 @@ def skill_view(
             if project_candidates:
                 candidates = project_candidates
 
+        if len(candidates) > 1 and root_namespace_filter is None:
+            # A caller-owned skill is the user's working copy and therefore
+            # intentionally shadows a same-named shared platform skill in that
+            # user's session. Keep every other collision fail-closed: two
+            # user matches, two platform matches, or any external/project mix
+            # still requires an explicit qualified/categorized name.
+            from agent.skill_namespaces import PLATFORM_NAMESPACE, USER_NAMESPACE
+
+            def _root_for(candidate_md: Path):
+                for root in all_roots:
+                    try:
+                        candidate_md.resolve().relative_to(root.path.resolve())
+                        return root
+                    except (OSError, ValueError):
+                        continue
+                return None
+
+            rooted = [(_root_for(smd), sd, smd) for sd, smd in candidates]
+            namespaces = {root.namespace for root, _, _ in rooted if root is not None}
+            user_candidates = [
+                (sd, smd)
+                for root, sd, smd in rooted
+                if root is not None and root.namespace == USER_NAMESPACE
+            ]
+            if (
+                len(user_candidates) == 1
+                and namespaces
+                and namespaces <= {PLATFORM_NAMESPACE, USER_NAMESPACE}
+                and len(rooted) == sum(root is not None for root, _, _ in rooted)
+            ):
+                candidates = user_candidates
+                logging.getLogger(__name__).info(
+                    "Resolved bare skill '%s' to caller-owned user namespace "
+                    "over same-named platform skill",
+                    name,
+                )
+
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -1563,9 +1600,9 @@ def skill_view(
                     ),
                     "matches": paths,
                     "hint": (
-                        "Pass the full relative path instead of the bare name "
-                        "(e.g., 'category/skill-name'), or rename one of the "
-                        "colliding skills so each name is unique."
+                        "Pass 'user:skill-name' or 'platform:skill-name' for "
+                        "built-in namespaces, use the full relative path for "
+                        "categorized skills, or rename colliding skills."
                     ),
                 },
                 ensure_ascii=False,
