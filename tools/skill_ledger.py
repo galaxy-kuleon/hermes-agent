@@ -1,9 +1,11 @@
 """Per-mutation skill audit ledger + single-edit rollback (tracker #79686 P3).
 
-Every skill mutation — regardless of actor — appends one JSONL entry to
-``~/.hermes/skills/.curator_ledger.jsonl`` describing who changed what, with
-before/after file manifests whose contents are stored content-addressed
-(sha256-deduped) under ``~/.hermes/.curator_backups/blobs/``.
+Every skill mutation — regardless of actor — appends one JSONL entry describing
+who changed what, with before/after file manifests whose contents are stored
+content-addressed (sha256-deduped). Personal namespace audit data stays beside
+that writable namespace. Platform audit data lives under writable
+``skill-state/platform`` because the serving gateway deliberately mounts the
+platform skill tree read-only.
 
 Design decisions (Teknium-approved):
   - JSONL, not the state DB: the ledger is a durable, human-greppable audit
@@ -106,16 +108,22 @@ def derive_actor() -> str:
 
 def ledger_path() -> Path:
     root = _ledger_root_override.get()
+    home = get_hermes_home()
     if root is not None:
+        if Path(root) == home / "skills":
+            return home / "skill-state" / "platform" / "curator_ledger.jsonl"
         return root / ".curator_ledger.jsonl"
-    return get_hermes_home() / "skills" / ".curator_ledger.jsonl"
+    return home / "skill-state" / "platform" / "curator_ledger.jsonl"
 
 
 def blobs_dir() -> Path:
     root = _ledger_root_override.get()
+    home = get_hermes_home()
     if root is not None:
+        if Path(root) == home / "skills":
+            return home / "skill-state" / "platform" / "curator_backups" / "blobs"
         return root / ".curator_backups" / "blobs"
-    return get_hermes_home() / ".curator_backups" / "blobs"
+    return home / "skill-state" / "platform" / "curator_backups" / "blobs"
 
 
 def ledger_enabled() -> bool:

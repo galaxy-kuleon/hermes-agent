@@ -48,6 +48,23 @@ def _create(name="my-skill", content=VALID_SKILL_CONTENT):
     return json.loads(skill_manage(action="create", name=name, content=content))
 
 
+def test_platform_ledger_uses_writable_operational_state(ledger_env):
+    """The gateway's read-only platform tree must never be the audit sink."""
+    from tools import skill_ledger
+
+    expected = (
+        ledger_env["home"]
+        / "skill-state"
+        / "platform"
+        / "curator_ledger.jsonl"
+    )
+    assert skill_ledger.ledger_path() == expected
+    assert skill_ledger.blobs_dir() == expected.parent / "curator_backups" / "blobs"
+    with skill_ledger.ledger_scope(ledger_env["skills"]):
+        assert skill_ledger.ledger_path() == expected
+        assert skill_ledger.blobs_dir() == expected.parent / "curator_backups" / "blobs"
+
+
 # ---------------------------------------------------------------------------
 # Adapted from PR #50261 (@yu-xin-c)
 # ---------------------------------------------------------------------------
