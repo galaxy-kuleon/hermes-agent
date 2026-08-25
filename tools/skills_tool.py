@@ -102,6 +102,52 @@ _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_li
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
+_MAX_DECLARED_SKILL_VIEW_CALL_CHARS = 512
+_MAX_DECLARED_SKILL_VIEW_EXAMPLES = 3
+_DECLARED_SKILL_VIEW_CALL_RE = re.compile(
+    rf"skill_view\s*\(([^)\n]{{1,{_MAX_DECLARED_SKILL_VIEW_CALL_CHARS}}})\)"
+)
+_DECLARED_SKILL_VIEW_NAME_RE = re.compile(
+    r"\bname\s*=\s*['\"]([^'\"]+)['\"]"
+)
+_DECLARED_SKILL_VIEW_FILE_RE = re.compile(
+    r"\bfile_path\s*=\s*['\"]([^'\"]+)['\"]"
+)
+
+
+def _declared_skill_view_examples(content: str) -> list[dict[str, str]]:
+    """Extract bounded, non-traversing ``skill_view`` examples from a skill.
+
+    These are recovery guidance only. They are never executed or used to
+    bypass namespace or file ACL checks.
+    """
+    examples: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for call in _DECLARED_SKILL_VIEW_CALL_RE.findall(content or ""):
+        name_match = _DECLARED_SKILL_VIEW_NAME_RE.search(call)
+        file_match = _DECLARED_SKILL_VIEW_FILE_RE.search(call)
+        if not name_match or not file_match:
+            continue
+        name = name_match.group(1).strip()
+        file_path = file_match.group(1).strip()
+        path = PurePosixPath(file_path)
+        if (
+            not name
+            or any(char.isspace() for char in name)
+            or not file_path
+            or file_path.startswith("/")
+            or "\\" in file_path
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            continue
+        key = (name, file_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        examples.append({"name": name, "file_path": file_path})
+        if len(examples) >= _MAX_DECLARED_SKILL_VIEW_EXAMPLES:
+            break
+    return examples
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
@@ -1658,15 +1704,24 @@ def skill_view(
                 # Remove empty categories
                 available_files = {k: v for k, v in available_files.items() if v}
 
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": f"File '{file_path}' not found in skill '{name}'.",
-                        "available_files": available_files,
-                        "hint": "Use one of the available file paths listed above",
-                    },
-                    ensure_ascii=False,
-                )
+                declared_examples = _declared_skill_view_examples(content)
+                hint = "Use one of the available file paths listed above"
+                if declared_examples:
+                    hint = (
+                        "This file is not part of the loaded skill. Follow one of "
+                        "the skill's declared skill_view examples below; do not "
+                        "invent a local path or request terminal access."
+                    )
+
+                payload = {
+                    "success": False,
+                    "error": f"File '{file_path}' not found in skill '{name}'.",
+                    "available_files": available_files,
+                    "hint": hint,
+                }
+                if declared_examples:
+                    payload["declared_skill_view_examples"] = declared_examples
+                return json.dumps(payload, ensure_ascii=False)
 
             # Read the file content
             try:

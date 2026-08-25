@@ -398,6 +398,47 @@ class TestSkillView:
         assert skill["linked_files"] is not None
         assert "references" in skill["linked_files"]
 
+    def test_missing_file_returns_declared_cross_skill_view_example(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "selector",
+                body=(
+                    "Load the source with "
+                    'skill_view(name="catalog", '
+                    'file_path="references/class-N.md").'
+                ),
+            )
+            missing = json.loads(
+                skill_view("selector", file_path="data/class_14.json")
+            )
+
+        assert missing["success"] is False
+        assert missing["declared_skill_view_examples"] == [
+            {"name": "catalog", "file_path": "references/class-N.md"}
+        ]
+        assert "do not invent a local path" in missing["hint"]
+        assert "terminal access" in missing["hint"]
+
+    def test_missing_file_omits_unsafe_declared_examples(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "selector",
+                body=(
+                    'skill_view(name="catalog", file_path="../secret.md")\n'
+                    'skill_view(name="catalog", file_path="/etc/passwd")\n'
+                    'skill_view(name="bad name", file_path="references/a.md")'
+                ),
+            )
+            missing = json.loads(
+                skill_view("selector", file_path="data/class_14.json")
+            )
+
+        assert missing["success"] is False
+        assert "declared_skill_view_examples" not in missing
+        assert missing["hint"] == "Use one of the available file paths listed above"
+
     def test_disabled_skill_blocked_enabled_allowed(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
