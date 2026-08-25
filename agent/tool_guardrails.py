@@ -407,6 +407,7 @@ class ToolCallGuardrailController:
         self._strict_skill_source_contract_seen = False
         self._strict_skill_source_requested_classes: tuple[int, ...] = ()
         self._strict_skill_source_allowed: set[tuple[str, str]] = set()
+        self._strict_skill_source_loaded: set[tuple[str, str]] = set()
         self._skill_mutation_allowed = False
 
     def set_strict_skill_source_boundary(
@@ -433,6 +434,21 @@ class ToolCallGuardrailController:
             return
         if not isinstance(payload, dict) or payload.get("success") is not True:
             return
+        call_args = _coerce_args(args)
+        loaded_source = (
+            str(payload.get("name") or call_args.get("name") or "").strip(),
+            str(
+                payload.get("file")
+                or (payload.get("routing") or {}).get("file_path")
+                or call_args.get("file_path")
+                or ""
+            ).strip(),
+        )
+        if (
+            payload.get("content_complete") is True
+            and loaded_source in self._strict_skill_source_allowed
+        ):
+            self._strict_skill_source_loaded.add(loaded_source)
         contract = payload.get("source_contract")
         if not isinstance(contract, dict):
             return
@@ -518,6 +534,19 @@ class ToolCallGuardrailController:
                         "declared by the loaded skill contract. Skip this "
                         "undeclared or repeated skill path and use exactly: "
                         f"{exact_calls or 'no support-file call is authorized'}."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            if requested in self._strict_skill_source_loaded:
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="strict_skill_source_already_loaded",
+                    message=(
+                        "This exact declared source was already loaded completely "
+                        "in this turn. Reuse its earlier full-fidelity result and "
+                        "answer the user now; do not request it again or mention "
+                        "this internal control in the user-visible answer."
                     ),
                     tool_name=tool_name,
                     signature=signature,

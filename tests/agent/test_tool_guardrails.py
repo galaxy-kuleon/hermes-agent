@@ -523,6 +523,34 @@ def test_named_skill_contract_allows_only_declared_requested_sources():
             == "allow"
         )
 
+    class_14_args = {
+        "name": "tw-tmc",
+        "file_path": "references/class-14.md",
+    }
+    controller.observe_skill_view_result(
+        class_14_args,
+        json.dumps(
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-14.md",
+                "content": "full authoritative source",
+                "content_complete": True,
+            }
+        ),
+    )
+    repeated = controller.before_call("skill_view", class_14_args)
+    assert repeated.action == "reuse"
+    assert repeated.code == "strict_skill_source_already_loaded"
+    assert "already loaded completely" in repeated.message
+    assert (
+        controller.before_call(
+            "skill_view",
+            {"name": "tw-tmc", "file_path": "references/class-35.md"},
+        ).action
+        == "allow"
+    )
+
     blocked = controller.before_call(
         "skill_view",
         {"name": "tw-tmcc", "file_path": "references/tipo-items.md"},
