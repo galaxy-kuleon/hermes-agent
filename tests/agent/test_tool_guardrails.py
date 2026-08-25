@@ -440,7 +440,6 @@ def test_strict_skill_source_boundary_skips_ambient_knowledge_tools():
     controller.set_strict_skill_source_boundary(True)
 
     for tool_name in (
-        "memory",
         "session_search",
         "viking_search",
         "viking_browse",
@@ -451,6 +450,14 @@ def test_strict_skill_source_boundary_skips_ambient_knowledge_tools():
         assert decision.action == "reuse"
         assert decision.code == "strict_skill_source_boundary"
         assert "cannot-confirm" in decision.message
+
+    assert (
+        controller.before_call(
+            "memory",
+            {"action": "add", "target": "user", "content": "safe preference"},
+        ).action
+        == "allow"
+    )
 
     assert controller.before_call("skill_view", {"name": "named-skill"}).action == "allow"
     assert (

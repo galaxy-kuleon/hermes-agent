@@ -196,8 +196,11 @@ _AUTHORITY_DISABLE_COMPLIANCE_RE = re.compile(
 )
 _AUTHORITY_CONTRACT_PRESERVED_RE = re.compile(
     r"(?:cannot|can't|will\s+not|must\s+not)\s+(?:disable|ignore|override|remove)"
-    r".{0,140}\bhk_legal_authority\b|"
-    r"\bhk_legal_authority\b.{0,140}(?:remains?|still|mandatory|required|cannot\s+be\s+disabled)|"
+    r".{0,140}(?:\bhk_legal_authority\b|official[- ]authority)|"
+    r"(?:\bhk_legal_authority\b|official[- ]authority).{0,140}"
+    r"(?:remains?|still|mandatory|required|cannot\s+be\s+disabled)|"
+    r"(?:does\s+not|doesn't)\s+disable.{0,100}(?:\bhk_legal_authority\b|"
+    r"mandatory\s+official[- ]authority)|"
     r"(?:不能|無法|无法|不會|不会).{0,100}(?:停用|忽略|繞過|绕过|覆蓋|覆盖)"
     r".{0,100}(?:hk_legal_authority|官方法源)|"
     r"(?:hk_legal_authority|官方法源).{0,100}(?:仍然|仍須|仍须|強制|强制|必須|必须)",
@@ -470,6 +473,19 @@ def is_hk_statutory_query(user_message: Any) -> bool:
     if not (_HK_RE.search(text) and _LEGAL_RE.search(text)):
         return False
     return bool(_LEGAL_REQUEST_RE.search(text) or "?" in text or "？" in text)
+
+
+def is_authority_disable_request(user_message: Any) -> bool:
+    """Identify a preference request that attempts to remove official checks."""
+    return bool(_AUTHORITY_DISABLE_REQUEST_RE.search(_message_text(user_message)))
+
+
+def preserves_authority_contract(text: Any) -> bool:
+    """Accept only a stored preference that keeps the statutory safety floor."""
+    value = _message_text(text)
+    return bool(_AUTHORITY_CONTRACT_PRESERVED_RE.search(value)) and not bool(
+        _AUTHORITY_DISABLE_COMPLIANCE_RE.search(value)
+    )
 
 
 def is_strict_skill_source_boundary(user_message: Any) -> bool:

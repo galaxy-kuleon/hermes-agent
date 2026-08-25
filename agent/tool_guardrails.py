@@ -36,7 +36,8 @@ _HK_REGISTERED_MARK_COMPLETE_BUNDLE = frozenset(
 )
 _STRICT_SKILL_BOUNDARY_EXTERNAL_KNOWLEDGE_TOOLS = frozenset(
     {
-        "memory",
+        # ``memory`` is a state mutation, not a knowledge read.  Its own
+        # mutation boundary validates explicit intent and safe content.
         "session_search",
         "viking_search",
         "viking_browse",

@@ -93,6 +93,32 @@ def _unrequested_task_memory_error(
         "engine. Do not retry the memory write."
     )
 
+
+def _authority_override_memory_error(
+    messages: Optional[List[Dict[str, Any]]], contents: List[str]
+) -> str | None:
+    """Never persist a preference that disables official statutory checks."""
+    if not messages:
+        return None
+    from agent.hk_legal_authority_gate import (
+        is_authority_disable_request,
+        preserves_authority_contract,
+    )
+
+    latest = _latest_user_text(messages)
+    if not is_authority_disable_request(latest):
+        return None
+    writes = [str(value or "").strip() for value in contents if str(value or "").strip()]
+    if not writes or all(preserves_authority_contract(value) for value in writes):
+        return None
+    return (
+        "Unsafe preference memory rejected: a preference cannot disable or bypass "
+        "mandatory official-authority verification for Hong Kong statutory legal "
+        "conclusions. If the user also requested a durable skill-first preference, "
+        "store only the compatible form: use the named skill first for skill-meta "
+        "questions while hk_legal_authority remains mandatory for statutory conclusions."
+    )
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -1183,6 +1209,17 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        authority_denial = _authority_override_memory_error(
+            messages,
+            [
+                str(op.get("content") or op.get("new_text") or "")
+                for op in operations
+                if isinstance(op, dict)
+                and str(op.get("action") or "") in {"add", "replace"}
+            ],
+        )
+        if authority_denial:
+            return tool_error(authority_denial, success=False)
         denial = _unrequested_task_memory_error(
             messages,
             [
@@ -1215,6 +1252,13 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    authority_denial = _authority_override_memory_error(
+        messages,
+        [str(content or "")] if action in {"add", "replace"} else [],
+    )
+    if authority_denial:
+        return tool_error(authority_denial, success=False)
 
     denial = _unrequested_task_memory_error(
         messages,
