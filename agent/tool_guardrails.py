@@ -436,6 +436,8 @@ class ToolCallGuardrailController:
         self._strict_skill_successful_source_calls: set[ToolCallSignature] = set()
         self._skill_mutation_allowed = False
         self._referential_skill_mutation_required = False
+        self._referential_skill_mutation_in_flight = False
+        self._referential_skill_mutation_landed = False
 
     def set_strict_skill_source_boundary(
         self,
@@ -565,6 +567,46 @@ class ToolCallGuardrailController:
                 tool_name=tool_name,
                 signature=signature,
             )
+
+        if self._referential_skill_mutation_required and tool_name == "skill_manage":
+            call_args = _coerce_args(args)
+            if self._referential_skill_mutation_landed:
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="referential_skill_mutation_already_landed",
+                    message=(
+                        "One coherent skill mutation already landed for this "
+                        "confirmation. Do not split or repeat it. Use the receipt "
+                        "and answer the user truthfully."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            if self._referential_skill_mutation_in_flight:
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="referential_skill_mutation_in_flight",
+                    message=(
+                        "One coherent skill mutation is already executing for "
+                        "this confirmation. Do not split the same behavioral "
+                        "change into parallel calls."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            if _is_frontmatter_only_skill_patch(call_args):
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="referential_skill_mutation_metadata_only",
+                    message=(
+                        "This confirmation is for a behavioral skill rule, not "
+                        "a metadata-only description edit. Skip this call and "
+                        "make one coherent behavioral skill mutation instead."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            self._referential_skill_mutation_in_flight = True
 
         if (
             self._strict_skill_source_boundary
@@ -845,6 +887,17 @@ class ToolCallGuardrailController:
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
+        if self._referential_skill_mutation_required and tool_name == "skill_manage":
+            self._referential_skill_mutation_in_flight = False
+            payload = safe_json_loads(result or "")
+            if (
+                not failed
+                and isinstance(payload, dict)
+                and payload.get("success") is True
+                and payload.get("execution_skipped") is not True
+            ):
+                self._referential_skill_mutation_landed = True
+
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
@@ -1048,6 +1101,20 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
+
+
+def _is_frontmatter_only_skill_patch(args: Mapping[str, Any]) -> bool:
+    """Identify a metadata-only description patch on a behavioral turn."""
+    if str(args.get("action") or "").strip().lower() != "patch":
+        return False
+    old = str(args.get("old_string") or "").strip()
+    new = str(args.get("new_string") or "").strip()
+    return (
+        "\n" not in old
+        and "\n" not in new
+        and old.lower().startswith("description:")
+        and new.lower().startswith("description:")
+    )
 
 
 def _result_hash(result: str | None) -> str:

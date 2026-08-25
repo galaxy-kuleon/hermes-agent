@@ -114,29 +114,6 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-def _require_referential_skill_manage(
-    agent: Any,
-    api_kwargs: dict[str, Any],
-    *,
-    api_call_count: int,
-) -> None:
-    """Force the first confirmed skill-mutation turn onto its mechanism."""
-    if (
-        api_call_count == 1
-        and agent.api_mode == "chat_completions"
-        and "skill_manage" in agent.valid_tool_names
-        and getattr(
-            agent._tool_guardrails,
-            "referential_skill_mutation_required",
-            False,
-        )
-    ):
-        api_kwargs["tool_choice"] = {
-            "type": "function",
-            "function": {"name": "skill_manage"},
-        }
-
-
 def _deliver_verbatim_terminal_reply(agent, reply: str) -> bool:
     """Project an exact trusted terminal reply to the live text stream.
 
@@ -3020,16 +2997,6 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
-                # A referential confirmation ("yes, make it governing rule")
-                # is already explicit skill-edit authority. On an OpenAI-
-                # compatible route, require skill_manage for the first call so
-                # the model cannot detour into profile/OpenViking memory and
-                # later claim that the skill changed without a receipt.
-                _require_referential_skill_manage(
-                    agent,
-                    api_kwargs,
-                    api_call_count=api_call_count,
-                )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is

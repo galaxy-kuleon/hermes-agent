@@ -512,6 +512,59 @@ def test_referential_skill_confirmation_routes_away_from_profile_memory():
     )
 
 
+def test_referential_skill_confirmation_allows_one_behavioral_landing():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_skill_mutation_allowed(True, referential=True)
+
+    metadata = controller.before_call(
+        "skill_manage",
+        {
+            "action": "patch",
+            "name": "example",
+            "old_string": "description: old",
+            "new_string": "description: new",
+        },
+    )
+    assert metadata.action == "reuse"
+    assert metadata.code == "referential_skill_mutation_metadata_only"
+
+    args = {
+        "action": "patch",
+        "name": "example",
+        "old_string": "# Example",
+        "new_string": "# Example\n\n## Governing rule\nUse the verified source.",
+    }
+    assert controller.before_call("skill_manage", args).action == "allow"
+    parallel = controller.before_call(
+        "skill_manage", {"action": "patch", "name": "example", "old_string": "a"}
+    )
+    assert parallel.action == "reuse"
+    assert parallel.code == "referential_skill_mutation_in_flight"
+
+    controller.after_call(
+        "skill_manage", args, '{"success":true,"message":"patched"}', failed=False
+    )
+    repeated = controller.before_call("skill_manage", args)
+    assert repeated.action == "reuse"
+    assert repeated.code == "referential_skill_mutation_already_landed"
+
+
+def test_failed_referential_skill_mutation_allows_one_retry():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_skill_mutation_allowed(True, referential=True)
+    args = {"action": "patch", "name": "example", "old_string": "missing"}
+
+    assert controller.before_call("skill_manage", args).action == "allow"
+    controller.after_call(
+        "skill_manage", args, '{"success":false,"error":"not found"}', failed=True
+    )
+    assert controller.before_call("skill_manage", args).action == "allow"
+
+
 def test_authorized_skill_mutation_cannot_disable_hk_authority_contract():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
