@@ -1991,6 +1991,20 @@ def skill_view(
                     exc_info=True,
                 )
 
+        declared_examples = _declared_skill_view_examples(rendered_content)
+        source_contract = None
+        if declared_examples:
+            source_contract = {
+                "required_before_answer": True,
+                "instruction": (
+                    "Load every relevant declared skill_view source before the "
+                    "final answer. Replace placeholders from the user's request. "
+                    "Do not substitute memory, local-path guesses, attachments, "
+                    "terminal access, or a prior run for these sources."
+                ),
+                "declared_skill_view_examples": declared_examples,
+            }
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1998,6 +2012,9 @@ def skill_view(
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
+            # Keep the declared dependency contract before the long skill body
+            # so provider-side tool-result compaction cannot hide it.
+            "source_contract": source_contract,
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,

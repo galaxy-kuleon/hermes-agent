@@ -412,6 +412,7 @@ class TestSkillView:
             missing = json.loads(
                 skill_view("selector", file_path="data/class_14.json")
             )
+            loaded = json.loads(skill_view("selector"))
 
         assert missing["success"] is False
         assert missing["declared_skill_view_examples"] == [
@@ -419,6 +420,19 @@ class TestSkillView:
         ]
         assert "do not invent a local path" in missing["hint"]
         assert "terminal access" in missing["hint"]
+        assert loaded["source_contract"] == {
+            "required_before_answer": True,
+            "instruction": (
+                "Load every relevant declared skill_view source before the final "
+                "answer. Replace placeholders from the user's request. Do not "
+                "substitute memory, local-path guesses, attachments, terminal "
+                "access, or a prior run for these sources."
+            ),
+            "declared_skill_view_examples": [
+                {"name": "catalog", "file_path": "references/class-N.md"}
+            ],
+        }
+        assert list(loaded).index("source_contract") < list(loaded).index("content")
 
     def test_missing_file_omits_unsafe_declared_examples(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
