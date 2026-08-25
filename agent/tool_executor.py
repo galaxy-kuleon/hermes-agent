@@ -50,6 +50,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from agent.tool_guardrails import STRICT_SKILL_SOURCE_IO_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -737,12 +738,12 @@ def _run_agent_tool_execution_middleware(
         _hb_thread.start()
         try:
             result = execute(final_args)
-            if function_name == "skill_view":
+            if function_name in STRICT_SKILL_SOURCE_IO_TOOLS:
                 observe = getattr(
-                    agent._tool_guardrails, "observe_skill_view_result", None
+                    agent._tool_guardrails, "observe_skill_source_result", None
                 )
                 if callable(observe):
-                    observe(final_args, result)
+                    observe(function_name, final_args, result)
             return result
         finally:
             _hb_stop.set()

@@ -44,6 +44,9 @@ _STRICT_SKILL_BOUNDARY_EXTERNAL_KNOWLEDGE_TOOLS = frozenset(
         "web_search",
     }
 )
+STRICT_SKILL_SOURCE_IO_TOOLS = frozenset(
+    {"skill_view", "read_file", "search_files"}
+)
 
 
 def _hk_authority_request(args: Mapping[str, Any]) -> tuple[str, frozenset[str]]:
@@ -408,6 +411,7 @@ class ToolCallGuardrailController:
         self._strict_skill_source_requested_classes: tuple[int, ...] = ()
         self._strict_skill_source_allowed: set[tuple[str, str]] = set()
         self._strict_skill_source_loaded: set[tuple[str, str]] = set()
+        self._strict_skill_successful_source_calls: set[ToolCallSignature] = set()
         self._skill_mutation_allowed = False
 
     def set_strict_skill_source_boundary(
@@ -420,12 +424,13 @@ class ToolCallGuardrailController:
         self._strict_skill_source_boundary = bool(enabled)
         self._strict_skill_source_requested_classes = tuple(requested_classes)
 
-    def observe_skill_view_result(
+    def observe_skill_source_result(
         self,
+        tool_name: str,
         args: Mapping[str, Any] | None,
         result: Any,
     ) -> None:
-        """Register the exact support files declared by the named skill."""
+        """Register successful named-skill and declared-source reads."""
         if not self._strict_skill_source_boundary:
             return
         try:
@@ -435,6 +440,14 @@ class ToolCallGuardrailController:
         if not isinstance(payload, dict) or payload.get("success") is not True:
             return
         call_args = _coerce_args(args)
+        if tool_name in STRICT_SKILL_SOURCE_IO_TOOLS and (
+            isinstance(payload.get("source_contract"), dict)
+            or payload.get("file")
+            or isinstance(payload.get("routing"), dict)
+        ):
+            self._strict_skill_successful_source_calls.add(
+                ToolCallSignature.from_call(tool_name, call_args)
+            )
         loaded_source = (
             str(payload.get("name") or call_args.get("name") or "").strip(),
             str(
@@ -470,8 +483,17 @@ class ToolCallGuardrailController:
                 )
             else:
                 allowed.add((name, file_path))
-        self._strict_skill_source_contract_seen = True
-        self._strict_skill_source_allowed = allowed
+        if allowed or not self._strict_skill_source_contract_seen:
+            self._strict_skill_source_contract_seen = True
+            self._strict_skill_source_allowed = allowed
+
+    def observe_skill_view_result(
+        self,
+        args: Mapping[str, Any] | None,
+        result: Any,
+    ) -> None:
+        """Backward-compatible wrapper for existing callers and integrations."""
+        self.observe_skill_source_result("skill_view", args, result)
 
     def set_skill_mutation_allowed(self, enabled: bool) -> None:
         """Bind skill writes to explicit user mutation intent for this turn."""
@@ -506,6 +528,24 @@ class ToolCallGuardrailController:
                     "outside memory/search source. Continue with skill_view and only "
                     "the source-specific tool or file that the skill directs you to; "
                     "if those sources cannot answer, say cannot-confirm or do not know."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
+
+        if (
+            self._strict_skill_source_boundary
+            and tool_name in STRICT_SKILL_SOURCE_IO_TOOLS
+            and signature in self._strict_skill_successful_source_calls
+        ):
+            return ToolGuardrailDecision(
+                action="reuse",
+                code="strict_skill_source_call_already_loaded",
+                message=(
+                    "This exact named-skill/source read already succeeded in "
+                    "this turn. Reuse its earlier full-fidelity result and "
+                    "continue; do not repeat the call or mention this internal "
+                    "control in the user-visible answer."
                 ),
                 tool_name=tool_name,
                 signature=signature,
@@ -551,6 +591,28 @@ class ToolCallGuardrailController:
                     tool_name=tool_name,
                     signature=signature,
                 )
+
+        if (
+            self._strict_skill_source_boundary
+            and self._strict_skill_source_contract_seen
+            and self._strict_skill_source_allowed
+            and self._strict_skill_source_allowed.issubset(
+                self._strict_skill_source_loaded
+            )
+            and tool_name in STRICT_SKILL_SOURCE_IO_TOOLS
+        ):
+            return ToolGuardrailDecision(
+                action="reuse",
+                code="strict_skill_sources_complete",
+                message=(
+                    "Every declared source required for this turn is already "
+                    "loaded completely. Stop source I/O and answer the user "
+                    "from those full-fidelity results now; do not mention this "
+                    "internal control in the user-visible answer."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
 
         if tool_name == "skill_manage" and not self._skill_mutation_allowed:
             return ToolGuardrailDecision(

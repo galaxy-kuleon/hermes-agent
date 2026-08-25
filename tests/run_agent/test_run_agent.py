@@ -2367,6 +2367,112 @@ def test_hk_authority_semantic_duplicate_reuses_prior_result_without_halt(
     assert controller.halt_decision is None
 
 
+def test_complete_declared_skill_sources_stop_alias_and_search_io(agent, monkeypatch):
+    from agent import tool_executor
+    from agent.tool_guardrails import (
+        ToolCallGuardrailConfig,
+        ToolCallGuardrailController,
+    )
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_strict_skill_source_boundary(
+        True, requested_classes=(14, 35)
+    )
+    agent._tool_guardrails = controller
+    monkeypatch.setattr(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    def execute(tool_name, args, result, call_id):
+        return tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name=tool_name,
+            function_args=args,
+            effective_task_id="task-1",
+            tool_call_id=call_id,
+            execute=lambda _args: result,
+        )
+
+    contract_result = json.dumps(
+        {
+            "success": True,
+            "name": "tw-tmcc",
+            "source_contract": {
+                "required_before_answer": True,
+                "declared_skill_view_examples": [
+                    {
+                        "name": "tw-tmc",
+                        "file_path": "references/class-N.md",
+                    }
+                ],
+            },
+        }
+    )
+    execute("skill_view", {"name": "tw-tmcc"}, contract_result, "skill")
+
+    alias_args = {"path": "/home/hermes/workspace/skills/tw-tmcc/SKILL.md"}
+    alias_result = json.dumps(
+        {
+            "success": True,
+            "name": "tw-tmcc",
+            "source_contract": {"required_before_answer": True},
+            "routing": {"to_tool": "skill_view"},
+        }
+    )
+    execute("read_file", alias_args, alias_result, "alias-first")
+    alias_replay = tool_executor._run_agent_tool_execution_middleware(
+        agent,
+        function_name="read_file",
+        function_args=alias_args,
+        effective_task_id="task-1",
+        tool_call_id="alias-replay",
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("successful alias must not dispatch twice")
+        ),
+    )
+    assert json.loads(alias_replay.result)["already_available"] is True
+
+    for class_number in (14, 35):
+        execute(
+            "skill_view",
+            {
+                "name": "tw-tmc",
+                "file_path": f"references/class-{class_number}.md",
+            },
+            json.dumps(
+                {
+                    "success": True,
+                    "name": "tw-tmc",
+                    "file": f"references/class-{class_number}.md",
+                    "content": "full authoritative source",
+                    "content_complete": True,
+                }
+            ),
+            f"class-{class_number}",
+        )
+
+    search_replay = tool_executor._run_agent_tool_execution_middleware(
+        agent,
+        function_name="search_files",
+        function_args={
+            "path": "/home/hermes/skills/legal/tw-tmc/references/class-35.md",
+            "pattern": "351914",
+        },
+        effective_task_id="task-1",
+        tool_call_id="search-after-complete",
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("complete declared sources must stop search I/O")
+        ),
+    )
+    payload = json.loads(search_replay.result)
+    assert payload["already_available"] is True
+    assert payload["execution_skipped"] is True
+    assert "Every declared source" in payload["instruction"]
+
+
 def test_hk_authority_subset_reuses_one_prior_complete_batch(agent, monkeypatch):
     from agent import tool_executor
     from agent.tool_guardrails import (

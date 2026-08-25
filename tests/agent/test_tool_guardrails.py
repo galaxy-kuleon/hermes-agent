@@ -511,6 +511,25 @@ def test_named_skill_contract_allows_only_declared_requested_sources():
         ),
     )
 
+    controller.observe_skill_source_result(
+        "read_file",
+        {"path": "/home/hermes/workspace/skills/tw-tmcc/SKILL.md"},
+        json.dumps(
+            {
+                "success": True,
+                "name": "tw-tmcc",
+                "source_contract": {"required_before_answer": True},
+                "routing": {"to_tool": "skill_view"},
+            }
+        ),
+    )
+    repeated_alias = controller.before_call(
+        "read_file",
+        {"path": "/home/hermes/workspace/skills/tw-tmcc/SKILL.md"},
+    )
+    assert repeated_alias.action == "reuse"
+    assert repeated_alias.code == "strict_skill_source_call_already_loaded"
+
     for class_number in (14, 35):
         assert (
             controller.before_call(
@@ -541,8 +560,8 @@ def test_named_skill_contract_allows_only_declared_requested_sources():
     )
     repeated = controller.before_call("skill_view", class_14_args)
     assert repeated.action == "reuse"
-    assert repeated.code == "strict_skill_source_already_loaded"
-    assert "already loaded completely" in repeated.message
+    assert repeated.code == "strict_skill_source_call_already_loaded"
+    assert "already succeeded" in repeated.message
     assert (
         controller.before_call(
             "skill_view",
@@ -550,6 +569,32 @@ def test_named_skill_contract_allows_only_declared_requested_sources():
         ).action
         == "allow"
     )
+
+    class_35_args = {
+        "name": "tw-tmc",
+        "file_path": "references/class-35.md",
+    }
+    controller.observe_skill_view_result(
+        class_35_args,
+        json.dumps(
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-35.md",
+                "content": "full authoritative source",
+                "content_complete": True,
+            }
+        ),
+    )
+    all_complete = controller.before_call(
+        "search_files",
+        {
+            "path": "/home/hermes/skills/legal/tw-tmc/references/class-35.md",
+            "pattern": "351914",
+        },
+    )
+    assert all_complete.action == "reuse"
+    assert all_complete.code == "strict_skill_sources_complete"
 
     blocked = controller.before_call(
         "skill_view",
