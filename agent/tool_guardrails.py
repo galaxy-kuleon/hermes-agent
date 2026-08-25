@@ -35,7 +35,14 @@ _HK_REGISTERED_MARK_COMPLETE_BUNDLE = frozenset(
     {"4", "11", "12", "44", "45", "52", "53"}
 )
 _STRICT_SKILL_BOUNDARY_EXTERNAL_KNOWLEDGE_TOOLS = frozenset(
-    {"memory", "session_search", "viking_search", "viking_browse", "web_search"}
+    {
+        "memory",
+        "session_search",
+        "viking_search",
+        "viking_browse",
+        "viking_read",
+        "web_search",
+    }
 )
 
 

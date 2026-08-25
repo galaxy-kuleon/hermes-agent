@@ -451,6 +451,15 @@ def test_cross_search_completed_evidence_can_finalize_without_model_rewrite():
     assert "2025-02-14" in decision.message
 
 
+def test_apply_named_skill_enforces_skill_source_boundary():
+    assert is_strict_skill_source_boundary(
+        "apply tm-twcc: 珠寶直銷 classes 14 and 35."
+    )
+    assert not is_strict_skill_source_boundary(
+        "Please apply the usual legal analysis to this contract."
+    )
+
+
 @pytest.mark.parametrize(
     "followup",
     [

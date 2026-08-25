@@ -51,6 +51,8 @@ class TestSkillViewDedup:
         assert r2.get("dedup") is True
         assert r2.get("content_returned") is False
         assert "unchanged" in r2["message"]
+        assert "only a dedup status" in r2["message"]
+        assert "does not contain the skill body" in r2["message"]
         assert "content" not in r2
 
     def test_modified_skill_returns_full_content(self, skills_home):

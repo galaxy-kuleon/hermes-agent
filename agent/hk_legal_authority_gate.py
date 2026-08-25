@@ -142,6 +142,10 @@ _SOURCE_BOUNDARY_FOLLOWUP_RE = re.compile(
     r"(?:只用|僅用|仅用|忽略|不要用).{0,160}(?:知識|知识|技能|來源|来源))",
     re.IGNORECASE | re.DOTALL,
 )
+_APPLY_NAMED_SKILL_RE = re.compile(
+    r"\bapply\s+[A-Za-z0-9][A-Za-z0-9._-]{0,127}\s*:",
+    re.IGNORECASE,
+)
 _FALSE_MANUAL_DELIVERY_RE = re.compile(
     r"(?:manual|ipd|working\s+manual|工作手冊|實務手冊|实务手册).{0,160}"
     r"(?:truncat|unavailable|not\s+found|not\s+read|could\s+not\s+read|"
@@ -421,8 +425,12 @@ def is_hk_statutory_query(user_message: Any) -> bool:
 
 
 def is_strict_skill_source_boundary(user_message: Any) -> bool:
-    """Return whether the user explicitly excludes knowledge outside one skill."""
-    return bool(_SOURCE_BOUNDARY_FOLLOWUP_RE.search(_message_text(user_message)))
+    """Return whether the user explicitly binds the turn to one skill."""
+    text = _message_text(user_message)
+    return bool(
+        _SOURCE_BOUNDARY_FOLLOWUP_RE.search(text)
+        or _APPLY_NAMED_SKILL_RE.search(text)
+    )
 
 
 def is_hk_statutory_turn(messages: list[Any], current_turn_user_idx: int) -> bool:

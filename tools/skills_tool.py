@@ -2178,8 +2178,8 @@ _SKILL_VIEW_DEDUP_CAP = 200
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "
     "conversation — refer to the earlier skill_view result; it is still "
-    "current and complete. (Re-issued after context compression, this "
-    "returns the full content again.)"
+    "current and complete. This response is only a dedup status and does not "
+    "contain the skill body. Do not invent alternate paths or sources."
 )
 
 

@@ -439,7 +439,14 @@ def test_strict_skill_source_boundary_skips_ambient_knowledge_tools():
     )
     controller.set_strict_skill_source_boundary(True)
 
-    for tool_name in ("memory", "session_search", "viking_search", "web_search"):
+    for tool_name in (
+        "memory",
+        "session_search",
+        "viking_search",
+        "viking_browse",
+        "viking_read",
+        "web_search",
+    ):
         decision = controller.before_call(tool_name, {"query": "outside knowledge"})
         assert decision.action == "reuse"
         assert decision.code == "strict_skill_source_boundary"
