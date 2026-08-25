@@ -269,6 +269,40 @@ def test_skill_meta_enquiry_does_not_trigger_statutory_research():
         "May I know if there is a skill called Hong Kong trade mark enquiry? "
         "What is this skill about?"
     )
+
+
+def test_skill_meta_answer_cannot_claim_full_view_was_truncated_or_add_history():
+    prompt = (
+        "May I know if there is a skill called Hong Kong trade mark enquiry? "
+        "What is this skill about?"
+    )
+    view = {
+        "role": "tool",
+        "name": "skill_view",
+        "content": json.dumps(
+            {
+                "success": True,
+                "name": "hong-kong-trade-mark-enquiry",
+                "description": "Verify Hong Kong trade mark law from official sources",
+                "tags": ["trademark", "hong-kong"],
+                "content": "# Complete skill\nCall hk_legal_authority before conclusions.",
+            }
+        ),
+    }
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": prompt}, view],
+        current_turn_user_idx=0,
+        final_response=(
+            "The skill output was partially truncated. It was used in your recent "
+            "Bennett matter and reflects your earlier corrections."
+        ),
+        attempts=0,
+    )
+    assert decision.action == "replace"
+    assert "hong-kong-trade-mark-enquiry" in decision.message
+    assert "hk_legal_authority" in decision.message
+    assert "truncated" not in decision.message
+    assert "Bennett" not in decision.message
     messages = [{"role": "user", "content": prompt}]
     assert not is_hk_statutory_query(messages[0])
     assert not is_hk_statutory_turn(messages, 0)

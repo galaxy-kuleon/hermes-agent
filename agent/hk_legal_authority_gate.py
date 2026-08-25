@@ -203,6 +203,18 @@ _AUTHORITY_CONTRACT_PRESERVED_RE = re.compile(
     r"(?:hk_legal_authority|官方法源).{0,100}(?:仍然|仍須|仍须|強制|强制|必須|必须)",
     re.IGNORECASE | re.DOTALL,
 )
+_SKILL_META_FALSE_TRUNCATION_RE = re.compile(
+    r"(?:skill|output|content).{0,100}(?:partial(?:ly)?|truncat|not\s+full|"
+    r"could\s+not\s+(?:load|read)).{0,100}|"
+    r"(?:部分|截斷|截断|不完整|未能完整).{0,100}(?:技能|skill|內容|内容)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SKILL_META_ADJACENT_HISTORY_RE = re.compile(
+    r"\byour\s+(?:recent|earlier|previous)\b.{0,160}"
+    r"(?:matter|case|correction|instruction|request)|"
+    r"(?:你|您)(?:最近|較早|较早|先前|之前).{0,120}(?:案件|事項|事项|更正|指示)",
+    re.IGNORECASE | re.DOTALL,
+)
 _ESTATE_DUTY_RE = re.compile(r"(?:estate\s+duty|遺產[稅税]|遗产[税稅])", re.IGNORECASE)
 _ESTATE_DUTY_ABOLITION_RE = re.compile(
     r"(?:abolish(?:ed|ment)?|no\s+estate\s+duty|not\s+subject\s+to\s+estate\s+duty|"
@@ -467,6 +479,47 @@ def is_strict_skill_source_boundary(user_message: Any) -> bool:
         _SOURCE_BOUNDARY_FOLLOWUP_RE.search(text)
         or _APPLY_NAMED_SKILL_RE.search(text)
     )
+
+
+def _successful_skill_views(
+    messages: list[Any], *, current_turn_user_idx: int
+) -> list[dict[str, Any]]:
+    views: list[dict[str, Any]] = []
+    for message in messages[current_turn_user_idx + 1 :]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "tool" or message.get("name") != "skill_view":
+            continue
+        for payload in _json_objects(message.get("content")):
+            if (
+                payload.get("success") is True
+                and str(payload.get("name") or "").strip()
+                and str(payload.get("content") or "").strip()
+            ):
+                views.append(payload)
+    return views
+
+
+def _bounded_skill_meta_summary(view: dict[str, Any]) -> str:
+    name = str(view.get("name") or "the requested skill").strip()
+    description = str(view.get("description") or "").strip()
+    tags = [str(tag).strip() for tag in (view.get("tags") or []) if str(tag).strip()]
+    lines = [f"Yes — the skill exists: `{name}`."]
+    if description:
+        lines.extend(("", description.rstrip(".") + "."))
+    lines.extend(
+        (
+            "",
+            "Its core contract is skill-first routing with current official-source "
+            "verification: before a Hong Kong statutory legal conclusion, it "
+            "requires `hk_legal_authority` for every relied-upon provision, visible "
+            "official URLs and version dates, and an explicit cannot-confirm result "
+            "when the official source does not support the claim.",
+        )
+    )
+    if tags:
+        lines.extend(("", "Tags: " + ", ".join(tags) + "."))
+    return "\n".join(lines)
 
 
 def is_hk_statutory_turn(messages: list[Any], current_turn_user_idx: int) -> bool:
@@ -1235,6 +1288,20 @@ def evaluate_hk_legal_answer(
             )
         return GateDecision("pass")
     if _SKILL_META_ENQUIRY_RE.search(current_text):
+        views = _successful_skill_views(
+            messages, current_turn_user_idx=current_turn_user_idx
+        )
+        if views and (
+            _SKILL_META_FALSE_TRUNCATION_RE.search(final_response)
+            or _SKILL_META_ADJACENT_HISTORY_RE.search(final_response)
+        ):
+            return GateDecision(
+                "replace",
+                _bounded_skill_meta_summary(views[-1]),
+                diagnostics=(
+                    "meta skill answer used adjacent history or contradicted the complete skill_view result",
+                ),
+            )
         return GateDecision("pass")
     if not is_hk_statutory_turn(messages, current_turn_user_idx):
         return GateDecision("pass")
