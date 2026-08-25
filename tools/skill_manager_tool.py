@@ -1805,6 +1805,7 @@ def _import_source_files(
     staged_library = stage_root / "library"
     staged_library.mkdir(parents=True)
     receipts: list[dict[str, Any]] = []
+    coverage_sources: list[tuple[str, str, str]] = []
     aggregate_chars = 0
     try:
         for ordinal, requested in enumerate(source_paths, start=1):
@@ -1885,6 +1886,7 @@ def _import_source_files(
                     "gaps": [],
                 }
             )
+            coverage_sources.append((str(resolved), requested, display_name))
 
         index_lines = [
             "# Imported source library",
@@ -1936,6 +1938,27 @@ def _import_source_files(
             raise
         if backup.exists():
             shutil.rmtree(backup)
+        # A successful atomic import is a complete reader outcome for each
+        # attached source: exact bytes were extracted without gaps and the
+        # resulting text is now durably present in the skill tree.  Record it
+        # only after the whole batch commits so a failed import cannot claim
+        # coverage.  This also prevents the terminal coverage footer from
+        # contradicting a successful import by labelling every source pending.
+        try:
+            from tools.attachment_ledger import OUTCOME_READ, record_outcome
+
+            for source_path, requested, display_name in coverage_sources:
+                record_outcome(
+                    source_path,
+                    task_id=task,
+                    status=OUTCOME_READ,
+                    reason="complete extraction imported into skill",
+                    display_name=display_name,
+                    handle=requested if requested.upper().startswith("F") else "",
+                    reader="skill_manage.import_files",
+                )
+        except Exception:
+            logger.debug("skill import attachment ledger update skipped", exc_info=True)
         return {
             "success": True,
             "message": (

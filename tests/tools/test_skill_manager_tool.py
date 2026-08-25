@@ -213,6 +213,99 @@ class TestImportFiles:
         assert "".join(path.read_text() for path in part_files) == extracted
         assert all("base64" not in path.read_text().lower() for path in part_files)
 
+    def test_successful_import_settles_attachment_coverage_after_commit(
+        self, tmp_path
+    ):
+        from tools.attachment_ledger import (
+            attachment_ledger_scope,
+            coverage_snapshot,
+        )
+
+        source = tmp_path / "001-deadbeef-source.pdf"
+        source.write_bytes(b"exact-pdf-bytes")
+        skills = tmp_path / "skills"
+
+        with _skill_dir(skills):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"]
+            managed = {
+                "path": skills / "my-skill",
+                "root": skills,
+                "namespace": "user",
+                "qualified_name": "user:my-skill",
+            }
+            with (
+                attachment_ledger_scope("task-1"),
+                patch("tools.skill_manager_tool._find_managed_skill", return_value=managed),
+                patch("tools.file_grants.resolve_grant_alias", return_value=str(source)),
+                patch("tools.file_grants.file_grant_error", return_value=None),
+                patch("tools.read_extract.is_extractable_document", return_value=True),
+                patch("tools.read_extract.extract_document_text", return_value="complete text"),
+                patch("tools.document_extract_cache.lookup", return_value=None),
+                patch(
+                    "tools.document_extract_cache.extraction_lock",
+                    return_value=nullcontext(),
+                ),
+                patch("tools.document_extract_cache.remember"),
+                patch("tools.skill_manager_tool._security_scan_skill", return_value=None),
+            ):
+                result = _import_source_files(
+                    "my-skill", ["F01"], None, "user", "task-1"
+                )
+                coverage = coverage_snapshot(
+                    [("F01", str(source))], task_id="task-1"
+                )
+
+        assert result["success"] is True
+        assert coverage["complete"] is True
+        assert coverage["read"][0]["reader"] == "skill_manage.import_files"
+
+    def test_failed_import_does_not_settle_attachment_coverage(self, tmp_path):
+        from tools.attachment_ledger import (
+            attachment_ledger_scope,
+            coverage_snapshot,
+        )
+
+        source = tmp_path / "source.pdf"
+        source.write_bytes(b"exact-pdf-bytes")
+        skills = tmp_path / "skills"
+
+        with _skill_dir(skills):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"]
+            managed = {
+                "path": skills / "my-skill",
+                "root": skills,
+                "namespace": "user",
+                "qualified_name": "user:my-skill",
+            }
+            with (
+                attachment_ledger_scope("task-1"),
+                patch("tools.skill_manager_tool._find_managed_skill", return_value=managed),
+                patch("tools.file_grants.resolve_grant_alias", return_value=str(source)),
+                patch("tools.file_grants.file_grant_error", return_value=None),
+                patch("tools.read_extract.is_extractable_document", return_value=True),
+                patch(
+                    "tools.read_extract.extract_document_text",
+                    side_effect=lambda _path, gaps_out: (
+                        gaps_out.append("page 2 missing") or "partial"
+                    ),
+                ),
+                patch("tools.document_extract_cache.lookup", return_value=None),
+                patch(
+                    "tools.document_extract_cache.extraction_lock",
+                    return_value=nullcontext(),
+                ),
+            ):
+                result = _import_source_files(
+                    "my-skill", ["F01"], None, "user", "task-1"
+                )
+                coverage = coverage_snapshot(
+                    [("F01", str(source))], task_id="task-1"
+                )
+
+        assert result["success"] is False
+        assert coverage["complete"] is False
+        assert len(coverage["pending"]) == 1
+
     def test_import_failure_keeps_existing_library(self, tmp_path):
         source = tmp_path / "source.pdf"
         source.write_bytes(b"exact-pdf-bytes")
