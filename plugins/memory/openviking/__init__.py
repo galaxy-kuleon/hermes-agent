@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import atexit
 import errno
+import hashlib
 import json
 import logging
 import math
@@ -679,7 +680,9 @@ REMEMBER_SCHEMA = {
 FORGET_SCHEMA = {
     "name": "viking_forget",
     "description": (
-        "Delete one OpenViking memory file by exact viking:// URI. "
+        "Remove one OpenViking memory file from the active user projection by "
+        "exact viking:// URI. The complete original is first retained in the "
+        "isolated append-only deletion-evidence namespace. "
         "Use only when the user explicitly asks to forget or delete a specific "
         "memory and you have the exact memory file URI. Resources, skills, "
         "sessions, directories, generated summaries, and broad deletes are rejected."
@@ -835,6 +838,23 @@ def _validate_forget_memory_uri(raw_uri: Any) -> tuple[Optional[str], Optional[s
         return None, "viking_forget cannot delete generated memory summary files"
 
     return uri, None
+
+
+def _memory_deletion_evidence_uri(memory_uri: str, event_id: str) -> str:
+    """Keep deletion evidence beside the user namespace, outside recall data."""
+    parts = [part for part in memory_uri[len("viking://") :].split("/") if part]
+    memories_idx = _memory_segment_index(parts)
+    if memories_idx is None:
+        raise ValueError("memory URI has no user memory namespace")
+    subject = parts[:memories_idx]
+    return "viking://" + "/".join(
+        [*subject, "_observability", "memory-deletions", f"{event_id}.json"]
+    )
+
+
+def _is_observability_uri(uri: Any) -> bool:
+    value = str(uri or "")
+    return "/_observability/" in value
 
 
 def _is_local_path_reference(value: str) -> bool:
@@ -5019,6 +5039,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         for ctx_type in ("memories", "resources", "skills"):
             items = result.get(ctx_type, [])
             for item in items:
+                if _is_observability_uri(item.get("uri")):
+                    continue
                 raw_score = item.get("score")
                 sort_score = raw_score if raw_score is not None else 0.0
                 entry = {
@@ -5283,12 +5305,61 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if error:
             return tool_error(error)
 
+        original = self._client.get(
+            "/api/v1/content/read",
+            params={"uri": uri},
+        )
+        original_result = self._unwrap_result(original)
+        if isinstance(original_result, str):
+            original_content = original_result
+        elif isinstance(original_result, dict):
+            original_content = str(
+                original_result.get("content")
+                or original_result.get("text")
+                or ""
+            )
+        else:
+            original_content = ""
+        if not original_content:
+            return tool_error(
+                "Refusing to delete memory because its complete original content "
+                "could not be retained as deletion evidence."
+            )
+
+        requested_at_ns = time.time_ns()
+        source_sha256 = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+        event_id = f"{requested_at_ns}-{uuid.uuid4().hex}"
+        evidence_uri = _memory_deletion_evidence_uri(uri, event_id)
+        evidence = {
+            "kind": "hermes.openviking.memory_deletion_requested",
+            "event_id": event_id,
+            "requested_at_ns": requested_at_ns,
+            "source_uri": uri,
+            "source_sha256": source_sha256,
+            "source_content": original_content,
+            "reason": "explicit_user_request",
+        }
+        self._client.post(
+            "/api/v1/content/write",
+            {
+                "uri": evidence_uri,
+                "content": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                "mode": "create",
+            },
+        )
+
         resp = self._client.delete(
             "/api/v1/fs",
             params={"uri": uri, "recursive": False},
         )
         result = self._unwrap_result(resp)
-        payload: Dict[str, Any] = {"status": "deleted", "uri": uri}
+        payload: Dict[str, Any] = {
+            "status": "deleted",
+            "uri": uri,
+            "active_projection_removed": True,
+            "evidence_uri": evidence_uri,
+            "source_sha256": source_sha256,
+        }
         if isinstance(result, dict):
             payload["uri"] = result.get("uri") or uri
             for key in (

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import socket
@@ -708,6 +709,37 @@ def test_tool_search_sorts_by_raw_score_across_buckets():
     assert result["total"] == 3
 
 
+def test_tool_search_hides_isolated_observability_evidence():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {
+        "result": {
+            "memories": [
+                {
+                    "uri": "viking://user/alice/memories/entities/current.md",
+                    "score": 0.8,
+                    "abstract": "active memory",
+                }
+            ],
+            "resources": [
+                {
+                    "uri": "viking://user/alice/_observability/memory-deletions/e1.json",
+                    "score": 1.0,
+                    "abstract": "deleted memory evidence",
+                }
+            ],
+            "total": 2,
+        }
+    }
+
+    result = json.loads(provider._tool_search({"query": "memory"}))
+
+    assert [entry["uri"] for entry in result["results"]] == [
+        "viking://user/alice/memories/entities/current.md"
+    ]
+    assert result["returned"] == 1
+
+
 def test_tool_search_bounds_deep_abstracts_and_routes_detail_to_read():
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
@@ -886,6 +918,62 @@ def test_get_tool_schemas_omits_profile_and_keeps_narrow_forget_tools():
 
     assert "viking_profile" not in names
     assert "viking_forget" in names
+
+
+def test_tool_forget_archives_complete_original_before_projection_delete(monkeypatch):
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    events = []
+    source_uri = "viking://user/alice/memories/entities/wrong.md"
+    original = "wrong cross-class memory"
+    provider._client.get.side_effect = lambda *args, **kwargs: (
+        events.append(("read", args, kwargs))
+        or {"result": {"content": original}}
+    )
+    provider._client.post.side_effect = lambda *args, **kwargs: (
+        events.append(("archive", args, kwargs))
+        or {"result": {"written_bytes": 1}}
+    )
+    provider._client.delete.side_effect = lambda *args, **kwargs: (
+        events.append(("delete", args, kwargs))
+        or {"result": {"uri": source_uri, "estimated_deleted_count": 1}}
+    )
+    monkeypatch.setattr(openviking_module.time, "time_ns", lambda: 123456789)
+
+    result = json.loads(provider._tool_forget({"uri": source_uri}))
+
+    assert [event[0] for event in events] == ["read", "archive", "delete"]
+    archive_call = events[1]
+    assert archive_call[1][0] == "/api/v1/content/write"
+    archive_body = archive_call[1][1]
+    assert archive_body["mode"] == "create"
+    assert archive_body["uri"].startswith(
+        "viking://user/alice/_observability/memory-deletions/123456789-"
+    )
+    evidence = json.loads(archive_body["content"])
+    assert evidence["source_uri"] == source_uri
+    assert evidence["source_content"] == original
+    assert evidence["source_sha256"] == hashlib.sha256(original.encode()).hexdigest()
+    assert result["active_projection_removed"] is True
+    assert result["evidence_uri"] == archive_body["uri"]
+    assert result["source_sha256"] == evidence["source_sha256"]
+
+
+def test_tool_forget_fails_closed_when_original_cannot_be_archived():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.get.return_value = {"result": {"content": ""}}
+
+    result = json.loads(
+        provider._tool_forget(
+            {"uri": "viking://user/alice/memories/entities/wrong.md"}
+        )
+    )
+
+    assert "error" in result
+    assert "complete original content" in result["error"]
+    provider._client.post.assert_not_called()
+    provider._client.delete.assert_not_called()
 
 
 def test_viking_client_delete_uses_identity_headers(monkeypatch):
