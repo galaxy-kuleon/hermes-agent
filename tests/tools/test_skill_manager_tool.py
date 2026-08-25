@@ -1,13 +1,16 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from tools.skill_manager_tool import (
+    SKILL_IMPORT_CHUNK_CHARS,
+    _import_source_files,
+    _split_import_text,
     _validate_name,
     _validate_category,
     _validate_frontmatter,
@@ -149,6 +152,155 @@ class TestValidateFilePath:
         # Only SKILL.md gets the root-level exception, not arbitrary files.
         err = _validate_file_path("README.md")
         assert "File must be under one of:" in err
+
+
+class TestImportFiles:
+    def test_split_import_text_preserves_every_character(self):
+        text = ("a" * (SKILL_IMPORT_CHUNK_CHARS + 17)) + "\nend\n"
+
+        parts = _split_import_text(text)
+
+        assert len(parts) == 2
+        assert all(len(part) <= SKILL_IMPORT_CHUNK_CHARS for part in parts)
+        assert "".join(parts) == text
+
+    def test_import_files_writes_plain_markdown_manifest_atomically(
+        self, tmp_path
+    ):
+        source = tmp_path / "001-deadbeef-source.pdf"
+        source.write_bytes(b"exact-pdf-bytes")
+        extracted = "First page\n" + ("x" * (SKILL_IMPORT_CHUNK_CHARS + 9))
+        skills = tmp_path / "skills"
+
+        with _skill_dir(skills):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"]
+            managed = {
+                "path": skills / "my-skill",
+                "root": skills,
+                "namespace": "user",
+                "qualified_name": "user:my-skill",
+            }
+            with (
+                patch("tools.skill_manager_tool._find_managed_skill", return_value=managed),
+                patch(
+                    "tools.file_grants.resolve_grant_alias",
+                    return_value=str(source),
+                ),
+                patch("tools.file_grants.file_grant_error", return_value=None),
+                patch("tools.read_extract.is_extractable_document", return_value=True),
+                patch(
+                    "tools.read_extract.extract_document_text",
+                    return_value=extracted,
+                ),
+                patch("tools.document_extract_cache.lookup", return_value=None),
+                patch(
+                    "tools.document_extract_cache.extraction_lock",
+                    return_value=nullcontext(),
+                ),
+                patch("tools.document_extract_cache.remember"),
+                patch("tools.skill_manager_tool._security_scan_skill", return_value=None),
+            ):
+                result = _import_source_files(
+                    "my-skill", ["F01"], None, "user", "task-1"
+                )
+
+        assert result["success"] is True
+        assert result["documents"] == 1
+        assert result["parts"] == 2
+        library = tmp_path / "skills" / "my-skill" / "references" / "source-library"
+        manifest = json.loads((library / "manifest.json").read_text())
+        part_files = [library / Path(path).name for path in manifest["documents"][0]["parts"]]
+        assert "".join(path.read_text() for path in part_files) == extracted
+        assert all("base64" not in path.read_text().lower() for path in part_files)
+
+    def test_import_failure_keeps_existing_library(self, tmp_path):
+        source = tmp_path / "source.pdf"
+        source.write_bytes(b"exact-pdf-bytes")
+        skills = tmp_path / "skills"
+
+        with _skill_dir(skills):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"]
+            existing = skills / "my-skill" / "references" / "source-library"
+            existing.mkdir(parents=True)
+            (existing / "kept.md").write_text("keep me")
+            managed = {
+                "path": skills / "my-skill",
+                "root": skills,
+                "namespace": "user",
+                "qualified_name": "user:my-skill",
+            }
+            with (
+                patch("tools.skill_manager_tool._find_managed_skill", return_value=managed),
+                patch(
+                    "tools.file_grants.resolve_grant_alias",
+                    return_value=str(source),
+                ),
+                patch("tools.file_grants.file_grant_error", return_value=None),
+                patch("tools.read_extract.is_extractable_document", return_value=True),
+                patch(
+                    "tools.read_extract.extract_document_text",
+                    side_effect=lambda _path, gaps_out: (
+                        gaps_out.append("page 2 missing") or "partial"
+                    ),
+                ),
+                patch("tools.document_extract_cache.lookup", return_value=None),
+                patch(
+                    "tools.document_extract_cache.extraction_lock",
+                    return_value=nullcontext(),
+                ),
+            ):
+                result = _import_source_files(
+                    "my-skill", ["F01"], None, "user", "task-1"
+                )
+
+        assert result["success"] is False
+        assert "incomplete" in result["error"]
+        assert (existing / "kept.md").read_text() == "keep me"
+
+    def test_platform_publish_serializes_complete_private_tree(self, tmp_path):
+        skill_dir = tmp_path / "my-skill"
+        references = skill_dir / "references" / "source-library"
+        references.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+        (references / "source.md").write_text("complete source")
+        managed = {
+            "path": skill_dir,
+            "root": tmp_path,
+            "namespace": "user",
+            "qualified_name": "user:my-skill",
+        }
+
+        def find_skill(_name, namespace=None):
+            return managed if namespace in {None, "user"} else None
+
+        with (
+            patch(
+                "gateway.session_context.get_session_env",
+                return_value="api_server",
+            ),
+            patch("tools.skill_manager_tool._acl_manage_block", return_value=None),
+            patch("tools.skill_manager_tool._find_managed_skill", side_effect=find_skill),
+            patch(
+                "tools.shared_skill_writer.request_shared_skill_mutation",
+                return_value={"success": True},
+            ) as request_mutation,
+        ):
+            result = json.loads(
+                skill_manage(
+                    action="publish",
+                    name="my-skill",
+                    namespace="platform",
+                    category="legal",
+                    requirements_confirmed=True,
+                )
+            )
+
+        assert result["success"] is True
+        arguments = request_mutation.call_args.kwargs["arguments"]
+        assert set(arguments["files"]) == {
+            "SKILL.md",
+            "references/source-library/source.md",
+        }
 
 
 # ---------------------------------------------------------------------------

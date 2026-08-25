@@ -32,10 +32,13 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import tempfile
 import contextvars as _ctxvars
 from contextlib import nullcontext
 from pathlib import Path
@@ -453,7 +456,7 @@ def _background_review_read_before_write_guard(
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
-    if action not in {"publish", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {"publish", "edit", "patch", "delete", "write_file", "remove_file", "import_files"}:
         return None
     existing = _find_managed_skill(name)
     if not existing:
@@ -513,6 +516,10 @@ def _curator_consolidation_delete_guard(
 
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
+MAX_SKILL_IMPORT_FILES = 256
+MAX_SKILL_IMPORT_CHARS = 48_000_000
+SKILL_IMPORT_CHUNK_CHARS = 240_000
+DEFAULT_SKILL_IMPORT_SUBDIR = "references/source-library"
 
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
@@ -1724,6 +1731,235 @@ def _write_file(
     return result
 
 
+def _safe_import_stem(display_name: str, ordinal: int) -> str:
+    """Return a stable, collision-free support-file stem."""
+    stem = Path(display_name).stem.strip()
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._") or "document"
+    return f"{ordinal:03d}-{stem[:120]}"
+
+
+def _split_import_text(text: str) -> list[str]:
+    """Split large extracted text without base64 or model-authored summaries."""
+    return [
+        text[offset : offset + SKILL_IMPORT_CHUNK_CHARS]
+        for offset in range(0, len(text), SKILL_IMPORT_CHUNK_CHARS)
+    ]
+
+
+def _import_source_files(
+    name: str,
+    source_paths: list[str],
+    reference_subdir: str | None,
+    namespace: Optional[str],
+    task_id: str | None,
+) -> Dict[str, Any]:
+    """Atomically turn granted attachments into complete skill references.
+
+    Extraction happens outside model context, reuses the content-addressed
+    document cache, and writes plain UTF-8 Markdown only. Large documents are
+    divided into bounded parts. One incomplete extraction aborts the complete
+    batch before the active skill tree changes.
+    """
+    if not isinstance(source_paths, list) or not source_paths:
+        return {"success": False, "error": "source_paths must contain at least one attached-file handle."}
+    if len(source_paths) > MAX_SKILL_IMPORT_FILES:
+        return {
+            "success": False,
+            "error": (
+                f"source_paths contains {len(source_paths)} items; "
+                f"the batch limit is {MAX_SKILL_IMPORT_FILES}."
+            ),
+        }
+    if any(not isinstance(value, str) or not value.strip() for value in source_paths):
+        return {"success": False, "error": "Every source_paths item must be a non-empty attached-file handle."}
+
+    subdir = (reference_subdir or DEFAULT_SKILL_IMPORT_SUBDIR).strip().replace("\\", "/").rstrip("/")
+    path_error = _validate_file_path(f"{subdir}/index.md")
+    if path_error:
+        return {"success": False, "error": path_error}
+
+    existing = _find_managed_skill(name, namespace)
+    if not existing:
+        return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    if existing.get("namespace") != "user":
+        return {
+            "success": False,
+            "error": "Import attachments into the caller's private skill first, then publish that complete tree to the platform namespace.",
+        }
+    skill_dir = Path(existing["path"])
+    guard = _background_review_write_guard(name, skill_dir, "import_files")
+    if guard:
+        return guard
+
+    from tools import document_extract_cache
+    from tools.file_grants import file_grant_error, resolve_grant_alias
+    from tools.read_extract import (
+        MAX_DOCUMENT_BYTES,
+        ExtractionError,
+        extract_document_text,
+        is_extractable_document,
+    )
+
+    task = task_id or "default"
+    stage_root = Path(tempfile.mkdtemp(prefix=f".{name}-import-", dir=skill_dir.parent))
+    staged_library = stage_root / "library"
+    staged_library.mkdir(parents=True)
+    receipts: list[dict[str, Any]] = []
+    aggregate_chars = 0
+    try:
+        for ordinal, requested in enumerate(source_paths, start=1):
+            resolved = Path(resolve_grant_alias(requested.strip(), task_id=task)).resolve(strict=True)
+            grant_error = file_grant_error(str(resolved), task_id=task, operation="read")
+            if grant_error:
+                raise ValueError(grant_error)
+            if not resolved.is_file():
+                raise ValueError(f"Attached source is not a regular file: {requested}")
+            if not is_extractable_document(str(resolved)):
+                raise ValueError(f"Attached source is not a supported extractable document: {requested}")
+            file_size = resolved.stat().st_size
+            if file_size > MAX_DOCUMENT_BYTES:
+                raise ValueError(
+                    f"Attached source exceeds the document limit: {requested} "
+                    f"({file_size:,} > {MAX_DOCUMENT_BYTES:,} bytes)"
+                )
+            with resolved.open("rb") as source_handle:
+                source_sha256 = hashlib.file_digest(
+                    source_handle, "sha256"
+                ).hexdigest()
+            suffix = resolved.suffix.lower()
+            cached = document_extract_cache.lookup(source_sha256, suffix)
+            gaps: list[str] = []
+            if cached is not None:
+                text = str(cached.get("text") or "")
+                gaps = list(cached.get("gaps") or [])
+                cache_status = "hit"
+            else:
+                try:
+                    with document_extract_cache.extraction_lock(source_sha256, suffix):
+                        cached = document_extract_cache.lookup(source_sha256, suffix)
+                        if cached is not None:
+                            text = str(cached.get("text") or "")
+                            gaps = list(cached.get("gaps") or [])
+                            cache_status = "hit_after_wait"
+                        else:
+                            text = extract_document_text(str(resolved), gaps_out=gaps)
+                            document_extract_cache.remember(
+                                source_sha256,
+                                suffix,
+                                text=text,
+                                file_size=file_size,
+                                gaps=gaps,
+                            )
+                            cache_status = "miss"
+                except (ExtractionError, OSError, ValueError) as exc:
+                    raise ValueError(f"Cannot extract {requested}: {exc}") from exc
+            if not text.strip():
+                raise ValueError(f"Extraction returned no text for {requested}")
+            if gaps:
+                raise ValueError(
+                    f"Extraction for {requested} is incomplete: {', '.join(gaps)}"
+                )
+            aggregate_chars += len(text)
+            if aggregate_chars > MAX_SKILL_IMPORT_CHARS:
+                raise ValueError(
+                    f"Extracted batch exceeds {MAX_SKILL_IMPORT_CHARS:,} characters."
+                )
+            display_name = re.sub(r"^\d{3}-[0-9a-f]{8}-", "", resolved.name)
+            stem = _safe_import_stem(display_name, ordinal)
+            parts = _split_import_text(text)
+            part_paths: list[str] = []
+            for part_index, part in enumerate(parts, start=1):
+                suffix_label = "" if len(parts) == 1 else f".part-{part_index:03d}"
+                relative = f"{stem}{suffix_label}.md"
+                atomic_write_text(staged_library / relative, part, preserve_mode=True)
+                part_paths.append(f"{subdir}/{relative}")
+            receipts.append(
+                {
+                    "request_handle": requested,
+                    "name": display_name,
+                    "source_sha256": source_sha256,
+                    "source_bytes": file_size,
+                    "text_chars": len(text),
+                    "parts": part_paths,
+                    "cache": cache_status,
+                    "gaps": [],
+                }
+            )
+
+        index_lines = [
+            "# Imported source library",
+            "",
+            "Every entry below was extracted from the exact attached bytes. ",
+            "A document appears in multiple bounded parts only when necessary; read all listed parts before claiming complete coverage.",
+            "",
+        ]
+        for receipt in receipts:
+            index_lines.append(
+                f"- `{receipt['name']}` — SHA-256 `{receipt['source_sha256']}` — "
+                + ", ".join(f"[{Path(path).name}]({Path(path).name})" for path in receipt["parts"])
+            )
+        atomic_write_text(staged_library / "index.md", "\n".join(index_lines) + "\n", preserve_mode=True)
+        atomic_write_text(
+            staged_library / "manifest.json",
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": receipts,
+                    "document_count": len(receipts),
+                    "text_chars": aggregate_chars,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            preserve_mode=True,
+        )
+
+        target = skill_dir / subdir
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = skill_dir.parent / f".{name}-import-backup"
+        if backup.exists():
+            shutil.rmtree(backup)
+        if target.exists():
+            os.replace(target, backup)
+        try:
+            os.replace(staged_library, target)
+            scan_error = _security_scan_skill(skill_dir)
+            if scan_error:
+                raise ValueError(scan_error)
+        except Exception:
+            if target.exists():
+                shutil.rmtree(target)
+            if backup.exists():
+                os.replace(backup, target)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+        return {
+            "success": True,
+            "message": (
+                f"Imported {len(receipts)} complete attachment(s) into skill "
+                f"'{name}' as {sum(len(row['parts']) for row in receipts)} bounded Markdown part(s)."
+            ),
+            "namespace": existing["namespace"],
+            "qualified_name": existing["qualified_name"],
+            "reference_subdir": subdir,
+            "documents": len(receipts),
+            "parts": sum(len(row["parts"]) for row in receipts),
+            "text_chars": aggregate_chars,
+            "manifest_sha256": hashlib.sha256(
+                (target / "manifest.json").read_bytes()
+            ).hexdigest(),
+            "receipts": receipts,
+            "_skills_root": str(existing["root"]),
+        }
+    except (OSError, ValueError) as exc:
+        return {"success": False, "error": str(exc)}
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+
 def _remove_file(
     name: str, file_path: str, namespace: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -1799,7 +2035,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
     """
-    if action not in {"create", "publish", "edit", "patch", "delete", "write_file", "remove_file"}:
+    if action not in {"create", "publish", "edit", "patch", "delete", "write_file", "remove_file", "import_files"}:
         return None
     if _skill_gate_bypass.get():
         return None
@@ -1880,6 +2116,8 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
                 replace_all=payload.get("replace_all", False),
                 absorbed_into=payload.get("absorbed_into"),
                 requirements_confirmed=payload.get("requirements_confirmed", False),
+                source_paths=payload.get("source_paths"),
+                reference_subdir=payload.get("reference_subdir"),
             )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1987,6 +2225,8 @@ def skill_manage(
     requirements_confirmed: Optional[bool] = None,
     task_id: str = None,
     session_id: str = None,
+    source_paths: list[str] = None,
+    reference_subdir: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -2041,6 +2281,7 @@ def skill_manage(
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
         requirements_confirmed=requirements_are_confirmed,
+        source_paths=source_paths, reference_subdir=reference_subdir,
     )
     if gate_result is not None:
         return gate_result
@@ -2073,6 +2314,12 @@ def skill_manage(
         pass
 
     if target_namespace == "platform" and api_server_session:
+        from tools.shared_skill_writer import (
+            SharedSkillWriterError,
+            request_shared_skill_mutation,
+            serialize_skill_tree,
+        )
+
         arguments = {
             "content": content,
             "category": category,
@@ -2084,15 +2331,47 @@ def skill_manage(
             "absorbed_into": absorbed_into,
             "requirements_confirmed": requirements_are_confirmed,
         }
+        import_result = None
+        if action == "publish":
+            personal = _find_managed_skill(bare_name, "user")
+            if not personal:
+                return tool_error(
+                    f"No private user skill named '{bare_name}' exists to publish.",
+                    success=False,
+                )
+            if source_paths:
+                import_result = json.loads(
+                    skill_manage(
+                        action="import_files",
+                        name=bare_name,
+                        namespace="user",
+                        source_paths=source_paths,
+                        reference_subdir=reference_subdir,
+                        task_id=task_id,
+                        session_id=session_id,
+                    )
+                )
+                if not import_result.get("success"):
+                    return json.dumps(import_result, ensure_ascii=False)
+                personal = _find_managed_skill(bare_name, "user")
         try:
-            from tools.shared_skill_writer import (
-                SharedSkillWriterError,
-                request_shared_skill_mutation,
-            )
+            if action == "publish":
+                arguments["files"] = serialize_skill_tree(personal["path"])
 
             result = request_shared_skill_mutation(
                 action, bare_name, arguments=arguments
             )
+            if import_result and result.get("success"):
+                result["source_import"] = {
+                    key: import_result.get(key)
+                    for key in (
+                        "documents",
+                        "parts",
+                        "text_chars",
+                        "reference_subdir",
+                        "manifest_sha256",
+                    )
+                }
         except SharedSkillWriterError as exc:
             result = {
                 "success": False,
@@ -2146,13 +2425,22 @@ def skill_manage(
             return tool_error("file_content is required for 'write_file'.", success=False)
         result = _write_file(bare_name, file_path, file_content, target_namespace)
 
+    elif action == "import_files":
+        result = _import_source_files(
+            bare_name,
+            source_paths,
+            reference_subdir,
+            target_namespace,
+            task_id,
+        )
+
     elif action == "remove_file":
         if not file_path:
             return tool_error("file_path is required for 'remove_file'.", success=False)
         result = _remove_file(bare_name, file_path, target_namespace)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, publish, edit, patch, delete, write_file, remove_file"}
+        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, publish, edit, patch, delete, write_file, import_files, remove_file"}
 
     if result.get("success"):
         # Audit ledger append (best-effort; never blocks the mutation).
@@ -2170,6 +2458,11 @@ def skill_manage(
                 _evidence["session_id"] = session_id
             if file_path:
                 _evidence["file_path"] = file_path
+            if action == "import_files":
+                _evidence["reference_subdir"] = (
+                    reference_subdir or DEFAULT_SKILL_IMPORT_SUBDIR
+                )
+                _evidence["source_count"] = len(source_paths or [])
             with _ledger.ledger_scope(_ledger_root):
                 _ledger.record_mutation(
                     action,
@@ -2248,7 +2541,12 @@ SKILL_MANAGE_SCHEMA = {
         "a completed inactive draft), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
-        "delete, write_file, remove_file.\n\n"
+        "delete, write_file, import_files, remove_file. import_files turns a "
+        "whole granted attachment batch into plain Markdown references in one "
+        "atomic, divide-and-conquer operation; it never embeds base64. To share "
+        "a private skill with colleagues, use publish with namespace='platform'. "
+        "publish may receive source_paths and will import those attachments "
+        "before publishing the complete personal tree.\n\n"
         "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
         "skill's content into another one, or `absorbed_into=\"\"` when you're "
         "pruning it with no forwarding target. This lets the curator tell "
@@ -2285,7 +2583,7 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "publish", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["create", "publish", "patch", "edit", "delete", "write_file", "import_files", "remove_file"],
                 "description": "The action to perform."
             },
             "name": {
@@ -2362,6 +2660,25 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": "Content for the file. Required for 'write_file'."
             },
+            "source_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": MAX_SKILL_IMPORT_FILES,
+                "description": (
+                    "For import_files, or publish to namespace=platform: the complete "
+                    "list of current attachment handles such as F01, F02. Every source "
+                    "is extracted outside model context, completeness-checked, split "
+                    "into bounded Markdown parts, and indexed. One incomplete source "
+                    "aborts the batch."
+                ),
+            },
+            "reference_subdir": {
+                "type": "string",
+                "description": (
+                    "Optional destination below references/. Defaults to "
+                    "references/source-library."
+                ),
+            },
             "absorbed_into": {
                 "type": "string",
                 "description": (
@@ -2402,6 +2719,8 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
         requirements_confirmed=args.get("requirements_confirmed"),
+        source_paths=args.get("source_paths"),
+        reference_subdir=args.get("reference_subdir"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id")),
     emoji="📝",
