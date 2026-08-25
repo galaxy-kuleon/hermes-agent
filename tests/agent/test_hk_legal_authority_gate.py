@@ -8,6 +8,7 @@ from agent.hk_legal_authority_gate import (
     evaluate_hk_legal_answer,
     is_hk_statutory_query,
     is_hk_statutory_turn,
+    is_strict_skill_source_boundary,
     successful_authorities,
 )
 
@@ -465,6 +466,7 @@ def test_cross_search_completed_evidence_can_finalize_without_model_rewrite():
     ],
 )
 def test_cross_search_source_boundary_followup_inherits_matter(followup):
+    assert is_strict_skill_source_boundary(followup)
     decision = evaluate_hk_legal_answer(
         messages=[
             {"role": "user", "content": EXACT_CROSS_SEARCH_PROMPT},

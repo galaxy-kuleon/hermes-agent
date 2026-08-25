@@ -420,6 +420,11 @@ def is_hk_statutory_query(user_message: Any) -> bool:
     return bool(_LEGAL_REQUEST_RE.search(text) or "?" in text or "？" in text)
 
 
+def is_strict_skill_source_boundary(user_message: Any) -> bool:
+    """Return whether the user explicitly excludes knowledge outside one skill."""
+    return bool(_SOURCE_BOUNDARY_FOLLOWUP_RE.search(_message_text(user_message)))
+
+
 def is_hk_statutory_turn(messages: list[Any], current_turn_user_idx: int) -> bool:
     """Recognize a same-Matter follow-up even when it omits “Hong Kong”."""
     if not (0 <= current_turn_user_idx < len(messages)):

@@ -433,6 +433,30 @@ def test_hk_authority_coverage_resets_for_the_next_user_turn():
     assert controller.before_call("hk_legal_authority", args).action == "allow"
 
 
+def test_strict_skill_source_boundary_skips_ambient_knowledge_tools():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_strict_skill_source_boundary(True)
+
+    for tool_name in ("memory", "session_search", "viking_search", "web_search"):
+        decision = controller.before_call(tool_name, {"query": "outside knowledge"})
+        assert decision.action == "reuse"
+        assert decision.code == "strict_skill_source_boundary"
+        assert "cannot-confirm" in decision.message
+
+    assert controller.before_call("skill_view", {"name": "named-skill"}).action == "allow"
+    assert (
+        controller.before_call(
+            "hk_legal_authority", {"chapter": "559", "provisions": ["12"]}
+        ).action
+        == "allow"
+    )
+
+    controller.reset_for_turn()
+    assert controller.before_call("viking_search", {"query": "allowed again"}).action == "allow"
+
+
 def test_block_message_tells_the_model_to_answer_not_to_report():
     """A control that halts a loop must not become the answer.
 

@@ -34,6 +34,9 @@ _HK_BARE_PROVISION_RE = re.compile(
 _HK_REGISTERED_MARK_COMPLETE_BUNDLE = frozenset(
     {"4", "11", "12", "44", "45", "52", "53"}
 )
+_STRICT_SKILL_BOUNDARY_EXTERNAL_KNOWLEDGE_TOOLS = frozenset(
+    {"memory", "session_search", "viking_search", "viking_browse", "web_search"}
+)
 
 
 def _hk_authority_request(args: Mapping[str, Any]) -> tuple[str, frozenset[str]]:
@@ -393,6 +396,11 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._strict_skill_source_boundary = False
+
+    def set_strict_skill_source_boundary(self, enabled: bool) -> None:
+        """Apply the current user's explicit one-skill knowledge boundary."""
+        self._strict_skill_source_boundary = bool(enabled)
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -409,6 +417,24 @@ class ToolCallGuardrailController:
         cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
         if cap_block is not None:
             return cap_block
+
+        if (
+            self._strict_skill_source_boundary
+            and tool_name in _STRICT_SKILL_BOUNDARY_EXTERNAL_KNOWLEDGE_TOOLS
+        ):
+            return ToolGuardrailDecision(
+                action="reuse",
+                code="strict_skill_source_boundary",
+                message=(
+                    "The user explicitly limited this turn to the named skill's "
+                    "knowledge and its authorized official sources. Skip this "
+                    "outside memory/search source. Continue with skill_view and only "
+                    "the source-specific tool or file that the skill directs you to; "
+                    "if those sources cannot answer, say cannot-confirm or do not know."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
 
         if not self._hard_stops_active():
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)

@@ -647,11 +647,18 @@ def _run_agent_tool_execution_middleware(
                     getattr(guardrail_decision, "code", "")
                     == "hk_authority_registered_mark_research_complete"
                 )
+                source_boundary_enforced = (
+                    getattr(guardrail_decision, "code", "")
+                    == "strict_skill_source_boundary"
+                )
                 result = json.dumps(
                     {
                         "success": True,
-                        "already_available": not research_complete,
+                        "already_available": not (
+                            research_complete or source_boundary_enforced
+                        ),
                         "research_complete": research_complete,
+                        "source_boundary_enforced": source_boundary_enforced,
                         "execution_skipped": True,
                         "tool": function_name,
                         "chapter": final_args.get("chapter"),
