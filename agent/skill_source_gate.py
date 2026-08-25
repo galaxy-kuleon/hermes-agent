@@ -9,6 +9,7 @@ from typing import Any
 
 
 MAX_SKILL_SOURCE_NUDGES = 3
+MAX_SKILL_CORRECTION_SOURCE_CHARS = 24_000
 _CLASS_LIST_RE = re.compile(
     r"\bclass(?:es)?\s*([1-9]\d?(?:\s*(?:,|and|&|/)\s*[1-9]\d?)*)",
     re.IGNORECASE,
@@ -139,6 +140,23 @@ def _numbered_item_count(text: str) -> int:
     return len(_NUMBERED_ITEM_RE.findall(text or ""))
 
 
+def _corrective_source_packet(
+    required: list[tuple[str, str]],
+    source_contents: dict[tuple[str, str], str],
+) -> str:
+    ordered = list(dict.fromkeys(required))
+    if not ordered or any(source not in source_contents for source in ordered):
+        return ""
+    parts = [
+        f"--- authoritative source: {name} / {file_path} ---\n{source_contents[(name, file_path)]}"
+        for name, file_path in ordered
+    ]
+    packet = "\n\n".join(parts)
+    if len(packet) > MAX_SKILL_CORRECTION_SOURCE_CHARS:
+        return ""
+    return packet
+
+
 def _answer_contract_diagnostics(
     *, contract: dict[str, Any], user_text: str, final_response: str
 ) -> tuple[str, ...]:
@@ -250,6 +268,7 @@ def evaluate_skill_source_contract(
     current_messages = messages[current_turn_user_idx + 1 :]
     required: list[tuple[str, str]] = []
     successful: set[tuple[str, str]] = set()
+    source_contents: dict[tuple[str, str], str] = {}
     answer_contract: dict[str, Any] = {}
     for message in current_messages:
         payload = _payload(message)
@@ -266,6 +285,9 @@ def evaluate_skill_source_contract(
         source = _successful_source(payload)
         if source:
             successful.add(source)
+            content = payload.get("content")
+            if payload.get("content_complete") is True and isinstance(content, str):
+                source_contents[source] = content
 
     missing = tuple(source for source in dict.fromkeys(required) if source not in successful)
     diagnostics = ()
@@ -285,6 +307,22 @@ def evaluate_skill_source_contract(
     if attempts < MAX_SKILL_SOURCE_NUDGES:
         if diagnostics:
             problems = "\n".join(f"- {item}" for item in diagnostics)
+            source_packet = _corrective_source_packet(required, source_contents)
+            contract_packet = json.dumps(
+                answer_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            grounding = (
+                "\n\nThe following are full-fidelity copies of every required "
+                "authoritative source already loaded in this turn. Use them "
+                "directly; they are not summaries or truncated views:\n"
+                f"{source_packet}"
+                if source_packet
+                else "\n\nThe required sources are too large to duplicate here. "
+                "Use targeted native source search only for the exact missing "
+                "items; do not guess or reread an undeclared path."
+            )
             return SkillSourceDecision(
                 action="nudge",
                 message=(
@@ -294,8 +332,10 @@ def evaluate_skill_source_contract(
                     "a loaded authoritative source is genuinely insufficient. "
                     "Follow the skill's exact section labels, list every selected "
                     "item, subgroup code, coverage allocation, cap, and Total line. "
+                    "The machine-readable contract is:\n"
+                    f"{contract_packet}\n"
                     "Fix these mechanically observed problems:\n"
-                    f"{problems}"
+                    f"{problems}{grounding}"
                 ),
                 diagnostics=diagnostics,
             )

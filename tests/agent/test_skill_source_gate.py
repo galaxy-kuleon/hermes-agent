@@ -53,8 +53,24 @@ def _answer_contract():
 
 def _loaded_sources():
     return [
-        _tool({"success": True, "name": "tw-tmc", "file": "references/class-14.md"}),
-        _tool({"success": True, "name": "tw-tmc", "file": "references/class-35.md"}),
+        _tool(
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-14.md",
+                "content": "class 14 source",
+                "content_complete": True,
+            }
+        ),
+        _tool(
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-35.md",
+                "content": "class 35 source",
+                "content_complete": True,
+            }
+        ),
     ]
 
 
@@ -165,6 +181,10 @@ def test_declared_answer_contract_rejects_candidate_dump():
     assert any("Class 14 lists 21 items" in item for item in decision.diagnostics)
     assert "Class 35 section is missing" in decision.diagnostics
     assert "Rewrite the answer only" in decision.message
+    assert "full-fidelity copies" in decision.message
+    assert "--- authoritative source: tw-tmc / references/class-14.md ---" in decision.message
+    assert "class 35 source" in decision.message
+    assert '"class_1_34_max_items": 20' in decision.message
 
 
 def test_declared_answer_contract_accepts_structured_selection():
