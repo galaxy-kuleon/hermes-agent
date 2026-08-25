@@ -2414,15 +2414,6 @@ def test_complete_declared_skill_sources_stop_alias_and_search_io(agent, monkeyp
     execute("skill_view", {"name": "tw-tmcc"}, contract_result, "skill")
 
     alias_args = {"path": "/home/hermes/workspace/skills/tw-tmcc/SKILL.md"}
-    alias_result = json.dumps(
-        {
-            "success": True,
-            "name": "tw-tmcc",
-            "source_contract": {"required_before_answer": True},
-            "routing": {"to_tool": "skill_view"},
-        }
-    )
-    execute("read_file", alias_args, alias_result, "alias-first")
     alias_replay = tool_executor._run_agent_tool_execution_middleware(
         agent,
         function_name="read_file",
@@ -2430,10 +2421,12 @@ def test_complete_declared_skill_sources_stop_alias_and_search_io(agent, monkeyp
         effective_task_id="task-1",
         tool_call_id="alias-replay",
         execute=lambda _args: (_ for _ in ()).throw(
-            AssertionError("successful alias must not dispatch twice")
+            AssertionError("guessed alias must not dispatch after contract load")
         ),
     )
-    assert json.loads(alias_replay.result)["already_available"] is True
+    alias_payload = json.loads(alias_replay.result)
+    assert alias_payload["source_boundary_enforced"] is True
+    assert "references/class-14.md" in alias_payload["instruction"]
 
     for class_number in (14, 35):
         execute(

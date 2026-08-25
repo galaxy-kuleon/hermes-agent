@@ -529,6 +529,26 @@ def test_named_skill_contract_allows_only_declared_requested_sources():
     )
     assert repeated_alias.action == "reuse"
     assert repeated_alias.code == "strict_skill_source_call_already_loaded"
+    assert "references/class-14.md" in repeated_alias.message
+    assert "references/class-35.md" in repeated_alias.message
+
+    guessed_search = controller.before_call(
+        "search_files",
+        {"path": "/home/hermes", "pattern": "tw-tmcc"},
+    )
+    assert guessed_search.action == "reuse"
+    assert guessed_search.code == "strict_skill_source_path"
+    assert "guessed path" in guessed_search.message
+    assert (
+        controller.before_call(
+            "search_files",
+            {
+                "path": "/home/hermes/skills/legal/tw-tmc/references/class-35.md",
+                "pattern": "351914",
+            },
+        ).action
+        == "allow"
+    )
 
     for class_number in (14, 35):
         assert (

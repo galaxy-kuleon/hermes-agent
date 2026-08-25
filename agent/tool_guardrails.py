@@ -538,6 +538,14 @@ class ToolCallGuardrailController:
             and tool_name in STRICT_SKILL_SOURCE_IO_TOOLS
             and signature in self._strict_skill_successful_source_calls
         ):
+            missing_sources = sorted(
+                self._strict_skill_source_allowed
+                - self._strict_skill_source_loaded
+            )
+            missing_calls = ", ".join(
+                f"skill_view(name={name!r}, file_path={file_path!r})"
+                for name, file_path in missing_sources
+            )
             return ToolGuardrailDecision(
                 action="reuse",
                 code="strict_skill_source_call_already_loaded",
@@ -546,10 +554,48 @@ class ToolCallGuardrailController:
                     "this turn. Reuse its earlier full-fidelity result and "
                     "continue; do not repeat the call or mention this internal "
                     "control in the user-visible answer."
+                    + (
+                        " Load the still-missing declared sources with exactly: "
+                        f"{missing_calls}."
+                        if missing_calls
+                        else ""
+                    )
                 ),
                 tool_name=tool_name,
                 signature=signature,
             )
+
+        if (
+            self._strict_skill_source_boundary
+            and self._strict_skill_source_contract_seen
+            and tool_name in {"read_file", "search_files"}
+        ):
+            call_args = _coerce_args(args)
+            requested_path = str(
+                call_args.get("path") or call_args.get("file_path") or ""
+            ).replace("\\", "/")
+            path_is_declared = any(
+                requested_path == file_path
+                or requested_path.endswith(f"/{name}/{file_path}")
+                or requested_path.endswith(f"/{file_path}")
+                for name, file_path in self._strict_skill_source_allowed
+            )
+            if not path_is_declared:
+                exact_calls = ", ".join(
+                    f"skill_view(name={name!r}, file_path={file_path!r})"
+                    for name, file_path in sorted(self._strict_skill_source_allowed)
+                )
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="strict_skill_source_path",
+                    message=(
+                        "This named-skill turn may read or search only its "
+                        "declared support files. Skip this guessed path and use "
+                        f"exactly: {exact_calls or 'no support-file call is authorized'}."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
 
         if (
             self._strict_skill_source_boundary
