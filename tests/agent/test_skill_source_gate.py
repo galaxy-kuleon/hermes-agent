@@ -188,22 +188,22 @@ def test_declared_answer_contract_rejects_candidate_dump():
 
 
 def test_declared_answer_contract_accepts_structured_selection():
-    response = """Class 14 — jewelry
+    response = """## Class 14 — jewelry
 
-Relevant items:
+**Relevant items:**
 - 1401 jewelry:
   1. A
   2. B
 
-Coverage items:
-- 1402 cufflinks:
+**Coverage items:**
+- **1402 cufflinks:**
   1. C
-- 1403 jewelry boxes:
+- **1403 jewelry boxes:**
   2. D
-- 1406 watches:
+- **1406 watches:**
   3. E
 
-Total: 5 items
+**Total: 5 items**
 
 Class 35 — retail
 
@@ -213,7 +213,7 @@ Relevant items:
 - 351909 watch retail:
   2. Watch retail
 
-Total: 2 items"""
+**Total: 2 items**"""
     assert (
         evaluate_skill_source_contract(
             messages=[
@@ -240,6 +240,48 @@ def test_explicit_smaller_item_count_overrides_default_coverage_shape():
             current_turn_user_idx=0,
             attempts=0,
             final_response="Class 14\n1. A\n2. B\nTotal: 2 items",
+        )
+        is None
+    )
+
+
+def test_declared_answer_contract_accepts_localized_markdown_labels():
+    response = """## 第 14 類 — 珠寶
+
+### 相關項目（2）
+- **1401 珠寶：**
+  1. A
+  2. B
+
+### 補充涵蓋項目（3）
+- **1402 袖扣：**
+  1. C
+- **1403 珠寶盒：**
+  2. D
+- **1406 手錶：**
+  3. E
+
+**小計：5 項**
+
+## 第 35 類 — 零售
+
+### 相關服務
+- **351914 珠寶零售：**
+  1. 珠寶零售
+- **351909 鐘錶零售：**
+  2. 鐘錶零售
+
+**總計：2 項**"""
+    assert (
+        evaluate_skill_source_contract(
+            messages=[
+                {"role": "user", "content": "apply tm-twcc: 珠寶直銷 classes 14 and 35."},
+                _answer_contract(),
+                *_loaded_sources(),
+            ],
+            current_turn_user_idx=0,
+            attempts=0,
+            final_response=response,
         )
         is None
     )

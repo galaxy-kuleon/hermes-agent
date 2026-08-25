@@ -140,6 +140,10 @@ def _numbered_item_count(text: str) -> int:
     return len(_NUMBERED_ITEM_RE.findall(text or ""))
 
 
+def _label_pattern(label: str) -> str:
+    return rf"(?im)^\s*(?:#{{1,6}}\s*)?(?:\*\*|__)?{label}(?:\*\*|__)?\s*$"
+
+
 def _corrective_source_packet(
     required: list[tuple[str, str]],
     source_contents: dict[tuple[str, str], str],
@@ -176,7 +180,12 @@ def _answer_contract_diagnostics(
         if contract.get("list_every_chosen_item") is True and item_count < 1:
             diagnostics.append(f"Class {class_number} does not list each chosen item")
 
-        total_match = re.search(r"(?im)^\s*Total:\s*(\d+)\s+items?\s*$", section)
+        total_match = re.search(
+            r"(?im)^\s*(?:\*\*|__)?(?:Total|總計|总计|合計|合计|小計|小计|"
+            r"總數|总数|共)\s*[:：]?\s*(\d+)\s*(?:items?|項|项)?"
+            r"(?:\*\*|__)?\s*$",
+            section,
+        )
         if contract.get("require_total") is True and total_match is None:
             diagnostics.append(f"Class {class_number} is missing the required Total line")
         elif total_match and int(total_match.group(1)) != item_count:
@@ -197,8 +206,22 @@ def _answer_contract_diagnostics(
                 )
             if explicit_count is not None:
                 continue
-            relevant_heading = re.search(r"(?im)^\s*Relevant\s+items:\s*$", section)
-            coverage_heading = re.search(r"(?im)^\s*Coverage\s+items:\s*$", section)
+            relevant_heading = re.search(
+                _label_pattern(
+                    r"(?:Relevant\s+items|(?:直接)?相關(?:項目|商品)|"
+                    r"(?:直接)?相关(?:项目|商品))(?:\s*[（(]\s*\d+\s*[）)])?\s*[:：]?"
+                ),
+                section,
+            )
+            coverage_heading = re.search(
+                _label_pattern(
+                    r"(?:Coverage\s+items|(?:補充|补充|跨組|跨组|延伸)?"
+                    r"(?:覆蓋|覆盖|涵蓋|涵盖)(?:項目|项目)|"
+                    r"(?:補充|补充|延伸)(?:項目|项目))"
+                    r"(?:\s*[（(]\s*\d+\s*[）)])?\s*[:：]?"
+                ),
+                section,
+            )
             if contract.get("require_relevant_and_coverage_sections") is True and (
                 relevant_heading is None or coverage_heading is None
             ):
@@ -233,7 +256,10 @@ def _answer_contract_diagnostics(
                         f"Class {class_number} must list exactly {coverage_required} coverage items; found {coverage_count}"
                     )
                 subgroup_codes = set(
-                    re.findall(r"(?m)^\s*[-*]\s*(\d{4})\b", coverage_text)
+                    re.findall(
+                        r"(?m)^\s*[-*]\s*(?:\*\*|__)?(\d{4})\b",
+                        coverage_text,
+                    )
                 )
                 if subgroup_required and len(subgroup_codes) < subgroup_required:
                     diagnostics.append(
