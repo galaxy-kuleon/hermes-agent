@@ -185,6 +185,9 @@ def test_declared_answer_contract_rejects_candidate_dump():
     assert "--- authoritative source: tw-tmc / references/class-14.md ---" in decision.message
     assert "class 35 source" in decision.message
     assert '"class_1_34_max_items": 20' in decision.message
+    assert "Return only this literal outer shape" in decision.message
+    assert "Class [N] — [name]" in decision.message
+    assert "Total: [exact listed-item count] items" in decision.message
 
 
 def test_declared_answer_contract_accepts_structured_selection():

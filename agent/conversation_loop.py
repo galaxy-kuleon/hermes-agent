@@ -8321,6 +8321,23 @@ def run_conversation(
                         list(_skill_source_decision.diagnostics),
                         getattr(agent, "session_id", None) or "none",
                     )
+                    logger.warning(
+                        "SKILL_SOURCE_GATE_EVIDENCE %s",
+                        json.dumps(
+                            {
+                                "action": "nudge",
+                                "attempt": skill_source_nudges,
+                                "session_id": getattr(agent, "session_id", None),
+                                "missing": list(_skill_source_decision.missing),
+                                "diagnostics": list(
+                                    _skill_source_decision.diagnostics
+                                ),
+                                "candidate": final_response or "",
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    )
                     agent._emit_status(
                         "↻ 技能所需的權威來源尚未載入 — 正在讀取原始資料"
                     )
@@ -8331,6 +8348,23 @@ def run_conversation(
                     _skill_source_decision
                     and _skill_source_decision.action == "fail"
                 ):
+                    logger.warning(
+                        "SKILL_SOURCE_GATE_EVIDENCE %s",
+                        json.dumps(
+                            {
+                                "action": "fail",
+                                "attempt": skill_source_nudges,
+                                "session_id": getattr(agent, "session_id", None),
+                                "missing": list(_skill_source_decision.missing),
+                                "diagnostics": list(
+                                    _skill_source_decision.diagnostics
+                                ),
+                                "candidate": final_response or "",
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    )
                     final_response = _skill_source_decision.message
                     final_msg["content"] = final_response
                     final_msg["finish_reason"] = "skill_source_unconfirmed"
