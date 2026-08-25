@@ -247,6 +247,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # its corrective user nudge are private retry scaffolding. Never persist or
     # replay either as genuine user-visible conversation history.
     "_hk_legal_authority_synthetic",
+    # Declared linked-skill source gate: ungrounded candidate + corrective
+    # nudge are private retry scaffolding.
+    "_skill_source_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an

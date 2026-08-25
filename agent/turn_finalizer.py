@@ -57,6 +57,7 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_hk_legal_authority_synthetic",
+    "_skill_source_synthetic",
 )
 
 
