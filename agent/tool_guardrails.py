@@ -404,11 +404,58 @@ class ToolCallGuardrailController:
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
         self._strict_skill_source_boundary = False
+        self._strict_skill_source_contract_seen = False
+        self._strict_skill_source_requested_classes: tuple[int, ...] = ()
+        self._strict_skill_source_allowed: set[tuple[str, str]] = set()
         self._skill_mutation_allowed = False
 
-    def set_strict_skill_source_boundary(self, enabled: bool) -> None:
+    def set_strict_skill_source_boundary(
+        self,
+        enabled: bool,
+        *,
+        requested_classes: tuple[int, ...] = (),
+    ) -> None:
         """Apply the current user's explicit one-skill knowledge boundary."""
         self._strict_skill_source_boundary = bool(enabled)
+        self._strict_skill_source_requested_classes = tuple(requested_classes)
+
+    def observe_skill_view_result(
+        self,
+        args: Mapping[str, Any] | None,
+        result: Any,
+    ) -> None:
+        """Register the exact support files declared by the named skill."""
+        if not self._strict_skill_source_boundary:
+            return
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return
+        contract = payload.get("source_contract")
+        if not isinstance(contract, dict):
+            return
+        examples = contract.get("declared_skill_view_examples") or []
+        if not isinstance(examples, list):
+            return
+        allowed: set[tuple[str, str]] = set()
+        for example in examples:
+            if not isinstance(example, dict):
+                continue
+            name = str(example.get("name") or "").strip()
+            file_path = str(example.get("file_path") or "").strip()
+            if not name or not file_path:
+                continue
+            if "class-N." in file_path and self._strict_skill_source_requested_classes:
+                allowed.update(
+                    (name, file_path.replace("class-N.", f"class-{number}."))
+                    for number in self._strict_skill_source_requested_classes
+                )
+            else:
+                allowed.add((name, file_path))
+        self._strict_skill_source_contract_seen = True
+        self._strict_skill_source_allowed = allowed
 
     def set_skill_mutation_allowed(self, enabled: bool) -> None:
         """Bind skill writes to explicit user mutation intent for this turn."""
@@ -447,6 +494,34 @@ class ToolCallGuardrailController:
                 tool_name=tool_name,
                 signature=signature,
             )
+
+        if (
+            self._strict_skill_source_boundary
+            and self._strict_skill_source_contract_seen
+            and tool_name == "skill_view"
+        ):
+            call_args = _coerce_args(args)
+            requested = (
+                str(call_args.get("name") or "").strip(),
+                str(call_args.get("file_path") or "").strip(),
+            )
+            if requested not in self._strict_skill_source_allowed:
+                exact_calls = ", ".join(
+                    f"skill_view(name={name!r}, file_path={file_path!r})"
+                    for name, file_path in sorted(self._strict_skill_source_allowed)
+                )
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="strict_skill_source_path",
+                    message=(
+                        "This named-skill turn may read only the support files "
+                        "declared by the loaded skill contract. Skip this "
+                        "undeclared or repeated skill path and use exactly: "
+                        f"{exact_calls or 'no support-file call is authorized'}."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
 
         if tool_name == "skill_manage" and not self._skill_mutation_allowed:
             return ToolGuardrailDecision(

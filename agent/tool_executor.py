@@ -649,7 +649,7 @@ def _run_agent_tool_execution_middleware(
                 )
                 source_boundary_enforced = (
                     getattr(guardrail_decision, "code", "")
-                    == "strict_skill_source_boundary"
+                    in {"strict_skill_source_boundary", "strict_skill_source_path"}
                 )
                 skill_mutation_intent_required = (
                     getattr(guardrail_decision, "code", "")
@@ -736,7 +736,14 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            result = execute(final_args)
+            if function_name == "skill_view":
+                observe = getattr(
+                    agent._tool_guardrails, "observe_skill_view_result", None
+                )
+                if callable(observe):
+                    observe(final_args, result)
+            return result
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)

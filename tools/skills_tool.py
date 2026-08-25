@@ -1756,6 +1756,8 @@ def skill_view(
                     "name": name,
                     "file": file_path,
                     "content": content,
+                    "content_complete": True,
+                    "content_chars": len(content),
                     "file_type": target_file.suffix,
                     # Internal: absolute source path for the repeat-view dedup
                     # fingerprint (mtime+size change detection).

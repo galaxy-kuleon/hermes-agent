@@ -60,7 +60,7 @@ def _payload(message: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _requested_class_numbers(text: str) -> tuple[int, ...]:
+def requested_class_numbers(text: str) -> tuple[int, ...]:
     numbers: list[int] = []
     for match in _CLASS_LIST_RE.finditer(text or ""):
         numbers.extend(int(value) for value in _CLASS_NUMBER_RE.findall(match.group(1)))
@@ -70,7 +70,7 @@ def _requested_class_numbers(text: str) -> tuple[int, ...]:
 def _required_sources(
     examples: list[dict[str, Any]], user_text: str
 ) -> tuple[tuple[str, str], ...]:
-    classes = _requested_class_numbers(user_text)
+    classes = requested_class_numbers(user_text)
     required: list[tuple[str, str]] = []
     for example in examples:
         name = str(example.get("name") or "").strip()
@@ -142,7 +142,10 @@ def evaluate_skill_source_contract(
                 "Required skill sources were not loaded successfully in this turn. "
                 "Do not answer from memory, a prior run, attachments, local-path "
                 "guesses, or terminal access. Issue these exact native calls now, "
-                "then answer only from their authoritative results:\n"
+                "then answer only from their authoritative results. Reapply every "
+                "count, coverage, wording, and response-format rule from the named "
+                "skill; list every item it requires and do not claim a successful "
+                "source was truncated when content_complete=true:\n"
                 f"{calls}"
             ),
             missing=missing,

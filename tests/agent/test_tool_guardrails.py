@@ -486,6 +486,53 @@ def test_skill_mutation_requires_explicit_turn_intent():
     )
 
 
+def test_named_skill_contract_allows_only_declared_requested_sources():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    controller.set_strict_skill_source_boundary(
+        True, requested_classes=(14, 35)
+    )
+    controller.observe_skill_view_result(
+        {"name": "tw-tmcc"},
+        json.dumps(
+            {
+                "success": True,
+                "source_contract": {
+                    "required_before_answer": True,
+                    "declared_skill_view_examples": [
+                        {
+                            "name": "tw-tmc",
+                            "file_path": "references/class-N.md",
+                        }
+                    ],
+                },
+            }
+        ),
+    )
+
+    for class_number in (14, 35):
+        assert (
+            controller.before_call(
+                "skill_view",
+                {
+                    "name": "tw-tmc",
+                    "file_path": f"references/class-{class_number}.md",
+                },
+            ).action
+            == "allow"
+        )
+
+    blocked = controller.before_call(
+        "skill_view",
+        {"name": "tw-tmcc", "file_path": "references/tipo-items.md"},
+    )
+    assert blocked.action == "reuse"
+    assert blocked.code == "strict_skill_source_path"
+    assert "class-14.md" in blocked.message
+    assert "class-35.md" in blocked.message
+
+
 def test_block_message_tells_the_model_to_answer_not_to_report():
     """A control that halts a loop must not become the answer.
 

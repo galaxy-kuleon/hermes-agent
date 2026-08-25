@@ -393,6 +393,8 @@ class TestSkillView:
 
         assert existing["success"] is True
         assert "Endpoint info" in existing["content"]
+        assert existing["content_complete"] is True
+        assert existing["content_chars"] == len(existing["content"])
         assert missing["success"] is False
         # The skill view advertises what else can be opened.
         assert skill["linked_files"] is not None

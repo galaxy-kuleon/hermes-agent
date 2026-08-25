@@ -148,6 +148,21 @@ def _deliver_verbatim_terminal_reply(agent, reply: str) -> bool:
     return True
 
 
+def _discard_held_skill_source_stream(agent) -> None:
+    """Discard a rejected named-skill draft without touching raw evidence."""
+    agent._held_skill_source_stream_text = ""
+    agent._current_streamed_assistant_text = ""
+
+
+def _release_held_skill_source_terminal_reply(agent, reply: str) -> bool:
+    """Expose only the terminal named-skill reply accepted by all gates."""
+    if not getattr(agent, "_skill_source_stream_hold", False):
+        return False
+    agent._skill_source_stream_hold = False
+    _discard_held_skill_source_stream(agent)
+    return _deliver_verbatim_terminal_reply(agent, reply)
+
+
 def _reset_tool_read_dedup_after_context_rewrite(task_id: str | None) -> None:
     """Re-arm exact reads after transcript content has been rewritten.
 
@@ -8271,6 +8286,7 @@ def run_conversation(
                     agent._emit_status(
                         "↻ 技能所需的權威來源尚未載入 — 正在讀取原始資料"
                     )
+                    _discard_held_skill_source_stream(agent)
                     final_response = None
                     continue
                 if (
@@ -8579,6 +8595,9 @@ def run_conversation(
                     final_response = None
                     continue
 
+                _release_held_skill_source_terminal_reply(
+                    agent, final_response or ""
+                )
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session

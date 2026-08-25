@@ -581,13 +581,31 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     from agent.hk_legal_authority_gate import is_strict_skill_source_boundary
-    from agent.skill_source_gate import has_explicit_skill_mutation_intent
+    from agent.skill_source_gate import (
+        has_explicit_skill_mutation_intent,
+        requested_class_numbers,
+    )
 
+    strict_skill_source_boundary = is_strict_skill_source_boundary(user_message)
     set_source_boundary = getattr(
         agent._tool_guardrails, "set_strict_skill_source_boundary", None
     )
     if callable(set_source_boundary):
-        set_source_boundary(is_strict_skill_source_boundary(user_message))
+        set_source_boundary(
+            strict_skill_source_boundary,
+            requested_classes=requested_class_numbers(
+                user_message.get("content", "")
+                if isinstance(user_message, dict)
+                else str(user_message or "")
+            ),
+        )
+    # A named-skill answer may be rejected after the provider has already
+    # streamed it. Hold model-authored text until the declared-source gate has
+    # accepted the terminal candidate; tool lifecycle/status events remain
+    # live, so the browser still shows honest progress without exposing an
+    # ungrounded draft as if it were an answer.
+    agent._skill_source_stream_hold = strict_skill_source_boundary
+    agent._held_skill_source_stream_text = ""
     set_skill_mutation_allowed = getattr(
         agent._tool_guardrails, "set_skill_mutation_allowed", None
     )

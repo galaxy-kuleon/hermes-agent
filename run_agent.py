@@ -6536,13 +6536,14 @@ class AIAgent:
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
                 if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
-                    self._record_streamed_assistant_text(think_tail)
+                    if not self._hold_skill_source_stream_text(think_tail):
+                        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                        for cb in callbacks:
+                            try:
+                                cb(think_tail)
+                            except Exception:
+                                pass
+                        self._record_streamed_assistant_text(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
@@ -6550,14 +6551,26 @@ class AIAgent:
         if scrubber is not None:
             tail = scrubber.flush()
             if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
-                self._record_streamed_assistant_text(tail)
+                if not self._hold_skill_source_stream_text(tail):
+                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                    for cb in callbacks:
+                        try:
+                            cb(tail)
+                        except Exception:
+                            pass
+                    self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
+        self._held_skill_source_stream_text = ""
+
+    def _hold_skill_source_stream_text(self, text: str) -> bool:
+        """Buffer named-skill model text until its source gate accepts it."""
+        if not getattr(self, "_skill_source_stream_hold", False):
+            return False
+        if isinstance(text, str) and text:
+            self._held_skill_source_stream_text = (
+                getattr(self, "_held_skill_source_stream_text", "") + text
+            )
+        return True
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -6923,6 +6936,11 @@ class AIAgent:
             ):
                 text = text.lstrip("\n")
         if not text:
+            return
+        if self._hold_skill_source_stream_text(text):
+            # The provider response is still preserved in the canonical
+            # assistant message and request trace. Only its browser projection
+            # is held until the declared skill-source stop gate accepts it.
             return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False

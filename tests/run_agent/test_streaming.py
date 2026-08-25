@@ -53,6 +53,34 @@ def _make_empty_chunk(model=None, usage=None):
     return SimpleNamespace(choices=[], model=model, usage=usage)
 
 
+def test_named_skill_stream_holds_draft_until_terminal_release():
+    from agent.conversation_loop import _release_held_skill_source_terminal_reply
+    from run_agent import AIAgent
+
+    delivered = []
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        stream_delta_callback=delivered.append,
+    )
+    agent._skill_source_stream_hold = True
+    agent._fire_stream_delta("ungrounded draft")
+
+    assert delivered == []
+    assert agent._held_skill_source_stream_text == "ungrounded draft"
+    assert agent._current_streamed_assistant_text == ""
+
+    assert _release_held_skill_source_terminal_reply(agent, "grounded final")
+    assert delivered == ["grounded final", None]
+    assert agent._skill_source_stream_hold is False
+    assert agent._held_skill_source_stream_text == ""
+    assert agent._current_streamed_assistant_text == "grounded final"
+
+
 # ── Test: Streaming Accumulator ──────────────────────────────────────────
 
 
@@ -1634,4 +1662,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-
