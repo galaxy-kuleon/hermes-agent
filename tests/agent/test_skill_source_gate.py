@@ -26,6 +26,38 @@ def _contract():
     )
 
 
+def _answer_contract():
+    return _tool(
+        {
+            "success": True,
+            "name": "tw-tmcc",
+            "source_contract": {
+                "required_before_answer": True,
+                "declared_skill_view_examples": [
+                    {"name": "tw-tmc", "file_path": "references/class-N.md"}
+                ],
+                "answer_contract": {
+                    "class_1_34_max_items": 20,
+                    "class_35_wholesale_retail_max_items": 5,
+                    "class_1_34_relevant_max_items": 17,
+                    "class_1_34_coverage_items": 3,
+                    "class_1_34_coverage_distinct_subgroups": 3,
+                    "list_every_chosen_item": True,
+                    "require_total": True,
+                    "require_relevant_and_coverage_sections": True,
+                },
+            },
+        }
+    )
+
+
+def _loaded_sources():
+    return [
+        _tool({"success": True, "name": "tw-tmc", "file": "references/class-14.md"}),
+        _tool({"success": True, "name": "tw-tmc", "file": "references/class-35.md"}),
+    ]
+
+
 def test_missing_requested_class_sources_nudges_exact_calls():
     decision = evaluate_skill_source_contract(
         messages=[
@@ -110,3 +142,100 @@ def test_skill_application_is_read_only_without_explicit_mutation_intent():
     assert has_explicit_skill_mutation_intent(
         "請更新 tw-tmcc 技能並加入這條規則。"
     )
+
+
+def test_declared_answer_contract_rejects_candidate_dump():
+    decision = evaluate_skill_source_contract(
+        messages=[
+            {"role": "user", "content": "apply tm-twcc: 珠寶直銷 classes 14 and 35."},
+            _answer_contract(),
+            *_loaded_sources(),
+        ],
+        current_turn_user_idx=0,
+        attempts=0,
+        final_response=(
+            "Class 14 — jewelry\n\n"
+            + "\n".join(f"{index}. candidate" for index in range(1, 22))
+            + "\nTotal: 21 items"
+        ),
+    )
+
+    assert decision is not None
+    assert decision.action == "nudge"
+    assert any("Class 14 lists 21 items" in item for item in decision.diagnostics)
+    assert "Class 35 section is missing" in decision.diagnostics
+    assert "Rewrite the answer only" in decision.message
+
+
+def test_declared_answer_contract_accepts_structured_selection():
+    response = """Class 14 — jewelry
+
+Relevant items:
+- 1401 jewelry:
+  1. A
+  2. B
+
+Coverage items:
+- 1402 cufflinks:
+  1. C
+- 1403 jewelry boxes:
+  2. D
+- 1406 watches:
+  3. E
+
+Total: 5 items
+
+Class 35 — retail
+
+Relevant items:
+- 351914 jewelry retail:
+  1. Jewelry retail
+- 351909 watch retail:
+  2. Watch retail
+
+Total: 2 items"""
+    assert (
+        evaluate_skill_source_contract(
+            messages=[
+                {"role": "user", "content": "apply tm-twcc: 珠寶直銷 classes 14 and 35."},
+                _answer_contract(),
+                *_loaded_sources(),
+            ],
+            current_turn_user_idx=0,
+            attempts=0,
+            final_response=response,
+        )
+        is None
+    )
+
+
+def test_explicit_smaller_item_count_overrides_default_coverage_shape():
+    assert (
+        evaluate_skill_source_contract(
+            messages=[
+                {"role": "user", "content": "apply tm-twcc class 14, only 2 items"},
+                _answer_contract(),
+                _loaded_sources()[0],
+            ],
+            current_turn_user_idx=0,
+            attempts=0,
+            final_response="Class 14\n1. A\n2. B\nTotal: 2 items",
+        )
+        is None
+    )
+
+
+def test_exhausted_answer_contract_fails_closed():
+    decision = evaluate_skill_source_contract(
+        messages=[
+            {"role": "user", "content": "apply tm-twcc class 14"},
+            _answer_contract(),
+            _loaded_sources()[0],
+        ],
+        current_turn_user_idx=0,
+        attempts=MAX_SKILL_SOURCE_NUDGES,
+        final_response="Class 14\n1. A",
+    )
+    assert decision is not None
+    assert decision.action == "fail"
+    assert decision.diagnostics

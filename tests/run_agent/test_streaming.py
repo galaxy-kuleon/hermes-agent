@@ -81,6 +81,26 @@ def test_named_skill_stream_holds_draft_until_terminal_release():
     assert agent._current_streamed_assistant_text == "grounded final"
 
 
+def test_named_skill_terminal_release_uses_per_turn_stream_callback():
+    from agent.conversation_loop import _release_held_skill_source_terminal_reply
+    from run_agent import AIAgent
+
+    delivered = []
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._stream_callback = delivered.append
+    agent._skill_source_stream_hold = True
+
+    assert _release_held_skill_source_terminal_reply(agent, "grounded final")
+    assert delivered == ["grounded final", None]
+
+
 # ── Test: Streaming Accumulator ──────────────────────────────────────────
 
 

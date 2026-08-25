@@ -9,7 +9,10 @@ from typing import Any
 
 
 MAX_SKILL_SOURCE_NUDGES = 3
-_CLASS_LIST_RE = re.compile(r"\bclasses?\b([^\n.:;]{0,80})", re.IGNORECASE)
+_CLASS_LIST_RE = re.compile(
+    r"\bclass(?:es)?\s*([1-9]\d?(?:\s*(?:,|and|&|/)\s*[1-9]\d?)*)",
+    re.IGNORECASE,
+)
 _CLASS_NUMBER_RE = re.compile(r"\b([1-9]|[1-9][0-9])\b")
 _CLASS_PLACEHOLDER_RE = re.compile(r"(?<=class-)N(?=\.)")
 _SKILL_MUTATION_INTENT_RE = re.compile(
@@ -30,6 +33,7 @@ class SkillSourceDecision:
     action: str
     message: str
     missing: tuple[tuple[str, str], ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
 
 def _message_text(message: Any) -> str:
@@ -101,11 +105,143 @@ def _successful_source(payload: dict) -> tuple[str, str] | None:
     return name, file_path
 
 
+_CLASS_SECTION_RE = re.compile(
+    r"(?im)^\s{0,3}(?:#{1,6}\s*)?(?:class\s*|第\s*)([1-9]\d?)"
+    r"(?=\s|[-—:：類类]|$)"
+)
+_NUMBERED_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*]\s*)?\d+[.)、]\s+\S.*$")
+_EXPLICIT_ITEM_COUNT_RE = re.compile(
+    r"(?:\b(?:only|exactly|at\s+most|maximum|max)\s*(\d+)\s*items?\b|"
+    r"(?:只要|僅要|仅要|最多|不超過|不超过)\s*(\d+)\s*(?:項|项))",
+    re.IGNORECASE,
+)
+
+
+def _class_sections(text: str) -> dict[int, str]:
+    matches = list(_CLASS_SECTION_RE.finditer(text or ""))
+    return {
+        int(match.group(1)): (text or "")[
+            match.start() : matches[index + 1].start() if index + 1 < len(matches) else None
+        ]
+        for index, match in enumerate(matches)
+    }
+
+
+def _explicit_item_count(user_text: str) -> int | None:
+    match = _EXPLICIT_ITEM_COUNT_RE.search(user_text or "")
+    if not match:
+        return None
+    value = next((group for group in match.groups() if group is not None), None)
+    return int(value) if value is not None else None
+
+
+def _numbered_item_count(text: str) -> int:
+    return len(_NUMBERED_ITEM_RE.findall(text or ""))
+
+
+def _answer_contract_diagnostics(
+    *, contract: dict[str, Any], user_text: str, final_response: str
+) -> tuple[str, ...]:
+    classes = requested_class_numbers(user_text)
+    if not classes or not final_response.strip():
+        return ("final answer is empty",) if classes else ()
+
+    sections = _class_sections(final_response)
+    explicit_count = _explicit_item_count(user_text)
+    diagnostics: list[str] = []
+    for class_number in classes:
+        section = sections.get(class_number)
+        if section is None:
+            diagnostics.append(f"Class {class_number} section is missing")
+            continue
+        item_count = _numbered_item_count(section)
+        if contract.get("list_every_chosen_item") is True and item_count < 1:
+            diagnostics.append(f"Class {class_number} does not list each chosen item")
+
+        total_match = re.search(r"(?im)^\s*Total:\s*(\d+)\s+items?\s*$", section)
+        if contract.get("require_total") is True and total_match is None:
+            diagnostics.append(f"Class {class_number} is missing the required Total line")
+        elif total_match and int(total_match.group(1)) != item_count:
+            diagnostics.append(
+                f"Class {class_number} Total says {total_match.group(1)} but lists {item_count} items"
+            )
+
+        if explicit_count is not None and item_count > explicit_count:
+            diagnostics.append(
+                f"Class {class_number} lists {item_count} items, above the user's explicit {explicit_count}-item limit"
+            )
+
+        if 1 <= class_number <= 34:
+            maximum = int(contract.get("class_1_34_max_items") or 0)
+            if maximum and item_count > maximum:
+                diagnostics.append(
+                    f"Class {class_number} lists {item_count} items, above the {maximum}-item cap"
+                )
+            if explicit_count is not None:
+                continue
+            relevant_heading = re.search(r"(?im)^\s*Relevant\s+items:\s*$", section)
+            coverage_heading = re.search(r"(?im)^\s*Coverage\s+items:\s*$", section)
+            if contract.get("require_relevant_and_coverage_sections") is True and (
+                relevant_heading is None or coverage_heading is None
+            ):
+                diagnostics.append(
+                    f"Class {class_number} must use separate Relevant items and Coverage items sections"
+                )
+                continue
+            if (
+                relevant_heading
+                and coverage_heading
+                and relevant_heading.start() < coverage_heading.start()
+            ):
+                relevant_text = section[relevant_heading.end() : coverage_heading.start()]
+                coverage_text = section[coverage_heading.end() :]
+                relevant_count = _numbered_item_count(relevant_text)
+                coverage_count = _numbered_item_count(coverage_text)
+                relevant_max = int(contract.get("class_1_34_relevant_max_items") or 0)
+                coverage_required = int(contract.get("class_1_34_coverage_items") or 0)
+                subgroup_required = int(
+                    contract.get("class_1_34_coverage_distinct_subgroups") or 0
+                )
+                if relevant_max and relevant_count > relevant_max:
+                    diagnostics.append(
+                        f"Class {class_number} has {relevant_count} relevant items, above the {relevant_max}-item relevant cap"
+                    )
+                if relevant_count < 1:
+                    diagnostics.append(
+                        f"Class {class_number} must include at least one relevant item"
+                    )
+                if coverage_required and coverage_count != coverage_required:
+                    diagnostics.append(
+                        f"Class {class_number} must list exactly {coverage_required} coverage items; found {coverage_count}"
+                    )
+                subgroup_codes = set(
+                    re.findall(r"(?m)^\s*[-*]\s*(\d{4})\b", coverage_text)
+                )
+                if subgroup_required and len(subgroup_codes) < subgroup_required:
+                    diagnostics.append(
+                        f"Class {class_number} coverage must span {subgroup_required} subgroup codes; found {len(subgroup_codes)}"
+                    )
+
+        if class_number == 35 and re.search(
+            r"wholesal|retail|direct\s+sales|批發|批发|零售|直銷|直销",
+            user_text,
+            re.IGNORECASE,
+        ):
+            maximum = int(contract.get("class_35_wholesale_retail_max_items") or 0)
+            if maximum and item_count > maximum:
+                diagnostics.append(
+                    f"Class 35 lists {item_count} wholesale/retail items, above the {maximum}-item cap"
+                )
+
+    return tuple(diagnostics)
+
+
 def evaluate_skill_source_contract(
     *,
     messages: list[Any],
     current_turn_user_idx: int,
     attempts: int,
+    final_response: str = "",
 ) -> SkillSourceDecision | None:
     """Require this turn's declared linked skill sources before finalization."""
     if not (0 <= current_turn_user_idx < len(messages)):
@@ -114,6 +250,7 @@ def evaluate_skill_source_contract(
     current_messages = messages[current_turn_user_idx + 1 :]
     required: list[tuple[str, str]] = []
     successful: set[tuple[str, str]] = set()
+    answer_contract: dict[str, Any] = {}
     for message in current_messages:
         payload = _payload(message)
         if payload is None:
@@ -123,12 +260,22 @@ def evaluate_skill_source_contract(
             examples = contract.get("declared_skill_view_examples") or []
             if isinstance(examples, list):
                 required.extend(_required_sources(examples, user_text))
+            declared_answer_contract = contract.get("answer_contract")
+            if isinstance(declared_answer_contract, dict):
+                answer_contract.update(declared_answer_contract)
         source = _successful_source(payload)
         if source:
             successful.add(source)
 
     missing = tuple(source for source in dict.fromkeys(required) if source not in successful)
-    if not missing:
+    diagnostics = ()
+    if not missing and answer_contract:
+        diagnostics = _answer_contract_diagnostics(
+            contract=answer_contract,
+            user_text=user_text,
+            final_response=final_response,
+        )
+    if not missing and not diagnostics:
         return None
 
     calls = "\n".join(
@@ -136,6 +283,22 @@ def evaluate_skill_source_contract(
         for name, file_path in missing
     )
     if attempts < MAX_SKILL_SOURCE_NUDGES:
+        if diagnostics:
+            problems = "\n".join(f"- {item}" for item in diagnostics)
+            return SkillSourceDecision(
+                action="nudge",
+                message=(
+                    "The final answer violates the named skill's declared answer "
+                    "contract. Rewrite the answer only; do not ask the user to "
+                    "choose from a candidate dump and do not use more tools unless "
+                    "a loaded authoritative source is genuinely insufficient. "
+                    "Follow the skill's exact section labels, list every selected "
+                    "item, subgroup code, coverage allocation, cap, and Total line. "
+                    "Fix these mechanically observed problems:\n"
+                    f"{problems}"
+                ),
+                diagnostics=diagnostics,
+            )
         return SkillSourceDecision(
             action="nudge",
             message=(
@@ -149,6 +312,16 @@ def evaluate_skill_source_contract(
                 f"{calls}"
             ),
             missing=missing,
+        )
+    if diagnostics:
+        return SkillSourceDecision(
+            action="fail",
+            message=(
+                "Cannot confirm the requested skill result because the final "
+                "answer repeatedly violated its declared count, coverage, or "
+                "response-format contract."
+            ),
+            diagnostics=diagnostics,
         )
     return SkillSourceDecision(
         action="fail",

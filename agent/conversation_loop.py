@@ -160,7 +160,42 @@ def _release_held_skill_source_terminal_reply(agent, reply: str) -> bool:
         return False
     agent._skill_source_stream_hold = False
     _discard_held_skill_source_stream(agent)
-    return _deliver_verbatim_terminal_reply(agent, reply)
+    callbacks = [
+        callback
+        for callback in (
+            getattr(agent, "stream_delta_callback", None),
+            getattr(agent, "_stream_callback", None),
+        )
+        if callback is not None
+    ]
+    if not callbacks or not isinstance(reply, str) or not reply:
+        return False
+    streamed_before = getattr(agent, "_current_streamed_assistant_text", "")
+    try:
+        agent._fire_stream_delta(reply)
+    except Exception:
+        logger.warning(
+            "verified skill terminal reply stream projection failed "
+            "(session=%s)",
+            getattr(agent, "session_id", None) or "none",
+            exc_info=True,
+        )
+        return False
+    if getattr(agent, "_current_streamed_assistant_text", "") == streamed_before:
+        return False
+    boundary_delivered = False
+    for callback in callbacks:
+        try:
+            callback(None)
+            boundary_delivered = True
+        except Exception:
+            logger.warning(
+                "verified skill terminal reply stream boundary failed "
+                "(session=%s)",
+                getattr(agent, "session_id", None) or "none",
+                exc_info=True,
+            )
+    return boundary_delivered
 
 
 def _reset_tool_read_dedup_after_context_rewrite(task_id: str | None) -> None:
@@ -8258,6 +8293,7 @@ def run_conversation(
                     messages=messages,
                     current_turn_user_idx=current_turn_user_idx,
                     attempts=skill_source_nudges,
+                    final_response=final_response or "",
                 )
                 if (
                     _skill_source_decision
@@ -8278,9 +8314,11 @@ def run_conversation(
                     agent._session_messages = messages
                     logger.warning(
                         "Named skill answer rejected pending declared sources "
-                        "(attempt %d, missing=%s, session=%s)",
+                        "or answer contract (attempt %d, missing=%s, "
+                        "diagnostics=%s, session=%s)",
                         skill_source_nudges,
                         list(_skill_source_decision.missing),
+                        list(_skill_source_decision.diagnostics),
                         getattr(agent, "session_id", None) or "none",
                     )
                     agent._emit_status(

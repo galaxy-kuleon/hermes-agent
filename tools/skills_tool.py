@@ -150,6 +150,57 @@ def _declared_skill_view_examples(content: str) -> list[dict[str, str]]:
     return examples
 
 
+def _declared_answer_contract(content: str) -> dict[str, Any] | None:
+    """Extract only explicit, mechanically checkable answer rules.
+
+    The contract is advisory metadata carried beside the skill body. It does
+    not invent policy: every emitted field must be backed by literal wording
+    in the loaded skill.
+    """
+    text = content or ""
+    contract: dict[str, Any] = {}
+    patterns = (
+        (
+            "class_1_34_max_items",
+            r"For\s+\*\*Classes\s+1[–-]34\*\*,\s*choose\s+\*\*(\d+)\s+items\s+at\s+most\*\*",
+        ),
+        (
+            "class_35_wholesale_retail_max_items",
+            r"For\s+\*\*Class\s+35\*\*[^\n]{0,180}?choose\s+\*\*(\d+)\s+items\s+at\s+most\*\*",
+        ),
+        (
+            "class_1_34_relevant_max_items",
+            r"for\s+\*\*classes\s+1[–-]34\*\*\s+pick\s+\*\*(\d+)\s+items\s+at\s+most\*\*",
+        ),
+        (
+            "class_1_34_coverage_items",
+            r"however\s+pick\s+\*\*(\d+)\s+items\*\*[^\n]{0,180}?cover\s+more\s+subgroups",
+        ),
+        (
+            "class_1_34_coverage_distinct_subgroups",
+            r"three\s+items\s+preferably\s+cover\s+\*\*(\d+|three)\s+different\s+subgroups\*\*",
+        ),
+    )
+    for key, pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = match.group(1).lower()
+            contract[key] = 3 if value == "three" else int(value)
+
+    if re.search(r"\*\*Always\s+list\s+every\s+chosen\s+item\*\*", text, re.IGNORECASE):
+        contract["list_every_chosen_item"] = True
+    if re.search(r"Total:\s*\[X\]\s+items", text, re.IGNORECASE):
+        contract["require_total"] = True
+    if re.search(
+        r"Relevant\s+items:\s*.*Coverage\s+items:",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        contract["require_relevant_and_coverage_sections"] = True
+
+    return contract or None
+
+
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
@@ -1994,6 +2045,7 @@ def skill_view(
                 )
 
         declared_examples = _declared_skill_view_examples(rendered_content)
+        answer_contract = _declared_answer_contract(rendered_content)
         source_contract = None
         if declared_examples:
             source_contract = {
@@ -2005,6 +2057,7 @@ def skill_view(
                     "terminal access, or a prior run for these sources."
                 ),
                 "declared_skill_view_examples": declared_examples,
+                "answer_contract": answer_contract,
             }
 
         result = {

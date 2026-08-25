@@ -433,8 +433,39 @@ class TestSkillView:
             "declared_skill_view_examples": [
                 {"name": "catalog", "file_path": "references/class-N.md"}
             ],
+            "answer_contract": None,
         }
         assert list(loaded).index("source_contract") < list(loaded).index("content")
+
+    def test_view_exposes_only_explicit_answer_contract_rules(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "selector",
+                body=(
+                    "For **Classes 1–34**, choose **20 items at most** per class.\n"
+                    "For **Class 35** regarding wholesaling and retailing, choose "
+                    "**5 items at most**.\n"
+                    "For **classes 1–34** pick **17 items at most** for the business, "
+                    "and however pick **3 items** which can cover more subgroups; "
+                    "the three items preferably cover **3 different subgroups**.\n"
+                    "**Always list every chosen item**.\n"
+                    "Relevant items:\nCoverage items:\nTotal: [X] items\n"
+                    'skill_view(name="catalog", file_path="references/class-N.md")'
+                ),
+            )
+            loaded = json.loads(skill_view("selector"))
+
+        assert loaded["source_contract"]["answer_contract"] == {
+            "class_1_34_max_items": 20,
+            "class_35_wholesale_retail_max_items": 5,
+            "class_1_34_relevant_max_items": 17,
+            "class_1_34_coverage_items": 3,
+            "class_1_34_coverage_distinct_subgroups": 3,
+            "list_every_chosen_item": True,
+            "require_total": True,
+            "require_relevant_and_coverage_sections": True,
+        }
 
     def test_missing_file_omits_unsafe_declared_examples(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
