@@ -317,6 +317,18 @@ def _answer_contract_diagnostics(
                     diagnostics.append(
                         f"Class {class_number} coverage must span {subgroup_required} subgroup codes; found {len(subgroup_codes)}"
                     )
+                if contract.get("coverage_must_add_new_subgroups") is True:
+                    relevant_subgroup_codes = set(
+                        re.findall(
+                            r"(?m)^\s*[-*]\s*(?:\*\*|__)?(\d{4})\b",
+                            relevant_text,
+                        )
+                    )
+                    overlap = sorted(relevant_subgroup_codes & subgroup_codes)
+                    if overlap:
+                        diagnostics.append(
+                            f"Class {class_number} coverage reuses relevant subgroup codes instead of adding new subgroup coverage: {', '.join(overlap)}"
+                        )
 
         if class_number == 35 and re.search(
             r"wholesal|retail|direct\s+sales|批發|批发|零售|直銷|直销",

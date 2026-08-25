@@ -468,6 +468,7 @@ class TestSkillView:
             "require_total": True,
             "require_relevant_and_coverage_sections": True,
             "require_authoritative_item_wording": True,
+            "coverage_must_add_new_subgroups": True,
         }
 
     def test_missing_file_omits_unsafe_declared_examples(self, tmp_path):

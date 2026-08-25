@@ -46,6 +46,7 @@ def _answer_contract():
                     "require_total": True,
                     "require_relevant_and_coverage_sections": True,
                     "require_authoritative_item_wording": True,
+                    "coverage_must_add_new_subgroups": True,
                 },
             },
         }
@@ -349,3 +350,36 @@ Total: 4 items"""
     assert decision is not None
     assert decision.action == "nudge"
     assert any("'手鏈'" in item for item in decision.diagnostics)
+
+
+def test_declared_answer_contract_rejects_coverage_from_relevant_subgroup():
+    response = """Class 14
+
+Relevant items:
+- 1401 jewelry:
+  1. A
+
+Coverage items:
+- 1401 jewelry:
+  1. B
+- 1403 jewelry boxes:
+  2. D
+- 1406 watches:
+  3. E
+
+Total: 4 items"""
+    decision = evaluate_skill_source_contract(
+        messages=[
+            {"role": "user", "content": "apply tm-twcc class 14"},
+            _answer_contract(),
+            _loaded_sources()[0],
+        ],
+        current_turn_user_idx=0,
+        attempts=0,
+        final_response=response,
+    )
+
+    assert decision is not None
+    assert decision.action == "nudge"
+    assert any("reuses relevant subgroup codes" in item for item in decision.diagnostics)
+    assert any("1401" in item for item in decision.diagnostics)

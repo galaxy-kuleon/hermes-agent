@@ -198,6 +198,13 @@ def _declared_answer_contract(content: str) -> dict[str, Any] | None:
     ):
         contract["require_relevant_and_coverage_sections"] = True
     if re.search(
+        r"however\s+pick\s+\*\*\d+\s+items\*\*[\s\S]{0,240}?"
+        r"cover\s+more\s+subgroups",
+        text,
+        re.IGNORECASE,
+    ):
+        contract["coverage_must_add_new_subgroups"] = True
+    if re.search(
         r"Items\s+must\s+be\s+chosen\s+ONLY\s+from[\s\S]{0,300}?"
         r"NEVER\s+invent\s+items?,\s*wording,\s*or\s*codes",
         text,
