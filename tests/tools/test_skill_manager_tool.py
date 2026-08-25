@@ -154,6 +154,15 @@ class TestValidateFilePath:
         assert "File must be under one of:" in err
 
 
+def test_skill_manage_schema_declares_one_call_portability_fast_path():
+    from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
+
+    description = SKILL_MANAGE_SCHEMA["description"]
+    assert "make exactly one skill_manage call" in description
+    assert "action='publish', namespace='platform'" in description
+    assert "Do not call import_files separately" in description
+
+
 class TestImportFiles:
     def test_split_import_text_preserves_every_character(self):
         text = ("a" * (SKILL_IMPORT_CHUNK_CHARS + 17)) + "\nend\n"
