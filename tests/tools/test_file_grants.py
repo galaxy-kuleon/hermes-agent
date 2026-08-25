@@ -210,6 +210,67 @@ def test_skill_directory_search_joins_literal_file_glob(tmp_path):
     )
 
 
+def test_skill_root_search_joins_literal_support_file_path(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    directory = "/home/hermes/user-skills/user-123/tw-tmc"
+
+    with _file_grant_scope("task-recovery", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+        return_value=json.dumps(
+            {
+                "success": True,
+                "name": "tw-tmc",
+                "file": "references/class-35.md",
+                "content": "3501 advertising\n351914 珠寶零售\n351915 watches retail",
+            }
+        ),
+    ) as routed, patch(
+        "tools.file_tools._get_file_ops",
+        side_effect=AssertionError("linked skill file must not reach file I/O"),
+    ):
+        result = json.loads(
+            search_tool(
+                "珠寶|首飾|貴重金屬",
+                path=directory,
+                file_glob="references/class-35.md",
+                task_id="task-recovery",
+            )
+        )
+
+    assert result["content"] == "2:351914 珠寶零售"
+    assert result["routing"]["requested_path"].endswith(
+        "/tw-tmc/references/class-35.md"
+    )
+    routed.assert_called_once_with(
+        {"name": "tw-tmc", "file_path": "references/class-35.md"},
+        task_id="task-recovery",
+        force_content=True,
+    )
+
+
+def test_skill_root_search_does_not_join_traversal_file_glob(tmp_path):
+    allowed = tmp_path / "attached.txt"
+    directory = "/home/hermes/user-skills/user-123/tw-tmc"
+
+    with _file_grant_scope("task-recovery", [str(allowed)]), patch(
+        "tools.skills_tool._skill_view_with_bump",
+    ) as routed, patch(
+        "tools.file_grants.file_grant_error",
+        return_value="local file access not granted",
+    ):
+        result = json.loads(
+            search_tool(
+                "tw-tmc",
+                path=directory,
+                file_glob="references/../SKILL.md",
+                task_id="task-recovery",
+            )
+        )
+
+    assert result == {"error": "local file access not granted", "success": False}
+    routed.assert_not_called()
+
+
 def test_exact_skill_search_count_does_not_return_source_body(tmp_path):
     allowed = tmp_path / "attached.txt"
     path = "/home/hermes/skills/legal/tw-tmc/references/class-35.md"
