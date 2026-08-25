@@ -581,12 +581,20 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     from agent.hk_legal_authority_gate import is_strict_skill_source_boundary
+    from agent.skill_source_gate import has_explicit_skill_mutation_intent
 
     set_source_boundary = getattr(
         agent._tool_guardrails, "set_strict_skill_source_boundary", None
     )
     if callable(set_source_boundary):
         set_source_boundary(is_strict_skill_source_boundary(user_message))
+    set_skill_mutation_allowed = getattr(
+        agent._tool_guardrails, "set_skill_mutation_allowed", None
+    )
+    if callable(set_skill_mutation_allowed):
+        set_skill_mutation_allowed(
+            has_explicit_skill_mutation_intent(user_message)
+        )
     agent._tool_guardrail_halt_decision = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):

@@ -651,14 +651,23 @@ def _run_agent_tool_execution_middleware(
                     getattr(guardrail_decision, "code", "")
                     == "strict_skill_source_boundary"
                 )
+                skill_mutation_intent_required = (
+                    getattr(guardrail_decision, "code", "")
+                    == "skill_mutation_intent_required"
+                )
                 result = json.dumps(
                     {
                         "success": True,
                         "already_available": not (
-                            research_complete or source_boundary_enforced
+                            research_complete
+                            or source_boundary_enforced
+                            or skill_mutation_intent_required
                         ),
                         "research_complete": research_complete,
                         "source_boundary_enforced": source_boundary_enforced,
+                        "skill_mutation_intent_required": (
+                            skill_mutation_intent_required
+                        ),
                         "execution_skipped": True,
                         "tool": function_name,
                         "chapter": final_args.get("chapter"),

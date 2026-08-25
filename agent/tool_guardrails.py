@@ -404,10 +404,15 @@ class ToolCallGuardrailController:
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
         self._strict_skill_source_boundary = False
+        self._skill_mutation_allowed = False
 
     def set_strict_skill_source_boundary(self, enabled: bool) -> None:
         """Apply the current user's explicit one-skill knowledge boundary."""
         self._strict_skill_source_boundary = bool(enabled)
+
+    def set_skill_mutation_allowed(self, enabled: bool) -> None:
+        """Bind skill writes to explicit user mutation intent for this turn."""
+        self._skill_mutation_allowed = bool(enabled)
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -438,6 +443,20 @@ class ToolCallGuardrailController:
                     "outside memory/search source. Continue with skill_view and only "
                     "the source-specific tool or file that the skill directs you to; "
                     "if those sources cannot answer, say cannot-confirm or do not know."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
+
+        if tool_name == "skill_manage" and not self._skill_mutation_allowed:
+            return ToolGuardrailDecision(
+                action="reuse",
+                code="skill_mutation_intent_required",
+                message=(
+                    "The user did not ask to create, edit, patch, publish, delete, "
+                    "or write a skill in this turn. Skip this mutation and continue "
+                    "with read-only skill_view/source calls. Do not claim that the "
+                    "skill or its files changed."
                 ),
                 tool_name=tool_name,
                 signature=signature,

@@ -12,6 +12,17 @@ MAX_SKILL_SOURCE_NUDGES = 3
 _CLASS_LIST_RE = re.compile(r"\bclasses?\b([^\n.:;]{0,80})", re.IGNORECASE)
 _CLASS_NUMBER_RE = re.compile(r"\b([1-9]|[1-9][0-9])\b")
 _CLASS_PLACEHOLDER_RE = re.compile(r"(?<=class-)N(?=\.)")
+_SKILL_MUTATION_INTENT_RE = re.compile(
+    r"(?:\b(?:create|edit|update|modify|patch|change|write|delete|remove|rename|"
+    r"publish|install|sync|save|remember)\b.{0,120}\bskills?\b|"
+    r"\bskills?\b.{0,120}\b(?:create|edit|update|modify|patch|change|write|"
+    r"delete|remove|rename|publish|install|sync|save)\b|"
+    r"(?:建立|新增|編輯|编辑|修改|更新|修補|删除|刪除|移除|重新命名|發佈|发布|"
+    r"安裝|安装|同步|儲存|保存|記住).{0,80}(?:技能|skill)|"
+    r"(?:技能|skill).{0,80}(?:建立|新增|編輯|编辑|修改|更新|修補|删除|刪除|"
+    r"移除|重新命名|發佈|发布|安裝|安装|同步|儲存|保存))",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +43,11 @@ def _message_text(message: Any) -> str:
             if isinstance(part, dict)
         )
     return ""
+
+
+def has_explicit_skill_mutation_intent(user_message: Any) -> bool:
+    """Return whether the user explicitly asked to mutate skill state."""
+    return bool(_SKILL_MUTATION_INTENT_RE.search(_message_text(user_message)))
 
 
 def _payload(message: Any) -> dict | None:

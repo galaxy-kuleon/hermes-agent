@@ -464,6 +464,28 @@ def test_strict_skill_source_boundary_skips_ambient_knowledge_tools():
     assert controller.before_call("viking_search", {"query": "allowed again"}).action == "allow"
 
 
+def test_skill_mutation_requires_explicit_turn_intent():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    blocked = controller.before_call(
+        "skill_manage",
+        {"action": "write_file", "name": "demo", "file_path": "references/a.md"},
+    )
+    assert blocked.action == "reuse"
+    assert blocked.code == "skill_mutation_intent_required"
+    assert "Do not claim" in blocked.message
+
+    controller.set_skill_mutation_allowed(True)
+    assert (
+        controller.before_call(
+            "skill_manage",
+            {"action": "write_file", "name": "demo", "file_path": "references/a.md"},
+        ).action
+        == "allow"
+    )
+
+
 def test_block_message_tells_the_model_to_answer_not_to_report():
     """A control that halts a loop must not become the answer.
 

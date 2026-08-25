@@ -3,6 +3,7 @@ import json
 from agent.skill_source_gate import (
     MAX_SKILL_SOURCE_NUDGES,
     evaluate_skill_source_contract,
+    has_explicit_skill_mutation_intent,
 )
 
 
@@ -96,4 +97,16 @@ def test_no_contract_does_not_gate_ordinary_turn():
             attempts=0,
         )
         is None
+    )
+
+
+def test_skill_application_is_read_only_without_explicit_mutation_intent():
+    assert not has_explicit_skill_mutation_intent(
+        "apply tm-twcc: jewelry classes 14 and 35."
+    )
+    assert has_explicit_skill_mutation_intent(
+        "Please patch the tw-tmcc skill to add this missing rule."
+    )
+    assert has_explicit_skill_mutation_intent(
+        "請更新 tw-tmcc 技能並加入這條規則。"
     )
