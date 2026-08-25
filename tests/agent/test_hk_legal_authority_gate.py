@@ -538,6 +538,29 @@ def test_will_rejects_invented_section_14_exceptions_in_export():
     )
 
 
+def test_will_rejects_false_female_only_section_14_scope():
+    prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
+    answer = (
+        "Section 14 applies to wills made by women and is subject to both the "
+        "power-of-appointment and contemplated-particular-marriage exceptions; "
+        "for this male testator a subsequent marriage would not revoke the will. "
+        "Current version 2024-08-18: "
+        "https://www.elegislation.gov.hk/hk/cap30!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": prompt},
+            _wills_authority_message("5", "14"),
+        ],
+        current_turn_user_idx=0,
+        final_response=answer,
+        attempts=1,
+    )
+
+    assert decision.action == "nudge"
+    assert any("female-only" in error for error in decision.diagnostics)
+
+
 def test_will_rejects_incomplete_s14_and_inverted_s10_in_export():
     prompt = "Prepare a Hong Kong Last Will under the Wills Ordinance."
     answer = (

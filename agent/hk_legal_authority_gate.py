@@ -317,6 +317,18 @@ _SECTION_5_MUTUAL_WITNESS_PRESENCE_CORRECTION_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _SECTION_14_RE = re.compile(r"(?:(?:section|s\.?)\s*14\b|第\s*14\s*條)", re.IGNORECASE)
+_SECTION_14_FALSE_GENDER_SCOPE_RE = re.compile(
+    r"(?:(?:section|s\.?)\s*14\b.{0,220}"
+    r"(?:appl(?:y|ies)\s+(?:only\s+)?to\s+)?"
+    r"(?:wills?\s+made\s+by\s+)?(?:a\s+)?(?:woman|women|female)|"
+    r"(?:male\s+testator|testator\s+is\s+male).{0,220}"
+    r"(?:subsequent\s+marriage|remarriage).{0,120}"
+    r"(?:would|does|will)\s+not\s+revoke|"
+    r"第\s*14\s*條.{0,120}(?:只|僅|仅).{0,40}(?:女性|女人)|"
+    r"(?:男性立遺囑人|男性立遗嘱人).{0,120}(?:再婚|結婚|结婚)"
+    r".{0,80}(?:不撤銷|不撤销))",
+    re.IGNORECASE | re.DOTALL,
+)
 _SECTION_15_RE = re.compile(r"(?:(?:section|s\.?)\s*15\b|第\s*15\s*條)", re.IGNORECASE)
 _SECTION_10_RE = re.compile(r"(?:(?:section|s\.?)\s*10\b|第\s*10\s*條)", re.IGNORECASE)
 _INTERESTED_WITNESS_RE = re.compile(
@@ -838,6 +850,11 @@ def _wills_semantic_errors(user_message: Any, answer: str) -> list[str]:
             errors.append(
                 "section 14 does not create a life-policy-trust or becoming-a-parent "
                 "exception to marriage revocation"
+            )
+        if _SECTION_14_FALSE_GENDER_SCOPE_RE.search(answer):
+            errors.append(
+                "section 14 applies to the testator's marriage without a female-only "
+                "or male-testator exemption"
             )
     if _INTERESTED_WITNESS_RE.search(answer):
         if not _SECTION_10_RE.search(answer):
