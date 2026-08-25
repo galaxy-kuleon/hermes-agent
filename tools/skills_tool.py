@@ -197,6 +197,13 @@ def _declared_answer_contract(content: str) -> dict[str, Any] | None:
         re.IGNORECASE | re.DOTALL,
     ):
         contract["require_relevant_and_coverage_sections"] = True
+    if re.search(
+        r"Items\s+must\s+be\s+chosen\s+ONLY\s+from[\s\S]{0,300}?"
+        r"NEVER\s+invent\s+items?,\s*wording,\s*or\s*codes",
+        text,
+        re.IGNORECASE,
+    ):
+        contract["require_authoritative_item_wording"] = True
 
     return contract or None
 

@@ -111,6 +111,9 @@ _CLASS_SECTION_RE = re.compile(
     r"(?=\s|[-—:：類类]|$)"
 )
 _NUMBERED_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*]\s*)?\d+[.)、]\s+\S.*$")
+_NUMBERED_ITEM_CAPTURE_RE = re.compile(
+    r"(?m)^\s*(?:[-*]\s*)?\d+[.)、]\s+(?P<item>\S.*)$"
+)
 _EXPLICIT_ITEM_COUNT_RE = re.compile(
     r"(?:\b(?:only|exactly|at\s+most|maximum|max)\s*(\d+)\s*items?\b|"
     r"(?:只要|僅要|仅要|最多|不超過|不超过)\s*(\d+)\s*(?:項|项))",
@@ -140,6 +143,34 @@ def _numbered_item_count(text: str) -> int:
     return len(_NUMBERED_ITEM_RE.findall(text or ""))
 
 
+def _numbered_items(text: str) -> tuple[str, ...]:
+    """Return item text while removing Markdown wrappers, not legal wording."""
+    items: list[str] = []
+    for match in _NUMBERED_ITEM_CAPTURE_RE.finditer(text or ""):
+        item = match.group("item").strip()
+        item = re.sub(r"^(?:\*\*|__)(.*?)(?:\*\*|__)$", r"\1", item).strip()
+        items.append(item)
+    return tuple(items)
+
+
+def _source_content_for_class(
+    source_contents: dict[tuple[str, str], str], class_number: int
+) -> str:
+    expected = re.compile(rf"(?:^|/)class-{class_number}\.md$", re.IGNORECASE)
+    return next(
+        (
+            content
+            for (_, file_path), content in source_contents.items()
+            if expected.search(file_path)
+        ),
+        "",
+    )
+
+
+def _without_layout_whitespace(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
 def _label_pattern(label: str) -> str:
     return rf"(?im)^\s*(?:#{{1,6}}\s*)?(?:\*\*|__)?{label}(?:\*\*|__)?\s*$"
 
@@ -162,7 +193,11 @@ def _corrective_source_packet(
 
 
 def _answer_contract_diagnostics(
-    *, contract: dict[str, Any], user_text: str, final_response: str
+    *,
+    contract: dict[str, Any],
+    user_text: str,
+    final_response: str,
+    source_contents: dict[tuple[str, str], str],
 ) -> tuple[str, ...]:
     classes = requested_class_numbers(user_text)
     if not classes or not final_response.strip():
@@ -179,6 +214,23 @@ def _answer_contract_diagnostics(
         item_count = _numbered_item_count(section)
         if contract.get("list_every_chosen_item") is True and item_count < 1:
             diagnostics.append(f"Class {class_number} does not list each chosen item")
+
+        if contract.get("require_authoritative_item_wording") is True:
+            authoritative_source = _without_layout_whitespace(
+                _source_content_for_class(source_contents, class_number)
+            )
+            seen_items: set[str] = set()
+            for item in _numbered_items(section):
+                compact_item = _without_layout_whitespace(item)
+                if compact_item in seen_items:
+                    diagnostics.append(
+                        f"Class {class_number} repeats item wording {item!r}"
+                    )
+                seen_items.add(compact_item)
+                if not authoritative_source or compact_item not in authoritative_source:
+                    diagnostics.append(
+                        f"Class {class_number} item wording is not present in its authoritative source: {item!r}"
+                    )
 
         total_match = re.search(
             r"(?im)^\s*(?:\*\*|__)?(?:Total|總計|总计|合計|合计|小計|小计|"
@@ -322,6 +374,7 @@ def evaluate_skill_source_contract(
             contract=answer_contract,
             user_text=user_text,
             final_response=final_response,
+            source_contents=source_contents,
         )
     if not missing and not diagnostics:
         return None

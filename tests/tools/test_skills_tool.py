@@ -450,6 +450,8 @@ class TestSkillView:
                     "and however pick **3 items** which can cover more subgroups; "
                     "the three items preferably cover **3 different subgroups**.\n"
                     "**Always list every chosen item**.\n"
+                    "Items must be chosen ONLY from the database. NEVER invent "
+                    "items, wording, or codes.\n"
                     "Relevant items:\nCoverage items:\nTotal: [X] items\n"
                     'skill_view(name="catalog", file_path="references/class-N.md")'
                 ),
@@ -465,6 +467,7 @@ class TestSkillView:
             "list_every_chosen_item": True,
             "require_total": True,
             "require_relevant_and_coverage_sections": True,
+            "require_authoritative_item_wording": True,
         }
 
     def test_missing_file_omits_unsafe_declared_examples(self, tmp_path):

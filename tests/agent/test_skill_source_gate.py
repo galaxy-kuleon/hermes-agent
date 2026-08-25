@@ -45,6 +45,7 @@ def _answer_contract():
                     "list_every_chosen_item": True,
                     "require_total": True,
                     "require_relevant_and_coverage_sections": True,
+                    "require_authoritative_item_wording": True,
                 },
             },
         }
@@ -58,7 +59,11 @@ def _loaded_sources():
                 "success": True,
                 "name": "tw-tmc",
                 "file": "references/class-14.md",
-                "content": "class 14 source",
+                "content": (
+                    "1401 A B jewelry Jewelry retail 珠寶 貴重金屬 寶石 項鍊 戒指 "
+                    "耳環 手鏈 墜子 胸針 手環 銀 黃金 Ｋ金 珍珠 鑽石 翡翠 紅寶石\n"
+                    "1402 C\n1403 D 珠寶盒\n1404 紀念章\n1406 E 手錶"
+                ),
                 "content_complete": True,
             }
         ),
@@ -67,7 +72,10 @@ def _loaded_sources():
                 "success": True,
                 "name": "tw-tmc",
                 "file": "references/class-35.md",
-                "content": "class 35 source",
+                "content": (
+                    "351914 Jewelry retail Watch retail 首飾零售批發 "
+                    "貴重金屬零售批發 珠寶零售 鐘錶零售"
+                ),
                 "content_complete": True,
             }
         ),
@@ -183,7 +191,7 @@ def test_declared_answer_contract_rejects_candidate_dump():
     assert "Rewrite the answer only" in decision.message
     assert "full-fidelity copies" in decision.message
     assert "--- authoritative source: tw-tmc / references/class-14.md ---" in decision.message
-    assert "class 35 source" in decision.message
+    assert "351914 Jewelry retail" in decision.message
     assert '"class_1_34_max_items": 20' in decision.message
     assert "Return only this literal outer shape" in decision.message
     assert "Class [N] — [name]" in decision.message
@@ -304,3 +312,40 @@ def test_exhausted_answer_contract_fails_closed():
     assert decision is not None
     assert decision.action == "fail"
     assert decision.diagnostics
+
+
+def test_declared_answer_contract_rejects_non_authoritative_wording():
+    response = """Class 14
+
+Relevant items:
+- 1401 jewelry:
+  1. 手鏈
+
+Coverage items:
+- 1402 cufflinks:
+  1. C
+- 1403 jewelry boxes:
+  2. D
+- 1406 watches:
+  3. E
+
+Total: 4 items"""
+    sources = _loaded_sources()
+    class_14 = json.loads(sources[0]["content"])
+    class_14["content"] = class_14["content"].replace("手鏈", "手鍊")
+    sources[0]["content"] = json.dumps(class_14, ensure_ascii=False)
+
+    decision = evaluate_skill_source_contract(
+        messages=[
+            {"role": "user", "content": "apply tm-twcc class 14"},
+            _answer_contract(),
+            sources[0],
+        ],
+        current_turn_user_idx=0,
+        attempts=0,
+        final_response=response,
+    )
+
+    assert decision is not None
+    assert decision.action == "nudge"
+    assert any("'手鏈'" in item for item in decision.diagnostics)
