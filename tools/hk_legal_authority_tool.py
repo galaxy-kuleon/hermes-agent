@@ -57,6 +57,14 @@ IPD_TIME_LIMITS_MANUAL_URL = (
     "registry-work-manual/current/eng/time_limits_in_exam_process.pdf"
 )
 IPD_TIME_LIMITS_MANUAL_TITLE = "Time limits in the examination process"
+IPD_CROSS_SEARCH_LIST_URL = (
+    "https://www.ipd.gov.hk/filemanager/ipd/common/trade-marks/"
+    "registry-work-manual/current/eng/Cross_search_list.pdf"
+)
+IPD_CROSS_SEARCH_LIST_TITLE = "Cross search list"
+MIN_TRADE_MARK_CLASS = 1
+MAX_TRADE_MARK_CLASS = 45
+MAX_CROSS_SEARCH_CLASSES = 10
 _RULE_13_MANUAL_TERMS = (
     "rule 13(3)",
     "6-month period",
@@ -175,7 +183,7 @@ def _fetch_bytes(
 
 def _fetch_official_pdf(opener, url: str) -> tuple[bytes, str]:
     """Fetch one allowlisted IPD manual and retain its server version hint."""
-    if url != IPD_TIME_LIMITS_MANUAL_URL:
+    if url not in {IPD_TIME_LIMITS_MANUAL_URL, IPD_CROSS_SEARCH_LIST_URL}:
         raise ValueError("unsupported official IPD manual URL")
     request = urllib.request.Request(
         url,
@@ -231,6 +239,186 @@ def _retained_manual() -> tuple[bytes, str, Path] | None:
         if path.name == f"ipd-time-limits-in-examination.{digest}.pdf":
             return content, digest, path
     return None
+
+
+def _cross_search_cache_path(digest: str) -> Path:
+    return _cache_dir() / f"ipd-cross-search-list.{digest}.pdf"
+
+
+def _retained_cross_search_manual() -> tuple[bytes, str, Path] | None:
+    for path in sorted(_cache_dir().glob("ipd-cross-search-list.*.pdf"), reverse=True):
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        digest = hashlib.sha256(content).hexdigest()
+        if path.name == f"ipd-cross-search-list.{digest}.pdf":
+            return content, digest, path
+    return None
+
+
+def _normalise_cross_search_classes(values: object) -> tuple[int, ...]:
+    if values is None:
+        return ()
+    if not isinstance(values, list) or not values or len(values) > MAX_CROSS_SEARCH_CLASSES:
+        raise ValueError(
+            "cross_search_classes must contain "
+            f"1-{MAX_CROSS_SEARCH_CLASSES} class numbers"
+        )
+    classes: list[int] = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise ValueError("cross-search class numbers must be integers from 1 to 45")
+        try:
+            number = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cross-search class numbers must be integers from 1 to 45"
+            ) from exc
+        if not MIN_TRADE_MARK_CLASS <= number <= MAX_TRADE_MARK_CLASS:
+            raise ValueError("cross-search class numbers must be integers from 1 to 45")
+        if number not in classes:
+            classes.append(number)
+    return tuple(classes)
+
+
+def _cross_search_practice_guidance(
+    opener, requested_classes: tuple[int, ...]
+) -> dict:
+    """Read exact class relationships from the current official IPD list."""
+    freshness = "current_ipd_url"
+    try:
+        content, version_hint = _fetch_official_pdf(opener, IPD_CROSS_SEARCH_LIST_URL)
+        digest = hashlib.sha256(content).hexdigest()
+        path = _cross_search_cache_path(digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("xb") as output:
+                output.write(content)
+        except FileExistsError:
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise OSError("retained IPD cross-search cache failed integrity verification")
+    except Exception as exc:
+        retained = _retained_cross_search_manual()
+        if retained is None:
+            return {
+                "success": False,
+                "cannot_confirm": True,
+                "source": "Hong Kong Intellectual Property Department",
+                "title": IPD_CROSS_SEARCH_LIST_TITLE,
+                "official_url": IPD_CROSS_SEARCH_LIST_URL,
+                "requested_classes": list(requested_classes),
+                "error": (
+                    "official IPD cross-search list unavailable and no retained "
+                    f"copy exists: {exc}"
+                ),
+            }
+        content, digest, path = retained
+        freshness = "cached_offline"
+        version_hint = "retained-version"
+
+    try:
+        text = _pdf_text(content)
+    except Exception as exc:
+        return {
+            "success": False,
+            "cannot_confirm": True,
+            "source": "Hong Kong Intellectual Property Department",
+            "title": IPD_CROSS_SEARCH_LIST_TITLE,
+            "official_url": IPD_CROSS_SEARCH_LIST_URL,
+            "freshness": freshness,
+            "pdf_sha256": digest,
+            "requested_classes": list(requested_classes),
+            "error": f"official IPD cross-search PDF text extraction failed: {exc}",
+        }
+
+    pages = text.split("\f")
+    class_rows: list[dict] = []
+    selected_pages: dict[int, str] = {}
+    for class_number in requested_classes:
+        relation_pattern = re.compile(
+            rf"\bClass\s+{class_number}\s+Cross\s+search\s+"
+            r"class(?:es)?\s*:\s*([0-9]+(?:\s*,\s*[0-9]+)*)",
+            re.IGNORECASE,
+        )
+        none_pattern = re.compile(
+            rf"\bClass\s+{class_number}\s+No\s+cross\s+search\s+required\b",
+            re.IGNORECASE,
+        )
+        found: dict | None = None
+        for page_number, page in enumerate(pages, start=1):
+            normalized = _SPACE_RE.sub(" ", page).strip()
+            relation = relation_pattern.search(normalized)
+            no_search = none_pattern.search(normalized)
+            if relation:
+                cross_classes = [
+                    int(value.strip()) for value in relation.group(1).split(",")
+                ]
+                found = {
+                    "class": class_number,
+                    "cross_search_classes": cross_classes,
+                    "page": page_number,
+                    "text": relation.group(0),
+                }
+            elif no_search:
+                found = {
+                    "class": class_number,
+                    "cross_search_classes": [],
+                    "page": page_number,
+                    "text": no_search.group(0),
+                }
+            if found is not None:
+                selected_pages[page_number] = normalized
+                break
+        if found is None:
+            found = {
+                "class": class_number,
+                "found": False,
+                "cross_search_classes": [],
+            }
+        else:
+            found["found"] = True
+        class_rows.append(found)
+
+    missing = [row["class"] for row in class_rows if row["found"] is False]
+    verified_extracts = [
+        {"page": row["page"], "text": row["text"]}
+        for row in class_rows
+        if row["found"] is True
+    ]
+    logger.info(
+        "hk_ipd_manual_cache title=%s freshness=%s path=%s pdf_sha256=%s classes=%s",
+        IPD_CROSS_SEARCH_LIST_TITLE,
+        freshness,
+        path,
+        digest,
+        requested_classes,
+    )
+    return {
+        "success": not missing,
+        "cannot_confirm": bool(missing),
+        "source": "Hong Kong Intellectual Property Department",
+        "title": IPD_CROSS_SEARCH_LIST_TITLE,
+        "official_url": IPD_CROSS_SEARCH_LIST_URL,
+        "freshness": freshness,
+        "server_version_hint": version_hint,
+        "pdf_sha256": digest,
+        "requested_classes": list(requested_classes),
+        "classes": class_rows,
+        "missing_classes": missing,
+        "matched_page_text_complete": not missing,
+        "verified_extracts": verified_extracts,
+        "matched_pages": [
+            {"page": page_number, "text": selected_pages[page_number]}
+            for page_number in sorted(selected_pages)
+        ],
+        "instruction": (
+            "This is current official Registry practice guidance, not legislation. "
+            "Use only the returned class rows for a cross-search conclusion, cite "
+            "the official PDF URL, and do not infer a class relationship from "
+            "section 12 or general knowledge."
+        ),
+    }
 
 
 def _rule_13_practice_guidance(opener) -> dict:
@@ -564,7 +752,13 @@ def extract_provisions(xml_content: bytes, provisions: Iterable[str]) -> list[di
     return rows
 
 
-def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> str:
+def hk_legal_authority(
+    chapter: str,
+    provisions: list[str],
+    cross_search_classes: list[int] | None = None,
+    *,
+    opener=None,
+) -> str:
     wanted_chapter = str(chapter).strip().upper()
     if (
         not isinstance(provisions, list)
@@ -579,6 +773,9 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
     try:
         for provision in provisions:
             _normalise_provision_request(provision)
+        requested_cross_search_classes = _normalise_cross_search_classes(
+            cross_search_classes
+        )
     except ValueError as exc:
         return json.dumps(
             {
@@ -624,6 +821,10 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
         row["provision"] == "13" and row["found"] for row in rows
     ):
         practice_guidance.append(_rule_13_practice_guidance(client))
+    if requested_cross_search_classes:
+        practice_guidance.append(
+            _cross_search_practice_guidance(client, requested_cross_search_classes)
+        )
     version_day = version.version_date.split("T", 1)[0]
     logger.info(
         "hk_legal_authority_cache chapter=%s freshness=%s path=%s xml_sha256=%s",
@@ -669,8 +870,16 @@ def hk_legal_authority(chapter: str, provisions: list[str], *, opener=None) -> s
                     "distinct from legislation."
                 ),
             },
-            "success": not missing,
-            "cannot_confirm": bool(missing),
+            "success": not missing and all(
+                row.get("success") is True
+                for row in practice_guidance
+                if row.get("title") == IPD_CROSS_SEARCH_LIST_TITLE
+            ),
+            "cannot_confirm": bool(missing) or any(
+                row.get("cannot_confirm") is True
+                for row in practice_guidance
+                if row.get("title") == IPD_CROSS_SEARCH_LIST_TITLE
+            ),
             "freshness": freshness,
             "source": "Hong Kong e-Legislation open data, Department of Justice",
             "dataset_url": DATASET_URL,
@@ -718,7 +927,11 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
         "prose overviews are not authority. Request whole section/rule numbers, e.g. "
         "chapter='559', provisions=['52','53'] or chapter='559A', provisions=['13']. "
         "Common labels such as 'section 53(5)(b)' and 'Sch. 1 rule 13' are "
-        "normalized to the whole provision and preserved in the result trace. A Cap. "
+        "normalized to the whole provision and preserved in the result trace. For a "
+        "trade-mark cross-class question, also pass every relevant Nice class in "
+        "cross_search_classes; the tool then reads the current official IPD Cross "
+        "search list and returns the exact class rows. Do not infer cross-search "
+        "relationships from section 12. A Cap. "
         "559A Rule 13 request also retrieves the official IPD 'Time limits in the "
         "examination process' manual, so Rule 13 answers must use both law and current "
         "practice guidance. For a dispute where the challenged mark is already "
@@ -740,6 +953,21 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
                 "maxItems": MAX_PROVISIONS,
                 "description": "Whole section/rule numbers or common labels such as 'section 53(5)(b)' and 'Sch. 1 rule 13'. The tool reads the whole provision.",
             },
+            "cross_search_classes": {
+                "type": "array",
+                "items": {
+                    "type": "integer",
+                    "minimum": MIN_TRADE_MARK_CLASS,
+                    "maximum": MAX_TRADE_MARK_CLASS,
+                },
+                "minItems": 1,
+                "maxItems": MAX_CROSS_SEARCH_CLASSES,
+                "uniqueItems": True,
+                "description": (
+                    "Nice class numbers to verify in the current official IPD Cross "
+                    "search list, for example [32, 43]."
+                ),
+            },
         },
         "required": ["chapter", "provisions"],
         "additionalProperties": False,
@@ -748,7 +976,11 @@ HK_LEGAL_AUTHORITY_SCHEMA = {
 
 
 def _handle_hk_legal_authority(args, **_kwargs):
-    return hk_legal_authority(args.get("chapter", ""), args.get("provisions"))
+    return hk_legal_authority(
+        args.get("chapter", ""),
+        args.get("provisions"),
+        args.get("cross_search_classes"),
+    )
 
 
 registry.register(
@@ -764,6 +996,7 @@ registry.register(
 __all__ = [
     "AuthorityVersion",
     "HK_LEGAL_AUTHORITY_SCHEMA",
+    "IPD_CROSS_SEARCH_LIST_URL",
     "extract_provisions",
     "hk_legal_authority",
     "parse_catalog",

@@ -222,6 +222,110 @@ def test_rule_13_manual_returns_only_matching_official_pages(monkeypatch, tmp_pa
     assert "path" not in json.dumps(result).lower()
 
 
+def test_cross_search_manual_returns_exact_requested_class_rows(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
+    monkeypatch.setattr(
+        authority_tool,
+        "_pdf_text",
+        lambda _content: (
+            "cover page\f"
+            "Class 32 Cross search classes : 30, 33\nBeer : Class 33\f"
+            "Class 43 Cross search classes : 29, 30, 39, 42\n"
+            "Fast food outlets, restaurants and cafes\f"
+        ),
+    )
+
+    class ManualOpener:
+        def open(self, request, timeout):
+            assert request.full_url == authority_tool.IPD_CROSS_SEARCH_LIST_URL
+            assert timeout == 600
+            return FakeResponse(
+                b"%PDF-1.7 fake",
+                headers={"ETag": '"cross-search-2026"'},
+            )
+
+    result = authority_tool._cross_search_practice_guidance(
+        ManualOpener(), (32, 43)
+    )
+
+    assert result["success"] is True
+    assert result["cannot_confirm"] is False
+    assert result["official_url"] == authority_tool.IPD_CROSS_SEARCH_LIST_URL
+    assert result["requested_classes"] == [32, 43]
+    assert result["classes"] == [
+        {
+            "class": 32,
+            "cross_search_classes": [30, 33],
+            "page": 2,
+            "text": "Class 32 Cross search classes : 30, 33",
+            "found": True,
+        },
+        {
+            "class": 43,
+            "cross_search_classes": [29, 30, 39, 42],
+            "page": 3,
+            "text": "Class 43 Cross search classes : 29, 30, 39, 42",
+            "found": True,
+        },
+    ]
+    assert result["verified_extracts"] == [
+        {"page": 2, "text": "Class 32 Cross search classes : 30, 33"},
+        {"page": 3, "text": "Class 43 Cross search classes : 29, 30, 39, 42"},
+    ]
+
+
+def test_cross_search_request_is_included_in_authority_result(monkeypatch, tmp_path):
+    member = r"cap_559_en_c\cap_559_20250214000000_en_c.xml"
+    authority_xml = AUTHORITY_XML.replace(b'name="s52"', b'name="s12"', 1)
+    expected_manual = {
+        "success": True,
+        "cannot_confirm": False,
+        "source": "Hong Kong Intellectual Property Department",
+        "title": "Cross search list",
+        "official_url": authority_tool.IPD_CROSS_SEARCH_LIST_URL,
+        "pdf_sha256": "c" * 64,
+        "requested_classes": [32, 43],
+        "classes": [
+            {"class": 32, "found": True, "cross_search_classes": [30, 33]},
+            {"class": 43, "found": True, "cross_search_classes": [29, 30, 39, 42]},
+        ],
+        "matched_page_text_complete": True,
+        "verified_extracts": [
+            {"page": 20, "text": "Class 32 Cross search classes : 30, 33"},
+            {
+                "page": 27,
+                "text": "Class 43 Cross search classes : 29, 30, 39, 42",
+            },
+        ],
+    }
+    monkeypatch.setenv("HERMES_HK_LEGAL_CACHE", str(tmp_path))
+    monkeypatch.setattr(
+        authority_tool,
+        "_cross_search_practice_guidance",
+        lambda _opener, classes: expected_manual
+        if classes == (32, 43)
+        else pytest.fail(f"unexpected classes: {classes}"),
+    )
+
+    result = json.loads(
+        hk_legal_authority(
+            "559",
+            ["12"],
+            [32, 43],
+            opener=FakeOpener(make_archive(member, authority_xml)),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["cannot_confirm"] is False
+    assert result["official_practice_guidance"] == [expected_manual]
+    assert result["answer_evidence"]["verified_practice_guidance"][0][
+        "title"
+    ] == "Cross search list"
+
+
 def test_cap_559a_rule_13_automatically_includes_ipd_manual(monkeypatch, tmp_path):
     catalog = (
         CATALOG

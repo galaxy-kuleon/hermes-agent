@@ -109,6 +109,30 @@ _RULE_13_TIME_RE = re.compile(
     r"rule\s*9[56]|延期|期限|逾期)",
     re.IGNORECASE,
 )
+_CROSS_SEARCH_RE = re.compile(
+    r"(?:cross[- ](?:class|search|reference)|related[- ]classes|"
+    r"跨類|跨类|跨類別|跨类别|交叉檢索|交叉检索)",
+    re.IGNORECASE,
+)
+_CLASS_NUMBER_RE = re.compile(
+    r"(?:\bclass(?:es)?\s*(\d{1,2})\b|第\s*(\d{1,2})\s*[類类])",
+    re.IGNORECASE,
+)
+_CROSS_SEARCH_POSITIVE_RE = re.compile(
+    r"(?:\byes\b|\bwill\b|\bdoes\b|\bis\b|會|会|是).{0,100}"
+    r"(?:cross[- ](?:class|search|reference)|跨類|跨类|交叉檢索|交叉检索)|"
+    r"(?:cross[- ](?:class|search|reference)|跨類|跨类|交叉檢索|交叉检索)"
+    r".{0,100}(?:\bappl(?:y|ies)\b|\brequired\b|會|会|是)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CROSS_SEARCH_NEGATIVE_RE = re.compile(
+    r"(?:\bno\b|\bnot\b|\bdoes\s+not\b|\bwill\s+not\b|不是|不會|不会|"
+    r"並非|并非).{0,120}"
+    r"(?:cross[- ](?:class|search|reference)|跨類|跨类|交叉檢索|交叉检索)|"
+    r"(?:cross[- ](?:class|search|reference)|跨類|跨类|交叉檢索|交叉检索)"
+    r".{0,120}(?:\bno\b|\bnot\b|不是|不會|不会|並非|并非)",
+    re.IGNORECASE | re.DOTALL,
+)
 _FALSE_MANUAL_DELIVERY_RE = re.compile(
     r"(?:manual|ipd|working\s+manual|工作手冊|實務手冊|实务手册).{0,160}"
     r"(?:truncat|unavailable|not\s+found|not\s+read|could\s+not\s+read|"
@@ -486,6 +510,29 @@ def successful_authorities(
                                 if isinstance(extract, dict)
                                 and str(extract.get("text") or "").strip()
                             ),
+                            "requested_classes": tuple(
+                                int(value)
+                                for value in (guidance.get("requested_classes") or [])
+                                if isinstance(value, int) and not isinstance(value, bool)
+                            ),
+                            "classes": tuple(
+                                {
+                                    "class": int(row.get("class")),
+                                    "cross_search_classes": tuple(
+                                        int(value)
+                                        for value in (
+                                            row.get("cross_search_classes") or []
+                                        )
+                                        if isinstance(value, int)
+                                        and not isinstance(value, bool)
+                                    ),
+                                }
+                                for row in (guidance.get("classes") or [])
+                                if isinstance(row, dict)
+                                and row.get("found") is True
+                                and isinstance(row.get("class"), int)
+                                and not isinstance(row.get("class"), bool)
+                            ),
                         }
                         for guidance in (result.get("official_practice_guidance") or [])
                         if isinstance(guidance, dict)
@@ -520,6 +567,47 @@ def _requires_rule_13_practice(user_message: Any) -> bool:
     return bool(
         _TRADE_MARK_RE.search(text) or _PRACTICE_GUIDANCE_RE.search(text)
     ) and bool(_RULE_13_TIME_RE.search(text))
+
+
+def _requires_cross_search_practice(user_message: Any) -> bool:
+    text = _message_text(user_message)
+    return bool(_TRADE_MARK_RE.search(text)) and bool(_CROSS_SEARCH_RE.search(text))
+
+
+def _mentioned_trade_mark_classes(user_message: Any, answer: str) -> tuple[int, ...]:
+    text = f"{_message_text(user_message)}\n{answer}"
+    classes: list[int] = []
+    for match in _CLASS_NUMBER_RE.finditer(text):
+        raw = match.group(1) or match.group(2)
+        number = int(raw)
+        if 1 <= number <= 45 and number not in classes:
+            classes.append(number)
+    return tuple(classes)
+
+
+def _cross_search_guidance(
+    authorities: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in _verified_practice_guidance(authorities)
+        if row.get("title") == "Cross search list"
+    ]
+
+
+def _cross_search_relationship(
+    guidance: list[dict[str, Any]], requested_classes: tuple[int, ...]
+) -> bool | None:
+    if len(requested_classes) != 2:
+        return None
+    rows: dict[int, tuple[int, ...]] = {}
+    for manual in guidance:
+        for row in manual.get("classes") or ():
+            rows[row["class"]] = row["cross_search_classes"]
+    left, right = requested_classes
+    if left not in rows or right not in rows:
+        return None
+    return right in rows[left] or left in rows[right]
 
 
 def _verified_practice_guidance(
@@ -1145,6 +1233,91 @@ def evaluate_hk_legal_answer(
             "離婚條文。為免誤導，本次不交付含錯誤法條的答案或文件。",
             tuple(wills_errors),
         )
+
+    if _requires_cross_search_practice(messages[current_turn_user_idx]):
+        practice_guidance = _cross_search_guidance(authorities)
+        guidance_classes = tuple(
+            dict.fromkeys(
+                class_number
+                for guidance in practice_guidance
+                for class_number in guidance.get("requested_classes") or ()
+            )
+        )
+        requested_classes = (
+            guidance_classes
+            if len(guidance_classes) == 2
+            else _mentioned_trade_mark_classes(
+                messages[current_turn_user_idx], final_response
+            )[:2]
+        )
+        if len(requested_classes) != 2 or not practice_guidance:
+            class_instruction = (
+                f"cross_search_classes={list(requested_classes)}"
+                if len(requested_classes) == 2
+                else "cross_search_classes=[the two relevant Nice class numbers]"
+            )
+            if attempts < max_attempts:
+                return GateDecision(
+                    "nudge",
+                    "[System: This Hong Kong trade-mark cross-class answer requires "
+                    "the current official IPD Cross search list, not an inference "
+                    "from section 12, memory, OpenViking, or general knowledge. "
+                    "Identify the two relevant Nice classes, then call "
+                    "hk_legal_authority with chapter='559', provisions=['12'], "
+                    f"{class_instruction}. Do not answer until the result contains "
+                    "successful Cross search list guidance, a PDF SHA-256, and one "
+                    "exact verified row for each class.]",
+                )
+            return GateDecision(
+                "fail",
+                "無法提供可依賴的香港商標跨類檢索結論：本回合未能完整讀取知識產權署"
+                "現行 Cross search list 中兩個相關類別的可驗證資料列。",
+            )
+
+        relationship = _cross_search_relationship(
+            practice_guidance, requested_classes
+        )
+        practice_urls = [row["official_url"] for row in practice_guidance]
+        cites_practice = all(url in final_response for url in practice_urls)
+        negative_claim = bool(_CROSS_SEARCH_NEGATIVE_RE.search(final_response))
+        positive_claim = bool(
+            _CROSS_SEARCH_POSITIVE_RE.search(final_response)
+        ) and not negative_claim
+        contradicts_relationship = relationship is None or (
+            relationship is False and positive_claim
+        ) or (relationship is True and negative_claim)
+        lacks_direct_answer = not positive_claim and not negative_claim
+        if contradicts_relationship or lacks_direct_answer or not cites_practice:
+            evidence_lines = []
+            for guidance in practice_guidance:
+                evidence_lines.append(
+                    f"Official IPD manual: {guidance['official_url']} "
+                    f"(PDF SHA-256 {guidance['pdf_sha256']})"
+                )
+                evidence_lines.extend(
+                    f"Exact verified class row: {extract}"
+                    for extract in guidance["verified_extracts"]
+                )
+            required_answer = "Yes" if relationship is True else "No"
+            if attempts < max_attempts:
+                return GateDecision(
+                    "nudge",
+                    "[System: Reject and rewrite the complete answer. The official "
+                    "IPD Cross search list was delivered completely. Give the direct "
+                    f"answer '{required_answer}' for Classes "
+                    f"{requested_classes[0]} and {requested_classes[1]}, reproduce "
+                    "the two verified class-list entries accurately, cite the manual "
+                    "URL visibly, and keep section 12's legal consequence separate "
+                    "from the Registry's search scope. Do not replace the manual with "
+                    "general knowledge.\n"
+                    + "\n".join(evidence_lines)
+                    + "]",
+                )
+            return GateDecision(
+                "fail",
+                "無法提供可依賴的香港商標跨類檢索結論：最終答案仍與知識產權署現行"
+                "Cross search list 的已驗證類別資料列矛盾或未作直接回答。",
+            )
 
     if _requires_rule_13_practice(messages[current_turn_user_idx]):
         practice_guidance = _verified_practice_guidance(authorities)

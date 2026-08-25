@@ -27,6 +27,10 @@ EXACT_RULE_13_PROMPT = (
     "2 January 2026, and I forgot to reply the same until 5 July 2026, can I "
     "write a letter to seek an extension of time on 5 July 2026?"
 )
+EXACT_CROSS_SEARCH_PROMPT = (
+    "apply Hong Kong Trade Mark Enquiry: please let me know if juice will be "
+    "cross-class check with restaurant services"
+)
 
 
 def _authority_message():
@@ -91,6 +95,67 @@ def _rule_13_authority_message():
                         {
                             "page": 2,
                             "text": "A timely request grants an extension of 3 months.",
+                        },
+                    ],
+                }
+            ],
+        }),
+    }
+
+
+def _cross_search_authority_message():
+    return {
+        "role": "tool",
+        "name": "hk_legal_authority",
+        "tool_call_id": "call-cross-search",
+        "content": json.dumps({
+            "success": True,
+            "cannot_confirm": False,
+            "chapter": "559",
+            "version_date": "2025-02-14T00:00:00",
+            "official_web_url": "https://www.elegislation.gov.hk/hk/cap559!en",
+            "required_answer_citation": (
+                "Hong Kong e-Legislation, Cap. 559, current version "
+                "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en"
+            ),
+            "requested_provisions": [
+                {"provision": "12", "found": True}
+            ],
+            "official_practice_guidance": [
+                {
+                    "success": True,
+                    "cannot_confirm": False,
+                    "matched_page_text_complete": True,
+                    "title": "Cross search list",
+                    "official_url": (
+                        "https://www.ipd.gov.hk/filemanager/ipd/common/"
+                        "trade-marks/registry-work-manual/current/eng/"
+                        "Cross_search_list.pdf"
+                    ),
+                    "pdf_sha256": "c" * 64,
+                    "requested_classes": [32, 43],
+                    "classes": [
+                        {
+                            "class": 32,
+                            "found": True,
+                            "cross_search_classes": [30, 33],
+                        },
+                        {
+                            "class": 43,
+                            "found": True,
+                            "cross_search_classes": [29, 30, 39, 42],
+                        },
+                    ],
+                    "verified_extracts": [
+                        {
+                            "page": 20,
+                            "text": "Class 32 Cross search classes : 30, 33",
+                        },
+                        {
+                            "page": 27,
+                            "text": (
+                                "Class 43 Cross search classes : 29, 30, 39, 42"
+                            ),
                         },
                     ],
                 }
@@ -289,6 +354,75 @@ def test_rule_13_time_answer_requires_manual_url_and_both_time_mechanisms():
             ],
             current_turn_user_idx=0,
             final_response=_rule_13_answer(),
+            attempts=1,
+        ).action
+        == "pass"
+    )
+
+
+def test_cross_search_answer_requires_current_official_manual_rows():
+    wrong_answer = (
+        "Yes — juice (Class 32) and restaurant services (Class 43) will be "
+        "cross-class checked. Current version 2025-02-14: "
+        "https://www.elegislation.gov.hk/hk/cap559!en"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_CROSS_SEARCH_PROMPT},
+            _authority_message(),
+        ],
+        current_turn_user_idx=0,
+        final_response=wrong_answer,
+        attempts=0,
+    )
+
+    assert decision.action == "nudge"
+    assert "current official IPD Cross search list" in decision.message
+    assert "cross_search_classes=[32, 43]" in decision.message
+
+
+def test_cross_search_answer_rejects_conclusion_contradicting_manual():
+    wrong_answer = (
+        "Yes — Class 32 and Class 43 will be cross-class checked. Current version "
+        "2025-02-14: https://www.elegislation.gov.hk/hk/cap559!en. Manual: "
+        "https://www.ipd.gov.hk/filemanager/ipd/common/trade-marks/"
+        "registry-work-manual/current/eng/Cross_search_list.pdf"
+    )
+    decision = evaluate_hk_legal_answer(
+        messages=[
+            {"role": "user", "content": EXACT_CROSS_SEARCH_PROMPT},
+            _cross_search_authority_message(),
+        ],
+        current_turn_user_idx=0,
+        final_response=wrong_answer,
+        attempts=1,
+    )
+
+    assert decision.action == "nudge"
+    assert "direct answer 'No'" in decision.message
+    assert "Class 32 Cross search classes : 30, 33" in decision.message
+    assert "Class 43 Cross search classes : 29, 30, 39, 42" in decision.message
+
+
+def test_cross_search_answer_passes_with_exact_manual_rows_and_citations():
+    answer = (
+        "No — Class 32 and Class 43 are not a cross-search pair in the current "
+        "official list. Class 32 cross-searches Classes 30 and 33; Class 43 "
+        "cross-searches Classes 29, 30, 39 and 42. Registry practice: "
+        "https://www.ipd.gov.hk/filemanager/ipd/common/trade-marks/"
+        "registry-work-manual/current/eng/Cross_search_list.pdf. Section 12 "
+        "governs the separate legal consequence. Current version 2025-02-14: "
+        "https://www.elegislation.gov.hk/hk/cap559!en"
+    )
+
+    assert (
+        evaluate_hk_legal_answer(
+            messages=[
+                {"role": "user", "content": EXACT_CROSS_SEARCH_PROMPT},
+                _cross_search_authority_message(),
+            ],
+            current_turn_user_idx=0,
+            final_response=answer,
             attempts=1,
         ).action
         == "pass"
