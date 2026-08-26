@@ -1,6 +1,8 @@
 """Behavioural guards for authenticated API-agent owner observation."""
 
 import asyncio
+import logging
+import re
 import threading
 from unittest.mock import patch
 
@@ -94,6 +96,49 @@ async def test_cancelled_waiter_cannot_hide_a_still_running_executor_owner():
         await _until(
             lambda: adapter._api_agent_owners.observe().get("active") == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_worker_lifecycle_log_stays_open_until_executor_cleanup(caplog):
+    """The log marker follows the worker, not its cancellable asyncio waiter."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    entered, release = threading.Event(), threading.Event()
+    agent = _BlockingAgent(entered, release)
+    caplog.set_level(logging.INFO, logger=subject.__name__)
+
+    with patch.object(adapter, "_create_agent", return_value=agent):
+        task = asyncio.create_task(adapter._run_agent(
+            user_message="synthetic", conversation_history=[],
+            session_id="lifecycle-cancel-test",
+        ))
+        assert await asyncio.to_thread(entered.wait, 2)
+
+        starts = [r.message for r in caplog.records
+                  if "turn_started service=hermes" in r.message]
+        terminals = [r.message for r in caplog.records
+                     if "turn_terminal service=hermes" in r.message]
+        assert len(starts) == 1
+        assert terminals == []
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not any("turn_terminal service=hermes" in r.message
+                       for r in caplog.records)
+
+        release.set()
+        await _until(lambda: any(
+            "turn_terminal service=hermes" in r.message
+            for r in caplog.records
+        ))
+
+    terminals = [r.message for r in caplog.records
+                 if "turn_terminal service=hermes" in r.message]
+    assert len(terminals) == 1
+    started_attempt = re.search(r"\battempt=([0-9a-f]+)", starts[0]).group(1)
+    terminal_attempt = re.search(r"\battempt=([0-9a-f]+)", terminals[0]).group(1)
+    assert terminal_attempt == started_attempt
+    assert "scope=agent_run execution_mode=task outcome=complete" in terminals[0]
 
 
 @pytest.mark.asyncio
@@ -239,7 +284,7 @@ async def test_real_connect_registers_the_authenticated_route(monkeypatch):
     ))
 
     class FakeRunner:
-        def __init__(self, app):
+        def __init__(self, app, **_kwargs):
             self.app = app
 
         async def setup(self):

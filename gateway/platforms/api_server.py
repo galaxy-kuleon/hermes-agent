@@ -9078,8 +9078,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        lifecycle_attempt = uuid.uuid4().hex
 
-        def _run():
+        def _run_scoped():
             from gateway.session_context import clear_session_vars, set_session_vars
             from tools.file_grants import file_grant_scope, make_file_handles
             from tools.local_document_export_tool import (
@@ -9293,6 +9294,27 @@ class APIServerAdapter(BasePlatformAdapter):
                         clear_session_vars(tokens)
                     finally:
                         reset_trusted_export_context(export_context_token)
+
+        def _run():
+            lifecycle_outcome = "error"
+            logger.info(
+                "turn_started service=hermes schema=1 attempt=%s "
+                "scope=agent_run execution_mode=task"
+                + _journey_suffix_safe(),
+                lifecycle_attempt,
+            )
+            try:
+                result = _run_scoped()
+                lifecycle_outcome = "complete"
+                return result
+            finally:
+                logger.info(
+                    "turn_terminal service=hermes schema=1 attempt=%s "
+                    "scope=agent_run execution_mode=task outcome=%s"
+                    + _journey_suffix_safe(),
+                    lifecycle_attempt,
+                    lifecycle_outcome,
+                )
 
         journey_context = contextvars.copy_context()
         self._activate_admitted_request()
