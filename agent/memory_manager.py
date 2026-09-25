@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import inspect
@@ -382,8 +383,8 @@ class MemoryManager:
             if external_prefetch_timeout is None
             else float(external_prefetch_timeout)
         )
-        if self._external_prefetch_timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
+        if not math.isfinite(self._external_prefetch_timeout) or self._external_prefetch_timeout <= 0:
+            raise ValueError("external_prefetch_timeout must be finite and positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on
