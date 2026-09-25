@@ -27,15 +27,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import inspect
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
+from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +378,7 @@ class MemoryManager:
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
-            _EXTERNAL_PREFETCH_TIMEOUT_S
+            float(os.environ.get("HERMES_MEMORY_PREFETCH_TIMEOUT_SECONDS", _EXTERNAL_PREFETCH_TIMEOUT_S))
             if external_prefetch_timeout is None
             else float(external_prefetch_timeout)
         )
@@ -584,7 +587,15 @@ class MemoryManager:
             self._external_prefetch_threads[provider.name] = thread
             thread.start()
 
-        thread.join(self._external_prefetch_timeout)
+        deadline = time.monotonic() + self._external_prefetch_timeout
+        while thread.is_alive():
+            if is_interrupted():
+                logger.info("Memory provider '%s' prefetch wait interrupted", provider.name)
+                return ""
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(min(0.1, remaining))
         if thread.is_alive():
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "

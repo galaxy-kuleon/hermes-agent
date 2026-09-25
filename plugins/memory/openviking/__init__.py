@@ -77,9 +77,12 @@ _OPENVIKING_ENV_KEYS = (
     "OPENVIKING_USER",
     "OPENVIKING_AGENT",
 )
-_TIMEOUT = 30.0
+_TIMEOUT = float(os.environ.get("OPENVIKING_HTTP_TIMEOUT_SECONDS", "30"))
+if not math.isfinite(_TIMEOUT) or _TIMEOUT <= 0:
+    raise ValueError("OPENVIKING_HTTP_TIMEOUT_SECONDS must be finite and positive")
 _SESSION_DRAIN_TIMEOUT = 10.0
-_DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
+# Writer drainage is separate from the foreground model/FIFO request budget.
+_DEFERRED_COMMIT_TIMEOUT = 65.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
 # Automatic extraction is Matter-first. Entity/event facts can describe the
 # active matter without silently turning legal work into a personal profile.
@@ -2486,7 +2489,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "description": "Total timeout for recall (seconds)",
                 "type": "number",
                 "minimum": 0.25,
-                "maximum": 60.0,
+                "maximum": 43200.0,
                 "step": 0.25,
                 "default": _DEFAULT_RECALL_TIMEOUT_SECONDS,
                 "env_var": "OPENVIKING_RECALL_TIMEOUT_SECONDS",
@@ -2496,7 +2499,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "description": "Per-request timeout for recall (seconds)",
                 "type": "number",
                 "minimum": 0.25,
-                "maximum": 60.0,
+                "maximum": 43200.0,
                 "step": 0.25,
                 "default": _DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS,
                 "env_var": "OPENVIKING_RECALL_REQUEST_TIMEOUT_SECONDS",
@@ -3840,13 +3843,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "OPENVIKING_RECALL_TIMEOUT_SECONDS",
                 cfg.get("recall_timeout_seconds", _DEFAULT_RECALL_TIMEOUT_SECONDS),
                 default=_DEFAULT_RECALL_TIMEOUT_SECONDS,
-                minimum=0.25, maximum=60.0,
+                minimum=0.25, maximum=43200.0,
             ),
             "request_timeout_seconds": self._setting_float(
                 "OPENVIKING_RECALL_REQUEST_TIMEOUT_SECONDS",
                 cfg.get("recall_request_timeout_seconds", _DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS),
                 default=_DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS,
-                minimum=0.25, maximum=60.0,
+                minimum=0.25, maximum=43200.0,
             ),
             "full_read_limit": self._setting_int(
                 "OPENVIKING_RECALL_FULL_READ_LIMIT",
