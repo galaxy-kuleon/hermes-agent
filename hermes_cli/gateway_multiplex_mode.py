@@ -93,7 +93,7 @@ def default_gateway_multiplexes(default_home: Optional[Path] = None) -> bool:
     if recorded is not None:
         return bool(recorded)
     flag = explicit_multiplex_flag(root)
-    return False if flag is None else True
+    return bool(flag)
 
 
 @dataclass(frozen=True)
@@ -240,9 +240,10 @@ def resolve_multiplex_mode(config) -> MultiplexDecision:
     standalone = standalone_launcher_decision(config)
     if standalone is not None:
         return standalone
+    if current is False:
+        return MultiplexDecision(False, "config", "gateway.multiplex_profiles explicitly disabled")
     if current:
         return MultiplexDecision(True, "config")
-    retired_opt_out = current is False
     try:
         blocker = implicit_multiplex_blocker()
     except Exception as exc:  # a broken preflight must not take the gateway down with it
@@ -250,8 +251,6 @@ def resolve_multiplex_mode(config) -> MultiplexDecision:
         blocker = f"preflight failed ({exc})"
     if blocker:
         decision = MultiplexDecision(False, "guard", blocker)
-    elif retired_opt_out:
-        decision = MultiplexDecision(True, "retired-opt-out", RETIRED_OPT_OUT_REASON)
     else:
         decision = MultiplexDecision(True, "default", "gateway.multiplex_profiles unset; default applies")
     config.multiplex_profiles = decision.enabled
@@ -270,6 +269,9 @@ def record_multiplex_decision(decision: MultiplexDecision) -> None:
 
 def log_multiplex_decision(decision: MultiplexDecision) -> None:
     record_multiplex_decision(decision)
+    if decision.source == "config" and not decision.enabled:
+        logger.info("Serving only the configured profile: gateway.multiplex_profiles=false.")
+        return
     if decision.source == "retired-opt-out":
         logger.warning("%s", RETIRED_OPT_OUT_REASON)
         persist_resolved_default(decision)
