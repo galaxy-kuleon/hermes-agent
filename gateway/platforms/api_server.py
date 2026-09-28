@@ -5814,13 +5814,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         lifecycle_attempt = uuid.uuid4().hex
         def _run():
             outcome = "error"
+            started_at = time.monotonic()
             logger.info("turn_started service=hermes schema=1 attempt=%s scope=agent_run execution_mode=task" + _journey_suffix_safe(), lifecycle_attempt)
             try:
                 value = _run_scoped()
-                outcome = "complete"
+                result = value[0] if isinstance(value[0], dict) else {}
+                outcome = (
+                    "cancelled" if result.get("interrupted") else
+                    "error" if result.get("failed") else
+                    "incomplete" if result.get("completed") is False else "complete"
+                )
                 return value
             finally:
-                logger.info("turn_terminal service=hermes schema=1 attempt=%s scope=agent_run execution_mode=task outcome=%s" + _journey_suffix_safe(), lifecycle_attempt, outcome)
+                logger.info("turn_terminal service=hermes schema=1 attempt=%s scope=agent_run execution_mode=task outcome=%s elapsed_seconds=%.3f" + _journey_suffix_safe(), lifecycle_attempt, outcome, time.monotonic() - started_at)
                 loop.call_soon_threadsafe(self._mark_session_run_finished, str(session_id or ""))
         journey_context = contextvars.copy_context()
         self._activate_admitted_request()
