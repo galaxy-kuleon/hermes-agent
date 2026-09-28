@@ -1688,8 +1688,10 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     already skips ``active``."""
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
-    homes = _multiplex_profile_homes(config)
     active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
+    if getattr(config, "multiplex_profiles", None) is False:
+        return [(active, get_profile_dir(active))]
+    homes = _multiplex_profile_homes(config)
     if any(name == active for name, _home in homes):
         return homes
     try:

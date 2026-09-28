@@ -101,7 +101,7 @@ def compose_user_api_content(
     if not isinstance(content, str):
         return None
     injection = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
-    return None if injection is None else content + "\n\n" + injection
+    return None if injection is None else injection + "\n\n" + content
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
@@ -1008,8 +1008,10 @@ def _append_multimodal_context(
     ``_row_id``-under-lock protocol as the string sidecar backfill; the row keeps its writer's
     shape (compaction inserted the raw parts, a flush the text projection)."""
     _mm_ctx = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
-    if not append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx):
+    content = turn_user_msg.get("content")
+    if not _mm_ctx or not isinstance(content, list):
         return
+    content.insert(0, {"type": "text", "text": _mm_ctx})
     from agent.session_persistence import _durable_content, _persist_lock
 
     with _persist_lock(agent):
