@@ -930,10 +930,10 @@ class OpenAICompatRoutesMixin:
             CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS, TOOL_PROGRESS_SSE_LINE_MAX_BYTES,
             _BARE_EXCEPTION_RE, _EMPTY_REPLY_SENTENCES, _LIVE_STREAM_BODIES, _TRACEBACK_SHAPE_RE,
             _empty_reply_sentence, _journey_suffix_safe, _legal_docx_download_suffix,
-            _minimal_tool_progress_payload, _reap_disconnected_agent_processes,
+            _minimal_tool_progress_payload,
             _register_stream_body, _serialize_tool_progress_payload, _sse_frame,
             _stop_cancelled_sse_agent, _terminate_stream_body,
-            emit_chat_completion_coverage_suffix, request_hard_interrupt, _chat_usage_payload)
+            emit_chat_completion_coverage_suffix, _chat_usage_payload)
         sse_headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -950,7 +950,12 @@ class OpenAICompatRoutesMixin:
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+        try:
+            await response.prepare(request)
+        except BaseException:
+            await asyncio.shield(_stop_cancelled_sse_agent(
+                agent_task, agent_ref, agent_cancel_event, completion_id))
+            raise
         # Registered AFTER prepare (before it, there is no body to terminate)
         # and removed in `finally` (a normal return terminates its own body, so
         # a stale entry would make shutdown write to a closed transport).
@@ -1530,22 +1535,8 @@ class OpenAICompatRoutesMixin:
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
-                except Exception:
-                    pass
-                _reap_disconnected_agent_processes(agent)
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _stop_cancelled_sse_agent(
+                agent_task, agent_ref, agent_cancel_event, completion_id)
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
         except asyncio.CancelledError:
             # THE truncation cause, proved by reproduction 2026-08-11.
@@ -1680,12 +1671,17 @@ class OpenAICompatRoutesMixin:
         or ``response.failed``. On disconnect the agent is interrupted and, with ``store=True``,
         an ``incomplete`` snapshot replaces ``in_progress`` so GET / chaining still work.
         """
-        from gateway.platforms.api_server import _abandon_agent_task, _redact_api_error_text
-        response = await self._prepare_sse_response(request, session_id, gateway_session_key)
-        st = _ResponsesStream(
-            self, response, response_id=response_id, model=model, created_at=created_at,
-            conversation_history=conversation_history, user_message=user_message,
-            instructions=instructions, conversation=conversation, store=store, session_id=session_id, user_id=user_id)
+        from gateway.platforms.api_server import _stop_cancelled_sse_agent, _redact_api_error_text
+        try:
+            response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+            st = _ResponsesStream(
+                self, response, response_id=response_id, model=model, created_at=created_at,
+                conversation_history=conversation_history, user_message=user_message,
+                instructions=instructions, conversation=conversation, store=store, session_id=session_id, user_id=user_id)
+        except BaseException:
+            await asyncio.shield(_stop_cancelled_sse_agent(
+                agent_task, agent_ref, agent_cancel_event, response_id))
+            raise
         try:
             await st.emit_created()
             async for item in _iter_stream_items(stream_q, agent_task, response):
@@ -1703,12 +1699,12 @@ class OpenAICompatRoutesMixin:
                 await st.emit_completed()
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             st.persist_incomplete_if_needed()
-            await _abandon_agent_task(agent_ref, agent_task, "SSE client disconnected")
+            await _stop_cancelled_sse_agent(
+                agent_task, agent_ref, agent_cancel_event, response_id)
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (shutdown, timeout): persist incomplete, then re-raise.
             st.persist_incomplete_if_needed()
-            from gateway.platforms.api_server import _stop_cancelled_sse_agent
             await _stop_cancelled_sse_agent(agent_task, agent_ref, agent_cancel_event, response_id)
             logger.info("SSE task cancelled; persisted incomplete snapshot for %s", response_id)
             raise

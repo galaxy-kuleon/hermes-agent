@@ -1519,10 +1519,12 @@ async def _stop_cancelled_sse_agent(
     agent = agent_ref[0] if agent_ref else None
     if agent is not None:
         try:
-            agent.interrupt(
+            request_hard_interrupt(
+                agent,
                 "SSE handler cancelled"
                 if source == "sse"
-                else "Non-streaming client disconnected"
+                else "Non-streaming client disconnected",
+                tool_reason="api request cancelled",
             )
         except Exception as exc:
             logger.warning(
@@ -1531,6 +1533,15 @@ async def _stop_cancelled_sse_agent(
                 source,
                 completion_id,
                 type(exc).__name__,
+            )
+
+    if agent is not None:
+        try:
+            _reap_disconnected_agent_processes(agent, source=f"api_server_{source}_cancelled")
+        except Exception as exc:
+            logger.warning(
+                "api_agent_reap_failed source=%s completion_id=%s error=%s" + _journey_suffix_safe(),
+                source, completion_id, type(exc).__name__,
             )
 
     # Retrieve an already-completed task's result/exception; do not leave an
@@ -5734,7 +5745,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # hook for the rest. See #63529.
                     self._shutdown_interruptible_agents[id(agent)] = agent
                     if agent_cancel_event is not None and agent_cancel_event.is_set():
-                        agent.interrupt("API handler cancelled before agent startup completed")
+                        request_hard_interrupt(agent, "API handler cancelled before agent startup completed", tool_reason="api request cancelled")
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
@@ -6826,4 +6837,3 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "object": "session.end",
             "committed": True,
         })
-
