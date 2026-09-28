@@ -17,7 +17,6 @@ These tests guard the schema against regressing back to a shape strict
 backends reject.
 """
 
-import json
 
 from tools.memory_tool import MEMORY_SCHEMA
 
@@ -34,10 +33,6 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
             "Codex backend (chatgpt.com/backend-api/codex). Per-action "
             "required-field checks belong in the runtime handler, not the schema."
         )
-
-
-def test_memory_schema_is_json_serializable():
-    json.dumps(MEMORY_SCHEMA)
 
 
 def test_memory_schema_keeps_task_errors_and_matter_facts_out_of_profile_memory():

@@ -50,7 +50,6 @@ OPENVIKING_ENDPOINT=http://127.0.0.1:1933
 # OPENVIKING_API_KEY=...
 # OPENVIKING_ACCOUNT=default
 # OPENVIKING_USER=default
-# OPENVIKING_AGENT=hermes
 ```
 
 ## Config
@@ -73,11 +72,48 @@ profile's `.env`:
 | `OPENVIKING_API_KEY` | (none) | User/admin API key for authenticated servers |
 | `OPENVIKING_ACCOUNT` | `default` | Tenant account for local/trusted mode |
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
-| `OPENVIKING_AGENT` | `hermes` | Hermes peer ID in OpenViking, used for peer-scoped memories |
+| `OPENVIKING_AGENT` | (none) | Optional peer ID for separate assistant context |
 
-When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
-identity from the key. In local or trusted deployments without an API key,
-Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
+Ordinary requests send the configured account and request-bound gateway user
+as identity headers, including when an API key is present. CLI requests use
+the configured user fallback. OpenViking API-key mode derives identity from
+the key and ignores these headers; trusted mode consumes the explicit
+identity. Health probes remain anonymous first.
+Hermes also sends `User-Agent: openviking-memory-hermes/<version>` on
+OpenViking requests. This standard harness identifier contains the Hermes
+version, but no per-user identifier, and does not add a separate request.
+
+### Optional peer identity
+
+New connections use the OpenViking user's memory directory by default. Setup
+does not ask for a peer ID. Without a configured peer, Hermes sends neither
+`X-OpenViking-Actor-Peer` nor assistant-message `peer_id`.
+
+For separate assistant context, set the existing `agent` field in the active
+profile's `config.yaml`:
+
+```yaml
+memory:
+  openviking:
+    agent: work-assistant
+```
+
+Existing non-empty `OPENVIKING_AGENT`, YAML `agent`, and linked OpenViking
+`actor_peer_id` or legacy `agent_id` values retain their behavior. Resolution
+order remains environment, linked OpenViking config, then Hermes YAML. To use
+no peer, remove the peer value from each configured source and start a new
+Hermes session.
+
+Upgrades do not move or delete existing memories. Installations that relied
+on the old implicit `hermes` peer now use user memory for new writes. Without
+a peer ID, default OpenViking search covers user memory and existing peer
+memories under the same OpenViking user. Old peer memories stay at their
+existing paths and remain searchable. Ranking and result limits determine
+which memories are returned. Keep a peer ID if you need the narrower view.
+
+Set `agent: hermes` to restore peer-scoped writes. Memories written at user
+scope before this change stay there and remain searchable. This setting
+changes future writes, not the location of existing memories.
 
 ## Tools
 
@@ -86,32 +122,44 @@ Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
 | `viking_search` | Semantic search with fast/deep/auto modes |
 | `viking_read` | Read content at a viking:// URI (abstract/overview/full) |
 | `viking_browse` | Filesystem-style navigation (list/tree/stat) |
-| `viking_remember` | Store a fact directly with OpenViking `content/write` |
+| `viking_remember` | Store an explicitly classified fact with OpenViking `content/write` |
 | `viking_forget` | Delete one exact `viking://` memory file URI |
 | `viking_add_resource` | Ingest URLs/docs into the knowledge base |
 
 ## Memory Writes And Deletes
 
-`viking_remember` writes directly to OpenViking with `POST /api/v1/content/write`
-and `mode=create`. It creates peer-scoped memory files under
-`viking://user/peers/${OPENVIKING_AGENT}/memories/...`; OpenViking may return a
-canonical user-scoped form such as
-`viking://user/default/peers/${OPENVIKING_AGENT}/memories/...` in API-key mode.
-Explicit remembers do not depend on session commit extraction.
+`viking_remember` writes directly through `POST /api/v1/content/write` with
+`mode=create`. The category selects preferences, entities, events, cases,
+or patterns; an omitted category defaults to cases. A preference requires
+an exact evidence excerpt from a current user message. Attachment process
+claims such as "fully read" are refused; coverage belongs in the attachment
+coverage ledger. The response includes the canonical memory URI.
+
+Memory URIs include the resolved user explicitly, for example
+`viking://user/<user-id>/peers/hermes/memories/cases/mem_<id>.md`.
+Without a configured peer, the path is directly under the user's memories.
+Explicit remembers do not depend on session extraction.
 
 Hermes' built-in `memory` store is not mirrored into OpenViking. Its `user`
-target identifies the local USER.md profile but does not prove that arbitrary
-content is a preference, and its entries do not carry stable OpenViking URIs
-for later replace/remove synchronization. Matter facts are learned through
-typed session commits (`entities` and `events`); explicitly classified writes
-use `viking_remember`.
+target identifies the local USER.md profile but does not prove a preference,
+and local entries have no stable OpenViking URI for replace/remove sync.
+Automatic session commits extract only entities and events; automatic
+profile/preferences, peer memory, and working memory extraction are disabled.
 
-`viking_forget` is intentionally narrow. It only accepts concrete user memory
-file URIs, such as
-`viking://user/peers/hermes/memories/preferences/mem_abc123.md` or the canonical
-`viking://user/default/peers/hermes/memories/preferences/mem_abc123.md`. Files
-directly under `memories/`, such as `viking://user/default/memories/profile.md`,
-are also allowed because OpenViking supports them. The tool rejects directories,
-resources, skills, sessions, generated summary files, and URIs with query
-strings or fragments. Use OpenViking's MCP, CLI, or admin APIs for broader
-resource and directory cleanup.
+`viking_add_resource` requires the latest user message to explicitly request
+adding, importing, or indexing the resource. Request-scoped attachment
+handles are resolved with the current task's file grants before upload.
+
+`viking_forget` is for explicit deletion of one concrete `.md` user memory
+file. It reads the complete raw stored content and preserves the original,
+source URI, SHA-256, and event timestamp in a unique append-only record at
+`viking://user/<user-id>/signals/memory-deletions/<event-id>.json` before
+deleting the active memory projection. These signals are not summarized,
+vectorized, or returned by semantic retrieval. Historical deletion evidence
+under `_observability` is also filtered from explicit and automatic recall.
+
+Use explicit-user memory URIs. Legacy uid-less memory paths are expanded
+using the active request identity before deletion. The tool rejects
+directories, resources, skills, sessions, generated summaries, query strings,
+and fragments. The `viking://~/...` alias is not accepted by this tool's
+validator. Broader cleanup uses OpenViking's MCP, CLI, or admin APIs.

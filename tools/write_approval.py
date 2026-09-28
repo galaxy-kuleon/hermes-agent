@@ -42,15 +42,19 @@ OpenWebUI subject; trusted CLI/platform records keep the legacy shared path.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
-import os
+import re
 import time
 import uuid
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -59,53 +63,34 @@ MEMORY = "memory"
 SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
 
-# Config key (per subsystem). A single boolean: the approval gate is OFF by
-# default (writes flow freely, the pre-gate behaviour), and ON means stage /
-# prompt every write for the user's approval. There is intentionally no third
-# "block all writes" state — to disable a subsystem entirely use its own
-# enable flag (e.g. ``memory.memory_enabled: false``).
+# Per-subsystem config key. Intentionally a single boolean with no "block all writes"
+# state — to disable a subsystem use its own enable flag (e.g. ``memory.memory_enabled``).
 CONFIG_KEY = "write_approval"
+_TRUTHY_STRINGS = frozenset({"on", "true", "yes", "1", "approve", "enabled"})
 
 
-# ---------------------------------------------------------------------------
-# Config resolution
-# ---------------------------------------------------------------------------
+# --- Config resolution ---
 
 def write_approval_enabled(subsystem: str) -> bool:
-    """Return whether the approval gate is enabled for ``subsystem``.
-
-    Reads ``<subsystem>.write_approval`` from config.yaml. Defaults to
-    ``False`` (gate off — writes flow freely) for any unset / invalid value so
-    existing installs keep their current behaviour until the user opts in.
-    """
+    """Read ``<subsystem>.write_approval``; any unset/invalid value means gate off."""
     if subsystem not in _SUBSYSTEMS:
         return False
     try:
         from hermes_cli.config import load_config, cfg_get
-        cfg = load_config()
-        raw = cfg_get(cfg, subsystem, CONFIG_KEY, default=False)
+        return _normalize_enabled(cfg_get(load_config(), subsystem, CONFIG_KEY, default=False))
     except Exception:
         return False
-    return _normalize_enabled(raw)
 
 
 def _normalize_enabled(value: Any) -> bool:
-    """Coerce a config value to a bool. Default (unknown) is False (gate off).
-
-    Accepts real bools and the usual truthy/falsey strings. YAML 1.1 parses
-    bare ``on``/``off``/``yes``/``no`` as bools already, so the string branch
-    is mostly for hand-edited configs.
-    """
+    """Coerce a config value to bool; unknown → False (gate off). The string branch
+    covers hand-edited configs (YAML already parses bare on/off/yes/no)."""
     if isinstance(value, bool):
         return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"on", "true", "yes", "1", "approve", "enabled"}
-    return False
+    return isinstance(value, str) and value.strip().lower() in _TRUTHY_STRINGS
 
 
-# ---------------------------------------------------------------------------
-# Pending store (file-backed)
-# ---------------------------------------------------------------------------
+# --- Pending store (file-backed) ---
 
 def _pending_dir(subsystem: str, subject_user_id: Optional[str] = None) -> Path:
     base = get_hermes_home() / "pending" / subsystem
@@ -125,41 +110,28 @@ def _pending_dir(subsystem: str, subject_user_id: Optional[str] = None) -> Path:
     return base
 
 
-def stage_write(subsystem: str, payload: Dict[str, Any],
-                *, summary: str, origin: str) -> Dict[str, Any]:
-    """Persist a pending write and return a short record describing it.
+def _pending_path(subsystem: str, pending_id: str, subject_user_id: Optional[str] = None) -> Path:
+    return _pending_dir(subsystem, subject_user_id) / f"{pending_id}.json"
 
-    Args:
-        subsystem: ``memory`` or ``skills``.
-        payload: the exact kwargs needed to replay the write when approved
-            (e.g. ``{"action": "add", "target": "user", "content": "..."}``
-            for memory, or the full ``skill_manage`` kwargs for skills).
-        summary: a one-line human-readable description shown in pending lists.
-            For skills this is the LLM/heuristic gist; for memory it can be the
-            entry text itself.
-        origin: ``foreground`` or ``background_review`` — recorded for audit.
 
-    Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
-    logs and still returns a record (the write is simply lost, which is the
-    safe failure for an approval gate — nothing is silently committed).
-    """
+def _pending_files(subsystem: str) -> list:
+    d = _pending_path(subsystem, "").parent
+    return list(d.glob("*.json")) if d.exists() else []
+
+
+def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
+    """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
+    kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
+    Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
+    the safe failure for an approval gate (nothing silently committed)."""
     pid = uuid.uuid4().hex[:8]
     record = {
-        "id": pid,
-        "subsystem": subsystem,
-        "action": payload.get("action", ""),
-        "summary": (summary or "").strip(),
-        "origin": origin or "foreground",
-        "created_at": time.time(),
-        "payload": payload,
+        "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
+        "summary": (summary or "").strip(), "origin": origin or "foreground",
+        "created_at": time.time(), "payload": payload,
     }
     try:
-        d = _pending_dir(subsystem)
-        d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{pid}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_json_write(_pending_path(subsystem, pid, payload.get("subject_user_id")), record)
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
     return record
@@ -167,13 +139,13 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
-    d = _pending_dir(subsystem)
-    if not d.exists():
-        return []
     records: List[Dict[str, Any]] = []
-    for p in d.glob("*.json"):
+    for p in _pending_files(subsystem):
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
+            record = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError(f"expected a JSON object, got {type(record).__name__}")
+            records.append(record)
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
@@ -182,19 +154,19 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    path = _pending_path(subsystem, pending_id)
     if not path.exists():
         return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    with suppress(Exception):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    return None
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
     try:
+        path = _pending_path(subsystem, pending_id)
         if path.exists():
             path.unlink()
             return True
@@ -205,315 +177,166 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
-    d = _pending_dir(subsystem)
+    d = _pending_path(subsystem, "").parent
     if not d.exists():
         return 0
-    try:
+    with suppress(Exception):
         return sum(1 for _ in d.glob("*.json"))
-    except Exception:
-        return 0
+    return 0
 
 
-# ---------------------------------------------------------------------------
-# Write origin
-# ---------------------------------------------------------------------------
+# --- Write origin ---
 
 def current_origin() -> str:
-    """Return the active write origin: ``foreground`` or ``background_review``.
-
-    Reuses the skill-provenance ContextVar, which the background review fork
-    already sets (see ``agent.background_review`` /
-    ``AIAgent._spawn_background_review``). Foreground agent turns leave it at
-    the default ``foreground``.
-    """
-    try:
+    """``foreground`` or ``background_review`` — reuses the skill-provenance ContextVar
+    the background review fork sets; foreground turns leave it at the default."""
+    with suppress(Exception):
         from tools.skill_provenance import get_current_write_origin
         return get_current_write_origin()
-    except Exception:
-        return "foreground"
+    return "foreground"
 
 
-def is_background() -> bool:
-    return current_origin() == "background_review"
+# --- Gate decision ---
 
-
-# ---------------------------------------------------------------------------
-# Gate decision
-# ---------------------------------------------------------------------------
-
+@dataclass(slots=True, kw_only=True)
 class GateDecision:
-    """Result of evaluating the write gate for a single write attempt.
+    """Result of evaluating the write gate; exactly one flag is True. ``allow``: do the real write;
+    ``blocked``: user denied the inline prompt (``message`` says why); ``stage``: caller must
+    ``stage_write`` the payload (``message`` is the user-facing "staged for approval" note)."""
 
-    Exactly one of the boolean flags is True:
-      * ``allow``  — proceed with the real write (gate off, or an inline
-        approval was granted).
-      * ``blocked`` — refuse the write (the user denied an inline approval
-        prompt). ``message`` explains why; surface it to the agent.
-      * ``stage``  — do not write; the caller should stage the payload via
-        ``stage_write`` (gate on, and no inline prompt is available — gateway,
-        background review, script, or any skill write). ``message`` is the
-        user-facing "staged for approval" note.
-    """
-
-    __slots__ = ("allow", "blocked", "stage", "message")
-
-    def __init__(self, *, allow=False, blocked=False, stage=False, message=""):
-        self.allow = allow
-        self.blocked = blocked
-        self.stage = stage
-        self.message = message
+    allow: bool = False
+    blocked: bool = False
+    stage: bool = False
+    message: str = ""
 
 
-def evaluate_gate(subsystem: str, *, inline_summary: str = "",
-                  inline_detail: str = "") -> GateDecision:
-    """Decide what to do with a pending write for ``subsystem``.
+def _staged(subsystem: str) -> GateDecision:
+    where = "/skills pending" if subsystem == SKILLS else "/memory pending"
+    return GateDecision(stage=True, message=(f"Staged for approval ({subsystem}.write_approval is on). "
+                                             f"Not yet saved — review with {where}."))
 
-    Args:
-        subsystem: ``memory`` or ``skills``.
-        inline_summary: short description used as the inline approval prompt
-            header (memory foreground path only).
-        inline_detail: full content shown in the inline prompt (memory entries
-            are small; skills never take the inline path).
 
-    Decision matrix:
-        gate off (default)                    → allow (writes flow freely)
-        gate on, memory + interactive CLI     → inline approve/deny prompt
-        gate on, memory + gateway/script/bg   → stage
-        gate on, skills (any origin)          → stage (too big to review inline)
-
-    Note: there is no config-driven "blocked" outcome — the gate only ever
-    delays a write for approval, never silently refuses it. ``blocked`` is
-    still produced when the user *actively denies* an inline prompt.
-    """
+def evaluate_gate(subsystem: str, *, inline_summary: str = "", inline_detail: str = "") -> GateDecision:
+    """Decide what to do with a pending write: gate off → allow; gate on + skills (any origin) or
+    background → stage; gate on + memory + foreground → inline prompt when an interactive channel
+    exists, else stage. The gate only ever delays a write, never silently refuses it; ``blocked``
+    is produced only when the user actively denies the inline prompt."""
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
-
-    background = is_background()
-
-    # Skills always stage — a SKILL.md is too large to review inline, and a
-    # background skill write happens in a daemon thread with no user present.
-    if subsystem == SKILLS or background:
-        where = "/skills pending" if subsystem == SKILLS else "/memory pending"
-        return GateDecision(
-            stage=True,
-            message=(
-                f"Staged for approval ({subsystem}.write_approval is on). "
-                f"Not yet saved — review with {where}."
-            ),
-        )
-
-    # Memory + foreground: if an interactive approval channel exists (a CLI
-    # approval callback registered on this thread), prompt inline — entries
-    # are small enough to show in full. Otherwise (gateway, script, batch,
-    # no listener) stage instead of forcing a blind deny.
-    if _interactive_approval_available():
-        granted = _prompt_inline_memory_approval(inline_summary, inline_detail)
-        if granted is True:
-            return GateDecision(allow=True)
-        if granted is False:
-            return GateDecision(
-                blocked=True,
-                message="Memory write denied by user. The change was not saved.",
-            )
-        # granted is None → prompt failed; fall through to staging.
-
-    return GateDecision(
-        stage=True,
-        message=(
-            "Staged for approval (memory.write_approval is on). "
-            "Not yet saved — review with /memory pending."
-        ),
-    )
-
-
-def _interactive_approval_available() -> bool:
-    """True when a foreground memory write can be approved inline.
-
-    Inline prompting requires a per-thread approval callback registered by the
-    interactive CLI (``tools.terminal_tool.set_approval_callback``). Every
-    other surface stages instead:
-
-    * **Gateway/API sessions** — the dangerous-command ``/approve`` round-trip
-      lives in the pending-approval queue (``submit_pending`` +
-      ``_await_gateway_decision``), which ``prompt_dangerous_approval`` never
-      reaches; trying to prompt from a gateway session would hit the
-      ``input()`` fallback and silently deny. Staging gives the user a real
-      review affordance (``/memory pending``) instead.
-    * Scripts, cron, and background threads — no user present.
-    """
-    try:
-        from tools.terminal_tool import _get_approval_callback
-        return _get_approval_callback() is not None
-    except Exception:
-        return False
+    # Skills are too big to review inline; a background write runs in a daemon thread with no user.
+    if subsystem == SKILLS or current_origin() == "background_review":
+        return _staged(subsystem)
+    granted = _prompt_inline_memory_approval(inline_summary, inline_detail)
+    if granted is None:
+        return _staged(MEMORY)
+    if granted:
+        return GateDecision(allow=True)
+    return GateDecision(blocked=True, message="Memory write denied by user. The change was not saved.")
 
 
 def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
-    """Prompt the user inline to approve a memory write.
+    """Prompt inline for a memory write: True approved, False denied, None → stage. Uses the per-thread
+    CLI approval callback (``tools.terminal_tool.set_approval_callback``) directly, not
+    ``prompt_dangerous_approval``: that wrapper falls back to ``input()`` (deadlock-prone under
+    prompt_toolkit; silent deny in gateway sessions) and turns callback errors into a deny, whereas
+    here a missing channel or failed prompt must stage instead.
 
-    Returns True (approved), False (denied), or None (no interactive prompt
-    available / prompt failed → caller should stage instead).
-
-    Reuses the per-thread CLI approval callback registered for dangerous
-    commands (``tools.terminal_tool.set_approval_callback``). The callback is
-    invoked directly — NOT via ``prompt_dangerous_approval`` — because that
-    wrapper falls back to ``input()`` (deadlock-prone under prompt_toolkit,
-    see #15216) and converts callback errors into a silent deny; here a
-    failed prompt must stage the write instead.
+    See #15216.
     """
     try:
         from tools.terminal_tool import _get_approval_callback
     except Exception:
         return None
-
     callback = _get_approval_callback()
     if callback is None:
-        # No interactive channel on this thread — stage rather than risk the
-        # input() fallback (deadlock under prompt_toolkit, EOF-deny in tests).
         return None
-
     header = summary.strip() or "Save to memory?"
-    body = detail.strip()
-    description = f"Save to memory: {header}"
-    command = body if body else header
-    # Invoke the callback directly instead of via prompt_dangerous_approval:
-    # that wrapper swallows callback exceptions into "deny", which would
-    # silently refuse the write. Direct invocation lets a crashed prompt fall
-    # back to staging (the gate only ever delays a write, never drops it).
     try:
-        choice = callback(command, description, allow_permanent=False)
+        from tools.approval_prompt import callback_accepts
+        extra = {"title": "Save to memory?"} if callback_accepts(callback, "title") else {}
+        choice = callback(detail.strip() or header, f"Save to memory: {header}", allow_permanent=False, **extra)
     except Exception as e:
         logger.error("Inline memory approval prompt failed: %s", e)
         return None
-
-    if choice in {"once", "session"}:
-        return True
-    if choice == "deny":
-        return False
-    # Any other outcome (e.g. timeout that returns "deny" already handled) →
-    # treat unknown as no-decision so we stage rather than silently drop.
-    return None
+    # unknown outcome → stage rather than drop
+    return {"once": True, "session": True, "deny": False}.get(choice)
 
 
-# ---------------------------------------------------------------------------
-# Skill-specific helpers (gist + diff for the review affordances)
-# ---------------------------------------------------------------------------
+# --- Skill-specific helpers (gist + diff for the review affordances) ---
 
-def skill_gist(action: str, name: str, *, content: str = "",
-               file_path: str = "", old_string: str = "",
-               new_string: str = "") -> str:
-    """Build a one-line human gist for a pending skill write.
+_GIST_TEMPLATES = {"write_file": "write {file_path} in '{name}'", "remove_file": "remove {file_path} from '{name}'",
+                   "delete": "delete skill '{name}'"}
 
-    Heuristic, no model call — the gist surfaces enough to decide approve/reject
-    in a chat bubble, while the full diff stays behind /skills diff (CLI/
-    dashboard/file). For create/edit it pulls the frontmatter ``description:``;
-    for patch/write_file it describes the size of the change.
-    """
+
+def skill_gist(action: str, name: str, *, content: str = "", file_path: str = "",
+               old_string: str = "", new_string: str = "") -> str:
+    """One-line heuristic gist (no model call) for a pending skill write: create/edit use
+    the frontmatter ``description:``; patch/write_file describe the size of the change."""
     if action in {"create", "edit"} and content:
         desc = _frontmatter_description(content)
         size = f"{len(content) // 1024 + 1} KB" if len(content) >= 1024 else f"{len(content)} chars"
-        verb = "create" if action == "create" else "rewrite"
-        if desc:
-            return f"{verb} '{name}' — {desc} ({size})"
-        return f"{verb} '{name}' ({size})"
+        return f"{'create' if action == 'create' else 'rewrite'} '{name}'{f' — {desc}' if desc else ''} ({size})"
     if action == "patch":
-        target = file_path or "SKILL.md"
         removed = old_string.count("\n") + 1 if old_string else 0
         added = new_string.count("\n") + 1 if new_string else 0
-        return f"patch '{name}' {target} (+{added}/-{removed} lines)"
-    if action == "write_file":
-        return f"write {file_path} in '{name}'"
-    if action == "remove_file":
-        return f"remove {file_path} from '{name}'"
-    if action == "delete":
-        return f"delete skill '{name}'"
-    return f"{action} '{name}'"
+        return f"patch '{name}' {file_path or 'SKILL.md'} (+{added}/-{removed} lines)"
+    return _GIST_TEMPLATES.get(action, "{action} '{name}'").format(action=action, name=name, file_path=file_path)
 
 
 def _frontmatter_description(content: str) -> str:
-    """Extract the ``description:`` value from SKILL.md YAML frontmatter."""
-    import re
+    """Extract the ``description:`` value from SKILL.md YAML frontmatter (≤140 chars)."""
     m = re.search(r"^description:\s*(.+)$", content, re.MULTILINE)
-    if not m:
-        return ""
-    desc = m.group(1).strip().strip("'\"")
-    return desc[:140]
+    return m.group(1).strip().strip("'\"")[:140] if m else ""
+
+
+def _find_skill_path(name: str, *, namespace=None, subject_user_id=None) -> Optional[Path]:
+    from contextlib import nullcontext
+    from tools.skill_manager_tool import _find_managed_skill
+    from agent.skill_namespaces import bind_skill_namespace_user
+
+    scope = bind_skill_namespace_user(subject_user_id) if namespace == "user" and subject_user_id else nullcontext()
+    with scope:
+        found = _find_managed_skill(name, namespace=namespace)
+        return found["path"] if found else None
 
 
 def skill_pending_diff(record: Dict[str, Any]) -> str:
-    """Build a full unified diff (or full content) for a staged skill write.
-
-    Used by /skills diff <id> on a surface that can render it (CLI pager, web
-    dashboard, or by opening the pending JSON file). For create this is the new
-    file content; for edit/patch it is a unified diff against the current
-    on-disk skill.
-    """
-    import difflib
+    """Full content (create) or unified diff vs. the on-disk skill (edit/patch/write_file),
+    rendered by /skills diff <id> on surfaces that can show it."""
     payload = record.get("payload", {})
     action = payload.get("action", "")
     name = payload.get("name", "")
-
     if action == "create":
-        return (payload.get("content") or "")
+        return payload.get("content") or ""
+    if action not in {"edit", "patch", "write_file"}:
+        return {"remove_file": f"remove file: {payload.get('file_path')} from skill '{name}'",
+                "delete": f"delete skill '{name}'"}.get(action, f"({action} on '{name}')")
 
-    # Resolve current on-disk content for diffable actions.
-    try:
-        from tools.skill_manager_tool import _find_skill
-    except Exception:
-        _find_skill = None  # type: ignore
+    # patch/write_file target a file inside the skill; edit always targets SKILL.md.
+    target_label, current = "SKILL.md", ""
+    skill_dir = _find_skill_path(name, namespace=payload.get("namespace"), subject_user_id=payload.get("subject_user_id"))
+    if skill_dir:
+        if action != "edit":
+            target_label = payload.get("file_path") or "SKILL.md"
+        with suppress(Exception):
+            p = skill_dir / target_label
+            current = p.read_text(encoding="utf-8") if p.exists() else ""
 
-    current = ""
-    target_label = "SKILL.md"
-    if _find_skill is not None:
-        from contextlib import nullcontext
-
-        namespace = payload.get("namespace")
-        replay_scope = nullcontext()
-        if namespace == "user" and payload.get("subject_user_id"):
-            from agent.skill_namespaces import bind_skill_namespace_user
-
-            replay_scope = bind_skill_namespace_user(payload["subject_user_id"])
-        try:
-            with replay_scope:
-                found = _find_skill(name, namespace=namespace)
-                if found:
-                    base = found["path"]
-                    if action == "edit":
-                        p = base / "SKILL.md"
-                    elif action in {"patch", "write_file"}:
-                        rel = payload.get("file_path") or "SKILL.md"
-                        p = base / rel
-                        target_label = rel
-                    else:
-                        p = base / "SKILL.md"
-                    try:
-                        if p.exists():
-                            current = p.read_text(encoding="utf-8")
-                    except Exception:
-                        current = ""
-        except ValueError:
-            current = ""
-
-    if action == "edit":
-        new = payload.get("content") or ""
-    elif action == "patch":
-        old_s = payload.get("old_string") or ""
-        new_s = payload.get("new_string") or ""
+    if action == "patch":
+        old_s, new_s = payload.get("old_string") or "", payload.get("new_string") or ""
         new = current.replace(old_s, new_s) if current else f"(patch {old_s!r} → {new_s!r})"
-    elif action == "write_file":
-        new = payload.get("file_content") or ""
-    elif action == "remove_file":
-        return f"remove file: {payload.get('file_path')} from skill '{name}'"
-    elif action == "delete":
-        return f"delete skill '{name}'"
     else:
-        return f"({action} on '{name}')"
+        new = payload.get("content" if action == "edit" else "file_content") or ""
+    diff = difflib.unified_diff(current.splitlines(keepends=True), new.splitlines(keepends=True),
+                                fromfile=f"a/{target_label}", tofile=f"b/{target_label}")
+    return "".join(diff) or "(no textual change)"
 
-    diff = difflib.unified_diff(
-        current.splitlines(keepends=True),
-        new.splitlines(keepends=True),
-        fromfile=f"a/{target_label}",
-        tofile=f"b/{target_label}",
-    )
-    text = "".join(diff)
-    return text or "(no textual change)"
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+def is_background() -> bool:
+    return current_origin() == "background_review"
+# ---- END PLUGIN-COMPAT ----
