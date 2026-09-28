@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from tools.binary_extensions import has_binary_extension, has_image_extension
 from tools.read_extract import is_extractable_document
@@ -48,6 +49,14 @@ def reader_guidance(target: str, path: str) -> tuple[str, str]:
     if read_with == READ_WITH_VISION:
         return read_with, f"Call {call}. Do not call read_file first."
     if read_with == READ_WITH_FILE:
+        if Path(path).suffix.lower() == ".docx":
+            return (
+                read_with,
+                f"Call {call} for ordinary text extraction. If a loaded skill "
+                "designates a request-scoped DOCX inspection or editing service as "
+                "authoritative for this task, follow that skill instead and do not "
+                "call both routes.",
+            )
         return read_with, f"Call {call}."
     return (
         read_with,

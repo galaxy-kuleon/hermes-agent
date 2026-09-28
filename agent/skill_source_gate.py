@@ -17,16 +17,23 @@ _CLASS_LIST_RE = re.compile(
 _CLASS_NUMBER_RE = re.compile(r"\b([1-9]|[1-9][0-9])\b")
 _CLASS_PLACEHOLDER_RE = re.compile(r"(?<=class-)N(?=\.)")
 _SKILL_MUTATION_INTENT_RE = re.compile(
-    r"(?:\b(?:create|edit|update|modify|patch|change|write|delete|remove|rename|"
-    r"publish|share|pass|import|add|attach|include|bundle|install|sync|save|remember)\b.{0,120}\bskills?\b|"
-    r"\bskills?\b.{0,120}\b(?:create|edit|update|modify|patch|change|write|"
-    r"delete|remove|rename|publish|share|pass|import|add|attach|include|bundle|install|sync|save)\b|"
-    r"(?:建立|新增|編輯|编辑|修改|更新|修補|删除|刪除|移除|重新命名|發佈|发布|"
-    r"分享|共享|傳給|传给|交給|交给|匯入|导入|導入|加入|附加|打包|包含|"
-    r"安裝|安装|同步|儲存|保存|記住).{0,80}(?:技能|skill)|"
-    r"(?:技能|skill).{0,80}(?:建立|新增|編輯|编辑|修改|更新|修補|删除|刪除|"
+    r"(?:"
+    r"\b(?:create|edit|update|patch|delete|remove|rename|publish|share|pass|"
+    r"import|add|attach|include|bundle|install|sync|save|remember)\b.{0,120}\bskills?\b|"
+    r"\b(?:modify|change|write)\b(?:(?!\b(?:document|template|draft|output)\b).){0,80}\bskills?\b|"
+    r"\bskills?\b\s*(?:(?:itself|content|instructions?|rules?|files?|references?)\s*)?"
+    r"(?:(?:needs?|should|must|please)\s*)?(?:to\s+be\s+)?"
+    r"(?:created|edited|updated|modified|patched|changed|written|deleted|removed|"
+    r"renamed|published|shared|imported|installed|synced|saved)\b|"
+    r"(?:建立|新增|編輯|编辑|修改|更新|修補|調整|调整|改寫|改写|刪除|删除|"
     r"移除|重新命名|發佈|发布|分享|共享|傳給|传给|交給|交给|匯入|导入|"
-    r"導入|加入|附加|打包|包含|安裝|安装|同步|儲存|保存))",
+    r"導入|加入|附加|打包|包含|安裝|安装|同步|儲存|保存|記住)"
+    r"(?:(?!(?:文件|範本|模板|草稿|輸出)).){0,80}(?:技能|skill)|"
+    r"(?:技能|skill)\s*(?:(?:本身|內容|内容|說明|说明|規則|规则|檔案|文件|"
+    r"reference|references)\s*)?(?:(?:還|还)?需要(?:一些)?|應|应|必須|必须|請|请)?\s*"
+    r"(?:建立|新增|編輯|编辑|修改|更新|修補|調整|调整|改寫|改写|刪除|删除|"
+    r"移除|重新命名|發佈|发布|分享|共享|匯入|导入|導入|安裝|安装|同步|儲存|保存)"
+    r")",
     re.IGNORECASE | re.DOTALL,
 )
 _REFERENTIAL_SKILL_MUTATION_RE = re.compile(

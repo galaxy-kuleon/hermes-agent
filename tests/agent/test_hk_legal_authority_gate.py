@@ -34,6 +34,58 @@ EXACT_CROSS_SEARCH_PROMPT = (
     "apply Hong Kong Trade Mark Enquiry: please let me know if juice will be "
     "cross-class check with restaurant services"
 )
+LEGAL_DOCX_RBV_PROMPT = (
+    "Run a functional RBV test with fake data. Use only "
+    "mcp__legal_docx__inspect, mcp__legal_docx__apply, "
+    "mcp__legal_docx__verify and mcp__legal_docx__publish. Return raw receipts. "
+    'source_file_id=F01 and the source paragraph begins "Hong Kong".'
+)
+
+
+def test_legal_docx_operational_rbv_is_not_a_statutory_query():
+    assert not is_hk_statutory_query(LEGAL_DOCX_RBV_PROMPT)
+
+
+def test_legal_docx_shared_skill_functional_test_is_not_a_statutory_query():
+    prompt = (
+        "請使用 legal-docx-template-customizer skill，以假資料執行功能測試。"
+        "範本內含 Hong Kong Identity Card 與 fictional Hong Kong address；"
+        "請確認是否成功，不提供法律意見。"
+    )
+    assert not is_hk_statutory_query(prompt)
+
+
+def test_legal_docx_tool_request_for_legal_advice_remains_gated():
+    prompt = (
+        "Use mcp__legal_docx__inspect in a functional test, then advise what I can "
+        "do under Hong Kong law about this will."
+    )
+    assert is_hk_statutory_query(prompt)
+
+
+def test_legal_docx_operational_followup_with_negated_legal_disclaimer_is_not_gated():
+    prompt = (
+        "這是 8083 legal DOCX RBV 功能測試，不是法律意見。"
+        "沿用 source_file_id=F01、inspection_id=15820031714cd09674b5cb0db6f01d9a，"
+        "只呼叫 apply、verify、publish。原文包含 Hong Kong Identity Card。"
+    )
+    assert not is_hk_statutory_query(prompt)
+    decision = evaluate_hk_legal_answer(
+        messages=[{"role": "user", "content": prompt}],
+        current_turn_user_idx=0,
+        final_response="apply 成功；artifact_id=abc，這是技術測試結果。",
+        attempts=0,
+    )
+    assert decision.action == "pass"
+
+
+def test_legal_docx_state_markers_do_not_exempt_actual_legal_conclusion_request():
+    prompt = (
+        "Run a functional RBV test with source_file_id=F01 and "
+        "inspection_id=15820031714cd09674b5cb0db6f01d9a, then advise what I can "
+        "do under Hong Kong law about this will."
+    )
+    assert is_hk_statutory_query(prompt)
 
 
 def _authority_message():

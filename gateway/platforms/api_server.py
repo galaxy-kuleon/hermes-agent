@@ -208,6 +208,106 @@ def emit_responses_coverage_suffix(
     ) or ""
 
 
+_LEGAL_DOCX_PUBLISH_TOOL = "mcp__legal_docx__publish"
+_LEGAL_DOCX_ARTIFACT_URL_RE = re.compile(
+    r"^/api/hermes/v1/artifacts/[a-f0-9]{32}/"
+    r"[A-Za-z0-9._~%\-]+\.docx/download/[0-9]{9,12}/[a-f0-9]{64}$"
+)
+
+
+def _legal_docx_publish_receipt(
+    tool_name: str, function_result: Any
+) -> Optional[Dict[str, str]]:
+    """Return a trusted, normalized legal-DOCX publication receipt.
+
+    The model is never allowed to nominate the download URL.  Only the native
+    ``legal_docx.publish`` tool result is accepted, and even that result must
+    match the same-origin signed-artifact route before it can reach assistant
+    content.  MCP wrappers may deliver the tool result as a mapping, a JSON
+    string, or a standard ``content: [{type: text, text: ...}]`` envelope.
+    """
+    if tool_name != _LEGAL_DOCX_PUBLISH_TOOL:
+        return None
+
+    candidate: Any = function_result
+    for _ in range(3):
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            continue
+        if isinstance(candidate, dict):
+            if "published" in candidate or "url" in candidate:
+                break
+            structured = candidate.get("structuredContent")
+            if structured is None:
+                structured = candidate.get("structured_content")
+            if isinstance(structured, dict):
+                candidate = structured
+                continue
+            content = candidate.get("content")
+            if isinstance(content, list) and len(content) == 1:
+                item = content[0]
+                if isinstance(item, dict) and item.get("type") == "text":
+                    candidate = item.get("text")
+                    continue
+        break
+
+    if not isinstance(candidate, dict):
+        return None
+    if candidate.get("ok") is not True or candidate.get("published") is not True:
+        return None
+    if candidate.get("schema") != "legal.docx.publish-result.v1":
+        return None
+
+    url = candidate.get("url")
+    filename = candidate.get("filename")
+    expires_at = candidate.get("expires_at")
+    export_artifact_id = candidate.get("export_artifact_id")
+    if not all(isinstance(value, str) and value for value in (
+        url, filename, expires_at, export_artifact_id
+    )):
+        return None
+    if not _LEGAL_DOCX_ARTIFACT_URL_RE.fullmatch(url):
+        return None
+    if not re.fullmatch(r"[a-f0-9]{32}", export_artifact_id):
+        return None
+    if f"/artifacts/{export_artifact_id}/" not in url:
+        return None
+    if not filename.lower().endswith(".docx"):
+        return None
+    # The public route percent-encodes every non-unreserved filename byte, so
+    # a raw slash, query marker, fragment, bracket, or parenthesis is never a
+    # legitimate filename character on this wire contract.
+    if any(char in filename for char in "/\\?#[]()\r\n"):
+        return None
+
+    return {
+        "url": url,
+        "filename": filename,
+        "expires_at": expires_at,
+        "export_artifact_id": export_artifact_id,
+    }
+
+
+def _legal_docx_download_suffix(
+    receipt: Optional[Dict[str, str]], emitted_text: str = ""
+) -> str:
+    """Build the deterministic OpenWebUI download affordance, if needed."""
+    if not receipt:
+        return ""
+    url = receipt["url"]
+    if url in (emitted_text or ""):
+        return ""
+    filename = receipt["filename"]
+    expires_at = receipt["expires_at"]
+    return (
+        f"\n\n下載檔案：[{filename}]({url})"
+        f"\n連結有效期限：{expires_at}"
+    )
+
+
 def _hermes_version() -> str:
     """Return the canonical Hermes Agent version string.
 
@@ -6370,6 +6470,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
                 """
+                publish_receipt = _legal_docx_publish_receipt(
+                    function_name, function_result
+                )
+                if publish_receipt is not None:
+                    # This private queue item is consumed by the adapter and
+                    # never exposed as a custom event.  It lets the response
+                    # layer guarantee delivery even when the model omits or
+                    # misformats the signed URL in its prose.
+                    _stream_q.put_threadsafe(
+                        ("__legal_docx_publish_receipt__", publish_receipt)
+                    )
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
@@ -6449,6 +6560,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # thread.
         nonstream_agent_ref = [None]
         nonstream_cancel_event = threading.Event()
+        nonstream_publish_receipts: List[Dict[str, str]] = []
+
+        def _capture_nonstream_publish_receipt(
+            tool_call_id, function_name, function_args, function_result
+        ):
+            receipt = _legal_docx_publish_receipt(function_name, function_result)
+            if receipt is not None:
+                nonstream_publish_receipts.append(receipt)
 
         async def _compute_completion():
             return await self._run_agent(
@@ -6466,6 +6585,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 granted_file_aliases=granted_file_aliases,
                 agent_ref=nonstream_agent_ref,
                 agent_cancel_event=nonstream_cancel_event,
+                tool_complete_callback=_capture_nonstream_publish_receipt,
                 **agent_overrides,
                 route=route,
             )
@@ -6518,6 +6638,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        if nonstream_publish_receipts:
+            final_response += _legal_docx_download_suffix(
+                nonstream_publish_receipts[-1], final_response
+            )
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -6652,7 +6776,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # reasoning is forwarded as ``delta.reasoning_content`` which
             # OpenWebUI's backend natively converts to a live "Thinking…"
             # block (open-webui middleware.py:4117-4150).
-            _owui_state = {"reasoning_open": False}
+            _owui_state = {
+                "reasoning_open": False,
+                "legal_docx_publish_receipt": None,
+            }
             import html as _html_mod
 
             def _render_tool_call_html(payload: Dict[str, Any]) -> str:
@@ -6734,7 +6861,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # final_response in the RESULT, and this writer never emitted the
             # result -- so the explainer fired, the text existed, and the user
             # still got an empty box.
-            _wire = {"content": False, "emitted_coverage_footer": None}
+            _wire = {
+                "content": False,
+                "content_tail": "",
+                "emitted_coverage_footer": None,
+            }
 
             def _encode_content_delta(text: str) -> bytes:
                 """Encode the exact OpenAI ``delta.content`` bytes to be written."""
@@ -6750,6 +6881,12 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _write_content_delta(text: str) -> None:
                 """Send ``text`` using the shared checked content encoder."""
                 await response.write(_encode_content_delta(text))
+                if isinstance(text, str) and text:
+                    # Enough context to detect a URL the model already emitted
+                    # without retaining an unbounded duplicate of its answer.
+                    _wire["content_tail"] = (
+                        _wire["content_tail"] + text
+                    )[-131_072:]
                 if (text or "").strip():
                     # "Wrote any string" is not "the user received something
                     # readable": a whitespace-only delta suppressed the
@@ -6786,7 +6923,15 @@ class APIServerAdapter(BasePlatformAdapter):
                   block automatically.
                 * Plain strings — standard ``delta.content`` chunks.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and item[0] == "__legal_docx_publish_receipt__"
+                ):
+                    receipt = item[1]
+                    if isinstance(receipt, dict):
+                        _owui_state["legal_docx_publish_receipt"] = receipt
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     payload = item[1]
                     # (a) legacy custom event for native clients — fires
                     # on BOTH running and completed so native UIs (TUI,
@@ -7101,6 +7246,26 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as _late_err:
                 logger.warning("late final_response emit failed for %s: %s",
                                completion_id, _late_err)
+
+            # A legal DOCX publication is not complete from the user's point
+            # of view until the signed download is visible.  The receipt came
+            # directly from the successful MCP tool call and passed the
+            # same-origin route validator above; do not rely on model prose to
+            # preserve it.  If the model already emitted the exact URL, this is
+            # a no-op so the answer contains only one download affordance.
+            try:
+                download_suffix = _legal_docx_download_suffix(
+                    _owui_state.get("legal_docx_publish_receipt"),
+                    _wire.get("content_tail", ""),
+                )
+                if download_suffix:
+                    await _write_content_delta(download_suffix)
+            except Exception as _artifact_emit_err:
+                logger.warning(
+                    "legal DOCX download link emit failed for %s: %s",
+                    completion_id,
+                    _artifact_emit_err,
+                )
 
             # M-U1-D all-exit A-channel: coverage suffix BEFORE stop/[DONE].
             # Production adapter (mutation target): emit_chat_completion_coverage_suffix

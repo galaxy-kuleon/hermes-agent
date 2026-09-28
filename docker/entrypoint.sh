@@ -67,6 +67,9 @@ if [ "$(id -u)" = "0" ]; then
     if [ -d "/handoff" ]; then
         mkdir -p /handoff/exports
         chown hermes:hermes /handoff/exports
+        # Shared publishers join the Hermes runtime group. setgid preserves
+        # that group on per-owner export directories without world write.
+        chmod 2770 /handoff/exports
     fi
 
     # OpenCode reads ~/.config/opencode/opencode.json. Hermes intentionally

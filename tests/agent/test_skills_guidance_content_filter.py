@@ -65,9 +65,9 @@ class TestBehaviourIsPreserved:
         assert "workflow" in first_line
         assert "reuse" in first_line
 
-    def test_patch_stale_skills_sentence_untouched(self):
-        assert "skill_manage(action='patch')" in SKILLS_GUIDANCE
-        assert "Skills that aren't maintained become liabilities." in SKILLS_GUIDANCE
+    def test_skill_mutation_requires_current_turn_authorization(self):
+        assert "only when the user's current turn explicitly asks" in SKILLS_GUIDANCE
+        assert "without mutating the skill" in SKILLS_GUIDANCE
 
     def test_skill_safety_rule_block_untouched(self):
         # Guarded independently by tests/agent/test_ghost_skill_pruning.py; asserted

@@ -38,6 +38,8 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _legal_docx_download_suffix,
+    _legal_docx_publish_receipt,
     _merge_api_system_prompts,
     _redact_api_error_text,
     _request_agent_overrides,
@@ -45,6 +47,78 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+
+
+_LEGAL_DOCX_TEST_RECEIPT = {
+    "ok": True,
+    "schema": "legal.docx.publish-result.v1",
+    "published": True,
+    "export_artifact_id": "bc9314f7c27142d099c9bf0325e88794",
+    "filename": "Simulation-B-DRAFT-NOT-FOR-SIGNING.docx",
+    "expires_at": "2026-09-02T13:13:24Z",
+    "url": (
+        "/api/hermes/v1/artifacts/bc9314f7c27142d099c9bf0325e88794/"
+        "Simulation-B-DRAFT-NOT-FOR-SIGNING.docx/download/1788354804/"
+        "5a6a164e18e2d79068b157b05fc15df3c2d7ab3d4c86c5550271c967be0b60db"
+    ),
+}
+
+
+class TestLegalDocxDownloadDelivery:
+    def test_accepts_native_publish_receipt_and_builds_link(self):
+        receipt = _legal_docx_publish_receipt(
+            "mcp__legal_docx__publish", json.dumps(_LEGAL_DOCX_TEST_RECEIPT)
+        )
+        assert receipt is not None
+        suffix = _legal_docx_download_suffix(receipt)
+        assert "下載檔案：" in suffix
+        assert _LEGAL_DOCX_TEST_RECEIPT["url"] in suffix
+        assert _LEGAL_DOCX_TEST_RECEIPT["filename"] in suffix
+        assert _LEGAL_DOCX_TEST_RECEIPT["expires_at"] in suffix
+
+    def test_accepts_standard_mcp_text_envelope(self):
+        receipt = _legal_docx_publish_receipt(
+            "mcp__legal_docx__publish",
+            {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(_LEGAL_DOCX_TEST_RECEIPT),
+                    }
+                ]
+            },
+        )
+        assert receipt is not None
+        assert receipt["export_artifact_id"] == _LEGAL_DOCX_TEST_RECEIPT["export_artifact_id"]
+
+    @pytest.mark.parametrize(
+        ("tool_name", "overrides"),
+        [
+            ("terminal", {}),
+            ("mcp__legal_docx__publish", {"published": False}),
+            ("mcp__legal_docx__publish", {"schema": "other.schema"}),
+            (
+                "mcp__legal_docx__publish",
+                {"url": "https://attacker.invalid/file.docx"},
+            ),
+            (
+                "mcp__legal_docx__publish",
+                {"export_artifact_id": "0" * 32},
+            ),
+        ],
+    )
+    def test_rejects_untrusted_or_unsuccessful_results(self, tool_name, overrides):
+        candidate = dict(_LEGAL_DOCX_TEST_RECEIPT)
+        candidate.update(overrides)
+        assert _legal_docx_publish_receipt(tool_name, candidate) is None
+
+    def test_does_not_duplicate_url_already_emitted(self):
+        receipt = _legal_docx_publish_receipt(
+            "mcp__legal_docx__publish", _LEGAL_DOCX_TEST_RECEIPT
+        )
+        assert _legal_docx_download_suffix(
+            receipt, f"已有連結 {_LEGAL_DOCX_TEST_RECEIPT['url']}"
+        ) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1369,6 +1443,106 @@ class TestChatCompletionsEndpoint:
             assert len(pairs) == 2, f"expected 2 events (running+completed), got {pairs}"
             assert pairs[0] == ("running", "call_terminal_1"), pairs
             assert pairs[1] == ("completed", "call_terminal_1"), pairs
+
+    @pytest.mark.asyncio
+    async def test_stream_appends_trusted_legal_docx_download_link(self, adapter):
+        """A successful native publish receipt must survive weak model prose."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                cb = kwargs.get("stream_delta_callback")
+                if ts_cb:
+                    ts_cb(
+                        "call_publish_1",
+                        "mcp__legal_docx__publish",
+                        {"output_artifact_id": "draft-1"},
+                    )
+                if tc_cb:
+                    tc_cb(
+                        "call_publish_1",
+                        "mcp__legal_docx__publish",
+                        {"output_artifact_id": "draft-1"},
+                        json.dumps(_LEGAL_DOCX_TEST_RECEIPT),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("文件已完成。")
+                return (
+                    {"final_response": "文件已完成。", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "修改文件"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "下載檔案：" in body
+        # The URL is present in the completed tool card and the deterministic
+        # user-facing link. Parse content deltas to assert the latter exactly.
+        assistant_content = ""
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            try:
+                chunk = json.loads(line[len("data: "):])
+            except json.JSONDecodeError:
+                continue
+            for choice in chunk.get("choices", []):
+                assistant_content += choice.get("delta", {}).get("content", "")
+        # The collapsed tool-result details also contain the receipt URL, but
+        # there must be exactly one clickable download affordance in the
+        # assistant prose outside that JSON payload.
+        assert assistant_content.count(
+            f"]({_LEGAL_DOCX_TEST_RECEIPT['url']})"
+        ) == 1
+        assert (
+            f"[{_LEGAL_DOCX_TEST_RECEIPT['filename']}]"
+            f"({_LEGAL_DOCX_TEST_RECEIPT['url']})"
+        ) in assistant_content
+
+    @pytest.mark.asyncio
+    async def test_nonstream_appends_trusted_legal_docx_download_link(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                tc_cb = kwargs.get("tool_complete_callback")
+                if tc_cb:
+                    tc_cb(
+                        "call_publish_2",
+                        "mcp__legal_docx__publish",
+                        {},
+                        _LEGAL_DOCX_TEST_RECEIPT,
+                    )
+                return (
+                    {"final_response": "文件已完成。", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "修改文件"}],
+                        "stream": False,
+                    },
+                )
+                assert resp.status == 200
+                payload = await resp.json()
+
+        content = payload["choices"][0]["message"]["content"]
+        assert content.count(_LEGAL_DOCX_TEST_RECEIPT["url"]) == 1
+        assert "下載檔案：" in content
 
     @pytest.mark.asyncio
     async def test_stream_tool_lifecycle_skips_internal_and_orphan_completes(self, adapter):

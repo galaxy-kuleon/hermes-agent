@@ -36,6 +36,61 @@ _LEGAL_REQUEST_RE = re.compile(
     r"侵權|侵权|無效|无效|反對|反对|草擬|草拟|擬備|拟备|起草|審閱|审阅)",
     re.IGNORECASE | re.DOTALL,
 )
+_LEGAL_DOCX_TOOL_RE = re.compile(
+    r"\bmcp__legal_docx__(?:inspect|apply|verify|publish)\b",
+    re.IGNORECASE,
+)
+_LEGAL_DOCX_SKILL_RE = re.compile(
+    r"\blegal[-_ ]docx(?:[-_ ]template[-_ ]customizer)?\b",
+    re.IGNORECASE,
+)
+_LEGAL_DOCX_OPERATIONAL_TEST_RE = re.compile(
+    r"(?:\bRBV\b|functional\s+(?:RBV\s+)?test|capability\s+test|"
+    r"raw\s+receipts?|source_file_id|inspection_id|output_artifact_id|"
+    r"功能測試|能力測試|原始回執|假資料)",
+    re.IGNORECASE,
+)
+_LEGAL_DOCX_STATE_RE = re.compile(
+    r"(?:\bsource_file_id\b|\bsource_sha256\b|\binspection_id\b|"
+    r"\boutput_artifact_id\b|\bartifact_id\b|\boutput_sha256\b|"
+    r"\blegal\.docx-change-manifest\.v1\b)",
+    re.IGNORECASE,
+)
+_NEGATED_LEGAL_CONCLUSION_RE = re.compile(
+    r"(?:\b(?:no|not|without)\s+(?:provid(?:e|ing)\s+)?(?:any\s+)?"
+    r"(?:legal\s+)?(?:advice|analysis|opinion|interpretation|conclusion)s?\b|"
+    r"\bdo\s+not\s+(?:provid(?:e|ing)|give|make)\s+(?:any\s+)?(?:legal\s+)?"
+    r"(?:advice|analysis|opinion|interpretation|conclusion)s?\b|"
+    r"不(?:是|提供|涉及|作出|包含|構成|构成).{0,12}法律"
+    r"(?:意見|意见|分析|解釋|解释|結論|结论)|"
+    r"無.{0,8}法律(?:意見|意见|分析|解釋|解释|結論|结论))",
+    re.IGNORECASE,
+)
+_LEGAL_CONCLUSION_INTENT_RE = re.compile(
+    r"(?:\b(?:advise|advice|analyse|analyze|explain|interpret|challenge|"
+    r"oppose|invalidate)\b|\bwhat\s+can\s+i\s+do\b|"
+    r"\bunder\s+(?:the\s+)?law\b|法律意見|法律分析|法律解釋|法律解释|"
+    r"救濟|救济|侵權|侵权|無效|无效|反對|反对)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_legal_docx_operational_test(text: str) -> bool:
+    """Recognize a deterministic DOCX run without treating disclaimers as intent."""
+    has_workflow = bool(
+        _LEGAL_DOCX_TOOL_RE.search(text) or _LEGAL_DOCX_SKILL_RE.search(text)
+    )
+    state_markers = {
+        marker.lower()
+        for marker in _LEGAL_DOCX_STATE_RE.findall(text)
+    }
+    if not (
+        _LEGAL_DOCX_OPERATIONAL_TEST_RE.search(text)
+        and (has_workflow or len(state_markers) >= 2)
+    ):
+        return False
+    intent_text = _NEGATED_LEGAL_CONCLUSION_RE.sub("", text)
+    return not bool(_LEGAL_CONCLUSION_INTENT_RE.search(intent_text))
 _TRADE_MARK_RE = re.compile(r"(?:trade\s*marks?|trademarks?|商標|商标)", re.IGNORECASE)
 _REGISTERED_RE = re.compile(r"(?:registered|registration|註冊|注册)", re.IGNORECASE)
 _REGISTERED_MARK_MINIMUM = {"559": frozenset({"4", "11", "12", "44", "45", "52", "53"})}
@@ -469,6 +524,12 @@ def is_hk_statutory_query(user_message: Any) -> bool:
     """Conservatively identify requests that can create HK-law reliance."""
     text = _message_text(user_message)
     if _SKILL_META_ENQUIRY_RE.search(text) or _AUTHORITY_DISABLE_REQUEST_RE.search(text):
+        return False
+    # Tool names and source payloads can contain both "legal" and "Hong Kong"
+    # even when the user is only running a deterministic DOCX capability test.
+    # Exempt only an explicit legal-docx operational test and never an actual
+    # request for a legal conclusion.
+    if _is_legal_docx_operational_test(text):
         return False
     if not (_HK_RE.search(text) and _LEGAL_RE.search(text)):
         return False

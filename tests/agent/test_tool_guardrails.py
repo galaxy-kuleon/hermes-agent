@@ -493,6 +493,40 @@ def test_skill_mutation_requires_explicit_turn_intent():
     )
 
 
+def test_legal_docx_apply_is_limited_to_once_per_source_per_turn():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"
+    )
+    first = controller.before_call(
+        "mcp__legal_docx__apply",
+        {"source_file_id": "F01", "manifest": {"changes": [{"change_id": "A"}]}},
+    )
+    assert first.action == "allow"
+
+    repeated = controller.before_call(
+        "mcp__legal_docx__apply",
+        {"source_file_id": "F01", "manifest": {"changes": [{"change_id": "B"}]}},
+    )
+    assert repeated.action == "reuse"
+    assert repeated.code == "legal_docx_single_apply_enforced"
+    assert "Do not retry" in repeated.message
+
+    other_source = controller.before_call(
+        "mcp__legal_docx__apply",
+        {"source_file_id": "F02", "manifest": {"changes": [{"change_id": "C"}]}},
+    )
+    assert other_source.action == "allow"
+
+    controller.reset_for_turn()
+    assert (
+        controller.before_call(
+            "mcp__legal_docx__apply",
+            {"source_file_id": "F01", "manifest": {"changes": [{"change_id": "D"}]}},
+        ).action
+        == "allow"
+    )
+
+
 def test_referential_skill_confirmation_routes_away_from_profile_memory():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(), platform_resolver=lambda: "api_server"

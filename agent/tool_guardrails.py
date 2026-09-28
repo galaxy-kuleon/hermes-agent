@@ -428,6 +428,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._legal_docx_apply_sources: set[str] = set()
         self._strict_skill_source_boundary = False
         self._strict_skill_source_contract_seen = False
         self._strict_skill_source_requested_classes: tuple[int, ...] = ()
@@ -550,6 +551,25 @@ class ToolCallGuardrailController:
         cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
         if cap_block is not None:
             return cap_block
+
+        if tool_name == "mcp__legal_docx__apply":
+            source_file_id = str(_coerce_args(args).get("source_file_id") or "").upper()
+            source_key = source_file_id or signature.args_hash
+            if source_key in self._legal_docx_apply_sources:
+                return ToolGuardrailDecision(
+                    action="reuse",
+                    code="legal_docx_single_apply_enforced",
+                    message=(
+                        "One legal DOCX apply call has already been attempted for this "
+                        "request-owned source in the current turn. Do not retry, split the "
+                        "manifest, or create diagnostic artifacts. If the first call "
+                        "succeeded, continue from its native output artifact receipt; if it "
+                        "failed, stop and report that native error to the user."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            self._legal_docx_apply_sources.add(source_key)
 
         if (
             self._referential_skill_mutation_required

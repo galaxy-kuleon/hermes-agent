@@ -107,6 +107,17 @@ class AttachmentsLedgerTests(unittest.TestCase):
                 f'Call read_file("{entry["id"]}").',
             )
 
+    def test_docx_allows_authoritative_native_skill_route_without_double_read(self):
+        ledger = self._ledger_for_names(
+            ["contract.docx"],
+            "docx-native-routing",
+        )
+        entry = ledger["files"][0]
+        self.assertEqual(entry["read_with"], "read_file")
+        self.assertIn('read_file("F01") for ordinary text extraction', entry["read_instruction"])
+        self.assertIn("request-scoped DOCX", entry["read_instruction"])
+        self.assertIn("do not call both routes", entry["read_instruction"])
+
     def test_unknown_extension_follows_existing_non_binary_guard(self):
         ledger = self._ledger_for_names(
             ["evidence.future-format"],

@@ -8618,6 +8618,18 @@ def run_conversation(
                         "✓ 香港法律答案已由已驗證官方法源產生安全版本"
                     )
 
+                if (
+                    _hk_legal_decision
+                    and _hk_legal_decision.action in {"fail", "replace"}
+                    and final_response
+                ):
+                    # The gate synthesizes this terminal reply after the model
+                    # stream has ended. Earlier progress text makes the
+                    # gateway's empty-stream bridge ineligible, so explicitly
+                    # project the authoritative replacement to streaming
+                    # clients as well as persisting/returning it.
+                    _deliver_verbatim_terminal_reply(agent, final_response)
+
                 # A successful export already returned canonical signed links.
                 # Do not ask a language model to remember or reconstruct them:
                 # append missing links deterministically at the response

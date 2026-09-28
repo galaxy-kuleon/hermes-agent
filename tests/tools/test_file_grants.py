@@ -748,3 +748,156 @@ def test_missing_capability_key_does_not_trip_socv2_breaker(monkeypatch, tmp_pat
         assert json.loads(ordinary_handler({}))["result"] == "ok"
 
     session.call_tool.assert_awaited_once()
+
+
+@pytest.mark.parametrize("tool_name", ["inspect", "apply", "verify", "publish"])
+def test_ungranted_legal_docx_handle_is_denied_before_mcp_io(tmp_path, tool_name):
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    allowed = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-1" / "allowed.docx"
+    handler = _make_tool_handler("legal_docx", tool_name, 30)
+    fake_server = SimpleNamespace(session=object())
+
+    with _file_grant_scope("task-1", [str(allowed)]), patch.dict(
+        _servers,
+        {"legal_docx": fake_server},
+    ), patch(
+        "tools.mcp_tool._run_on_mcp_loop",
+        side_effect=AssertionError("authorization must run before MCP I/O"),
+    ):
+        result = json.loads(
+            handler(
+                {"source_file_id": "F02"},
+                task_id="task-1",
+            )
+        )
+
+    assert result["success"] is False
+    assert "not granted" in result["error"].lower()
+
+
+def test_legal_docx_rejects_model_authored_path_before_mcp_io(tmp_path):
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    allowed = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-1" / "allowed.docx"
+    denied = tmp_path / "handoff" / "user" / "user-2" / "chat" / "chat-2" / "private.docx"
+    handler = _make_tool_handler("legal_docx", "inspect", 30)
+    fake_server = SimpleNamespace(session=object())
+
+    with _file_grant_scope("task-1", [str(allowed)]), patch.dict(
+        _servers,
+        {"legal_docx": fake_server},
+    ), patch(
+        "tools.mcp_tool._run_on_mcp_loop",
+        side_effect=AssertionError("authorization must run before MCP I/O"),
+    ):
+        result = json.loads(
+            handler(
+                {"source_file_id": str(denied)},
+                task_id="task-1",
+            )
+        )
+
+    assert result["success"] is False
+    assert "not granted" in result["error"].lower()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "extra_args", "settles_coverage"),
+    [
+        ("inspect", {}, True),
+        (
+            "apply",
+            {
+                "source_sha256": "a" * 64,
+                "inspection_id": "b" * 32,
+                "manifest": {"schema": "legal.docx-change-manifest.v1"},
+            },
+            False,
+        ),
+        ("verify", {"output_artifact_id": "c" * 32}, False),
+        (
+            "publish",
+            {"output_artifact_id": "c" * 32, "filename_stem": "review-draft"},
+            False,
+        ),
+    ],
+)
+def test_granted_legal_docx_handle_uses_hidden_capability_metadata(
+    monkeypatch,
+    tmp_path,
+    tool_name,
+    extra_args,
+    settles_coverage,
+):
+    from tools.attachment_ledger import attachment_ledger_scope, coverage_snapshot
+    from tools.file_grants import _CAPABILITY_META_KEY, file_grant_scope
+    from tools.mcp_tool import _make_tool_handler, _servers
+
+    class AsyncLock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    granted = tmp_path / "handoff" / "user" / "user-1" / "chat" / "chat-1" / "allowed.docx"
+    session = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(text='{"ok":true}')],
+                isError=False,
+            )
+        )
+    )
+    fake_server = SimpleNamespace(
+        session=session,
+        _rpc_lock=AsyncLock(),
+        _pending_call_context=None,
+    )
+    handler = _make_tool_handler("legal_docx", tool_name, 30)
+    monkeypatch.setenv("HERMES_FILE_CAPABILITY_KEY", "test-capability-secret")
+
+    def run_locally(coro_or_factory, timeout=30):
+        del timeout
+        coroutine = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coroutine)
+
+    with file_grant_scope(
+        "task-1",
+        [str(granted)],
+        handles={"F01": str(granted)},
+    ), attachment_ledger_scope("task-1"), patch.dict(
+        _servers,
+        {"legal_docx": fake_server},
+    ), patch("tools.mcp_tool._run_on_mcp_loop", side_effect=run_locally):
+        result = handler(
+            {
+                "source_file_id": "F01",
+                **extra_args,
+                _CAPABILITY_META_KEY: "model-forged-token",
+                "_meta": {"model": "forged"},
+            },
+            task_id="task-1",
+        )
+        coverage = coverage_snapshot(
+            [("F01", str(granted))],
+            task_id="task-1",
+        )
+
+    assert str(granted) not in result
+    call = session.call_tool.await_args
+    assert call.kwargs["arguments"] == {"source_file_id": "F01", **extra_args}
+    capability = call.kwargs["meta"][_CAPABILITY_META_KEY]
+    assert capability != "model-forged-token"
+    assert capability not in result
+    encoded_payload = capability.split(".", 1)[0]
+    encoded_payload += "=" * (-len(encoded_payload) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded_payload))
+    assert payload["path"] == str(granted.resolve())
+    assert payload["op"] == f"legal_docx.{tool_name}"
+    assert coverage["complete"] is settles_coverage
+    if settles_coverage:
+        assert coverage["read"][0]["reader"] == "mcp__legal_docx__inspect"
+    else:
+        assert coverage["pending"][0]["id"] == "F01"

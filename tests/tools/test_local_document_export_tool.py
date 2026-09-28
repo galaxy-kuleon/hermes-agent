@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -199,3 +200,130 @@ def test_validation_rejects_fake_docx_and_pdf():
         tool.validate_docx_bytes(b"not-a-zip")
     with pytest.raises(ValueError):
         tool.validate_pdf_bytes(b"%PDF")
+
+
+def test_download_resolver_enforces_signature_expiry_checksum_filename_and_owner(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LOCAL_EXPORT_DIR", str(tmp_path))
+    monkeypatch.setenv("LOCAL_EXPORT_ARTIFACT_SIGNING_KEY", "artifact-secret")
+    artifact_id = "a" * 32
+    user_id = "user-1"
+    chat_id = "chat-1"
+    owner_hash = tool.owner_hash_for_scope(user_id, chat_id)
+    artifact_dir = tmp_path / owner_hash / artifact_id
+    artifact_dir.mkdir(parents=True)
+    filename = "review-draft.docx"
+    data = _valid_docx_bytes()
+    sha256 = tool._sha256(data)
+    expires_at = tool._format_utc(tool._utc_now() + timedelta(hours=1))
+    signature = tool.build_artifact_signature(
+        key="artifact-secret",
+        version="v1",
+        user_id=user_id,
+        chat_id=chat_id,
+        artifact_id=artifact_id,
+        filename=filename,
+        sha256=sha256,
+        expires_at=expires_at,
+    )
+    entry = {
+        "format": "docx",
+        "filename": filename,
+        "size": len(data),
+        "sha256": sha256,
+        "expires_at": expires_at,
+        "signature": signature,
+        "url": "/api/hermes/example",
+    }
+    manifest = {
+        "artifact_id": artifact_id,
+        "created_at": tool._format_utc(tool._utc_now()),
+        "expires_at": expires_at,
+        "signature_version": "v1",
+        "owner": {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "owner_hash": owner_hash,
+            "platform": "api_server",
+            "session_id": "",
+        },
+        "source_docx_sha256": sha256,
+        "legal_verification_receipt_id": "b" * 32,
+        "artifacts": [entry],
+    }
+    file_path = artifact_dir / filename
+    manifest_path = artifact_dir / "manifest.json"
+    file_path.write_bytes(data)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    valid = tool.resolve_local_export_download(
+        artifact_id=artifact_id,
+        filename=filename,
+        expires=expires_at,
+        sig=signature,
+    )
+    assert valid["ok"] is True
+    assert valid["path"] == file_path.resolve()
+
+    bad_signature = tool.resolve_local_export_download(
+        artifact_id=artifact_id,
+        filename=filename,
+        expires=expires_at,
+        sig="0" * 64,
+    )
+    assert bad_signature["status"] == 403
+
+    wrong_filename = tool.resolve_local_export_download(
+        artifact_id=artifact_id,
+        filename="other.docx",
+        expires=expires_at,
+        sig=signature,
+    )
+    assert wrong_filename["status"] == 404
+
+    manifest["owner"]["chat_id"] = "chat-2"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    wrong_owner = tool.resolve_local_export_download(
+        artifact_id=artifact_id,
+        filename=filename,
+        expires=expires_at,
+        sig=signature,
+    )
+    assert wrong_owner["status"] == 403
+    manifest["owner"]["chat_id"] = chat_id
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    file_path.write_bytes(data + b"tampered")
+    bad_checksum = tool.resolve_local_export_download(
+        artifact_id=artifact_id,
+        filename=filename,
+        expires=expires_at,
+        sig=signature,
+    )
+    assert bad_checksum["status"] == 403
+    file_path.write_bytes(data)
+
+    expired_at = tool._format_utc(tool._utc_now() - timedelta(seconds=1))
+    expired_signature = tool.build_artifact_signature(
+        key="artifact-secret",
+        version="v1",
+        user_id=user_id,
+        chat_id=chat_id,
+        artifact_id=artifact_id,
+        filename=filename,
+        sha256=sha256,
+        expires_at=expired_at,
+    )
+    manifest["expires_at"] = expired_at
+    manifest["artifacts"][0]["expires_at"] = expired_at
+    manifest["artifacts"][0]["signature"] = expired_signature
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    expired = tool.resolve_local_export_download(
+        artifact_id=artifact_id,
+        filename=filename,
+        expires=expired_at,
+        sig=expired_signature,
+    )
+    assert expired["status"] == 410

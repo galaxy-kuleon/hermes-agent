@@ -124,6 +124,15 @@ if [ -n "${HERMES_GID:-}" ] && validate_uid_gid "$HERMES_GID" && [ "$HERMES_GID"
     groupmod -o -g "$HERMES_GID" hermes 2>/dev/null || true
 fi
 
+# The handoff export store is shared with narrowly scoped publisher services.
+# Own it by the remapped Hermes runtime identity, make that group writable,
+# and preserve the group on child directories without granting world access.
+if [ -d "/handoff" ]; then
+    mkdir -p /handoff/exports
+    chown hermes:hermes /handoff/exports
+    chmod 2770 /handoff/exports
+fi
+
 # Keep libc/passwd home lookup aligned with HOME. HERMES_HOME may later be
 # profile-scoped, while agent tools use their own workspace/cwd contract.
 current_container_home="$(getent passwd hermes | cut -d: -f6)"

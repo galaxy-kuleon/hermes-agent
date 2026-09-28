@@ -168,6 +168,16 @@ def test_skill_application_is_read_only_without_explicit_mutation_intent():
     assert has_explicit_skill_mutation_intent(
         "請更新 tw-tmcc 技能並加入這條規則。"
     )
+    assert has_explicit_skill_mutation_intent(
+        "skill 還需要一些調整，請補上 replace 規則。"
+    )
+    assert not has_explicit_skill_mutation_intent(
+        "請使用共用 skill `legal-docx-template-customizer` 處理範本，"
+        "並進行以下修改：替換客戶名稱。"
+    )
+    assert not has_explicit_skill_mutation_intent(
+        "Use the shared skill to modify this document and publish the draft."
+    )
 
 
 def test_skill_attachment_import_and_sharing_are_explicit_mutation_intent():

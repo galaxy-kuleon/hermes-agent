@@ -138,6 +138,25 @@ def test_handoff_context_delegates_routing_to_shared_reader_policy(
     assert "Call sentinel_reader(F01)." in out
 
 
+def test_handoff_context_preserves_docx_native_skill_routing_choice(
+    monkeypatch,
+    tmp_path,
+):
+    original = _prepare_handoff(monkeypatch, tmp_path).with_name("contract.docx")
+    original.write_bytes(b"docx fixture")
+    sig = api_server._sign_handoff_entry("user-1", "chat-1", str(original))
+
+    out = api_server._build_handoff_context(
+        [{"original": str(original), "sig": sig}],
+        _scope(),
+    )
+
+    assert 'read_with="read_file"' in out
+    assert "for ordinary text extraction" in out
+    assert "request-scoped DOCX inspection or editing service" in out
+    assert "do not call both routes" in out
+
+
 def test_handoff_context_preserves_validated_file_id_and_sha256_metadata(monkeypatch, tmp_path):
     original = _prepare_handoff(monkeypatch, tmp_path)
     sha256 = "83c00fb2636ab7323daef872ba0c786f57e833b44361abde31befa08d623829d"

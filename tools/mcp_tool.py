@@ -5794,6 +5794,26 @@ def _normalize_socv2_submit_args(args: dict) -> tuple[dict, str | None]:
     return normalized, None
 
 
+def _legal_docx_inspection_succeeded(result: str) -> bool:
+    """Return whether a wrapped legal-docx MCP result is an explicit success."""
+    try:
+        envelope = json.loads(result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(envelope, dict) or "error" in envelope:
+        return False
+    candidates = [envelope.get("result"), envelope.get("structuredContent")]
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if isinstance(candidate, dict) and candidate.get("ok") is True:
+            return True
+    return False
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -5817,6 +5837,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 )
 
         capability_request = None
+        legal_docx_coverage = None
         # These soc_v2 tools carry no owui user header on this channel, so the
         # server derives whose data is in play from a capability-signed path.
         # list_conversions is read-only and joins the two mutations here for the
@@ -5871,6 +5892,37 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # path that names no user, which is the one thing the signature
                 # exists to prevent.
                 args.pop("path", None)
+
+        # The legal DOCX service never accepts a model-authored local path.
+        # Its public schema carries only the request-local Fxx handle; Hermes
+        # resolves that handle inside the active file-grant scope and places
+        # the canonical path exclusively in short-lived MCP metadata. The
+        # service decodes the capability after transport and never returns the
+        # path to the model.
+        if server_name == "legal_docx" and tool_name in {"inspect", "apply", "verify", "publish"}:
+            from tools.file_grants import (
+                _CAPABILITY_META_KEY,
+                resolve_file_grant,
+            )
+
+            task_id = kwargs.get("task_id") or "default"
+            source_file_id = str(args.get("source_file_id") or "")
+            canonical_path, grant_denial = resolve_file_grant(
+                source_file_id,
+                task_id=task_id,
+                operation=f"legal_docx.{tool_name}",
+            )
+            if grant_denial:
+                return json.dumps(
+                    {"error": grant_denial, "success": False},
+                    ensure_ascii=False,
+                )
+            args = dict(args)
+            args.pop(_CAPABILITY_META_KEY, None)
+            args.pop("_meta", None)
+            capability_request = (canonical_path, f"legal_docx.{tool_name}")
+            if tool_name == "inspect":
+                legal_docx_coverage = (canonical_path, task_id, source_file_id.upper())
 
         # Skill ACL (#13 code-exec extension): block a locally-launched code-exec
         # MCP server (e.g. opencode_runner) from operating under a protected
@@ -6121,6 +6173,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
                 _reset_server_error(server_name)  # non-JSON = success
+            if legal_docx_coverage and _legal_docx_inspection_succeeded(result):
+                from tools.attachment_ledger import OUTCOME_READ, record_outcome
+
+                coverage_path, coverage_task_id, coverage_handle = legal_docx_coverage
+                record_outcome(
+                    coverage_path,
+                    task_id=coverage_task_id,
+                    status=OUTCOME_READ,
+                    reason="complete request-scoped DOCX structural inspection",
+                    handle=coverage_handle,
+                    reader="mcp__legal_docx__inspect",
+                )
             return result
         except _LocalMCPConfigurationError as exc:
             return json.dumps(
