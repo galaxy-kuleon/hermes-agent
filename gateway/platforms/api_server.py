@@ -2819,6 +2819,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._openwebui_bridge_service = None
         self._dreaming_scheduler_task = None
         self._session_activity_lock = threading.Lock()
+        self._commit_inflight = set()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")))
         self._model_name: str = self._resolve_model_name(
@@ -6549,15 +6550,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Drop entries past TTL — across many restarts this dict could
         # otherwise grow unbounded.
         now = time.time()
+        from plugins.memory.openviking.commit_state import pending_path
         kept = {
             sid: info for sid, info in loaded.items()
             if isinstance(info, dict)
-            and now - float(info.get("last_seen", 0) or 0) < self.SESSION_ACTIVITY_TTL_S
+            and (not info.get("committed") or pending_path(path.parent, sid).exists()
+                 or now - float(info.get("last_seen", 0) or 0) < self.SESSION_ACTIVITY_TTL_S)
         }
         with self._session_activity_lock:
             for sid, info in kept.items():
                 # Don't clobber any record the running process already
                 # has (defensive — load is called once at startup).
+                from plugins.memory.openviking.commit_state import pending_path, read_pending
+                if pending_path(path.parent, sid).exists() and read_pending(path.parent, sid).get("status") != "completed":
+                    info["committed"] = False
                 self._session_activity.setdefault(sid, info)
         logger.info(
             "[api_server] reloaded %d session activity records "
@@ -6594,9 +6600,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 continue
             if info.get("chat_id") == chat_id:
                 continue
-            # Mark committed up-front so the periodic watcher doesn't
-            # also fire its own commit before this in-flight task lands.
-            info["committed"] = True
             if loop is not None:
                 loop.create_task(self._commit_session_async(sid, info.get("user_id", "")))
                 logger.info(
@@ -6693,66 +6696,47 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
 
     def _commit_openviking_session_sync(self, session_id: str, user_id: str) -> bool:
-        """Direct POST to OpenViking /api/v1/sessions/{id}/commit.
-
-        Bypasses AIAgent so we don't pay the full agent-init cost just to
-        run a single HTTP POST.  Returns True on a 2xx response, False on
-        any failure (logged at WARN; non-fatal for the watcher loop).
-        """
-        endpoint = (os.environ.get("OPENVIKING_ENDPOINT", "") or "").rstrip("/")
-        if not endpoint:
+        if not user_id:
             return False
         try:
-            import httpx
-        except ImportError:
-            logger.debug("[api_server] httpx unavailable; cannot commit OpenViking session")
-            return False
-        api_key = os.environ.get("OPENVIKING_API_KEY", "")
-        account = os.environ.get("OPENVIKING_ACCOUNT", "default")
-        agent = os.environ.get("OPENVIKING_AGENT", "hermes")
-        viking_user = user_id or os.environ.get("OPENVIKING_USER", "default")
-        headers = {
-            "Content-Type": "application/json",
-            "X-OpenViking-Account": account,
-            "X-OpenViking-User": viking_user,
-            "X-OpenViking-Agent": agent,
-        }
-        if api_key:
-            headers["X-API-Key"] = api_key
-        url = f"{endpoint}/api/v1/sessions/{session_id}/commit"
-        try:
-            from plugins.memory.openviking import hermes_session_commit_payload
-
-            with httpx.Client(timeout=60.0) as client:
-                resp = client.post(
-                    url,
-                    headers=headers,
-                    json=hermes_session_commit_payload(),
-                )
-                if resp.status_code == 404:
-                    # Session never reached OpenViking (no sync_turn fired).
-                    # Not an error — just nothing to commit.
-                    logger.debug(
-                        "[api_server] OpenViking session %s has no messages; skipping commit",
-                        session_id,
-                    )
-                    return False
-                resp.raise_for_status()
-            return True
+            from plugins.memory.openviking import (
+                _VikingClient, _resolve_connection_settings, _load_hermes_openviking_config,
+                hermes_session_commit_payload)
+            from plugins.memory.openviking.commit_state import commit_step
+            settings = _resolve_connection_settings(_load_hermes_openviking_config())
+            client = _VikingClient(settings["endpoint"], settings["api_key"],
+                                  account=settings["account"], user=user_id, agent=settings["agent"],
+                                  use_request_identity=False)
+            return commit_step(self._session_activity_file().parent, client, session_id,
+                               hermes_session_commit_payload())
         except Exception as exc:
-            logger.warning(
-                "[api_server] OpenViking commit failed for session %s: %s",
-                session_id, exc,
-            )
+            logger.warning("[api_server] memory commit remains pending session=%s user=%s error=%s",
+                           session_id, user_id, exc)
             return False
 
 
     async def _commit_session_async(self, session_id: str, user_id: str) -> bool:
-        """Run _commit_openviking_session_sync in the default executor."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, self._commit_openviking_session_sync, session_id, user_id
-        )
+        if session_id in self._commit_inflight:
+            return False
+        self._commit_inflight.add(session_id)
+        info = self._session_activity.get(session_id)
+        last_seen = (info or {}).get("last_seen")
+        try:
+            loop = asyncio.get_running_loop()
+            context = contextvars.copy_context()
+            complete = await loop.run_in_executor(None, lambda: context.run(
+                self._commit_openviking_session_sync, session_id, user_id))
+            if info is not None:
+                from plugins.memory.openviking.commit_state import read_pending
+                record = read_pending(self._session_activity_file().parent, session_id)
+                info.update(commit_status=record.get("status", "pending"),
+                            commit_task_id=record.get("task_id"), commit_error=record.get("last_error"))
+                if info.get("last_seen") == last_seen:
+                    info["committed"] = complete
+                self._persist_session_activity()
+            return complete
+        finally:
+            self._commit_inflight.discard(session_id)
 
 
     async def _session_idle_watcher(self) -> None:
@@ -6770,17 +6754,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # GC very old sessions so the dict doesn't grow unbounded
                 gc_keys = [
                     sid for sid, info in snapshot
-                    if now - info.get("last_seen", now) >= self.SESSION_ACTIVITY_TTL_S
+                    if info.get("committed") and now - info.get("last_seen", now) >= self.SESSION_ACTIVITY_TTL_S
                 ]
                 for sid in gc_keys:
                     self._session_activity.pop(sid, None)
 
                 for sid, info in stale:
                     ok = await self._commit_session_async(sid, info.get("user_id", ""))
-                    # Mark committed even on False so we don't retry forever
-                    # for sessions OpenViking doesn't know about.  A new chat
-                    # turn will reset this via _touch_session_activity.
-                    info["committed"] = True
                     if ok:
                         logger.info(
                             "[api_server] auto-committed idle session %s (user=%s, chat=%s)",
@@ -6812,31 +6792,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _missing_user_id_error()
 
         session_id = request.match_info["session_id"]
-        # Ownership: session_id must contain "-user-{caller}".  Returning 404
-        # rather than 403 to avoid revealing whether the session exists.
-        if f"-user-{scope['user_id']}" not in session_id:
-            return web.json_response(
-                _openai_error(f"Session not found: {session_id}"), status=404,
-            )
-
         info = self._session_activity.get(session_id)
-        user_id_for_commit = (info or {}).get("user_id") or scope["user_id"]
-
-        ok = await self._commit_session_async(session_id, user_id_for_commit)
-        if info is not None:
-            info["committed"] = True
-            # P0: persist the flip so a restart doesn't double-commit
-            # this session.
-            self._persist_session_activity()
+        if not info or info.get("user_id") != scope["user_id"]:
+            return web.json_response(_openai_error("Session not found"), status=404)
+        ok = await self._commit_session_async(session_id, scope["user_id"])
         if not ok:
-            return web.json_response(
-                _openai_error(
-                    f"Commit failed for session {session_id} "
-                    "(session may not have any messages in OpenViking yet)",
-                    err_type="server_error",
-                ),
-                status=502,
-            )
+            return web.json_response({"id": session_id, "object": "session.end",
+                                      "committed": False, "status": info.get("commit_status", "pending"),
+                                      "error": info.get("commit_error")}, status=202)
 
         return web.json_response({
             "id": session_id,

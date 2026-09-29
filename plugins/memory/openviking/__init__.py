@@ -42,7 +42,7 @@ from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
-from utils import atomic_json_write, env_var_enabled
+from utils import env_var_enabled
 
 try:
     import fcntl
@@ -337,7 +337,8 @@ class _VikingClient:
     """Thin HTTP client for the OpenViking REST API (httpx, no SDK dependency)."""
 
     def __init__(self, endpoint: str, api_key: str = "",
-                 account: Optional[str] = None, user: Optional[str] = None, agent: Optional[str] = None):
+                 account: Optional[str] = None, user: Optional[str] = None, agent: Optional[str] = None,
+                 use_request_identity: bool = True):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         # Account/user are local/trusted-mode tenant identity. API-key requests
@@ -347,6 +348,7 @@ class _VikingClient:
         self._account = account or get_secret("OPENVIKING_ACCOUNT", "") or "default"
         self._user = user or get_secret("OPENVIKING_USER", "") or "default"
         self._agent = agent if agent is not None else (get_secret("OPENVIKING_AGENT", "") or _DEFAULT_AGENT)
+        self._use_request_identity = use_request_identity
         self._httpx = _get_httpx()
         if self._httpx is None:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
@@ -354,7 +356,7 @@ class _VikingClient:
     def _headers(self, *, include_tenant: bool | None = None) -> dict:
         if include_tenant is None:
             include_tenant = True
-        effective_user = _request_user_id() or self._user
+        effective_user = (_request_user_id() if self._use_request_identity else "") or self._user
         headers = {"Content-Type": "application/json", "User-Agent": _OPENVIKING_USER_AGENT}
         if self._agent:
             headers["X-OpenViking-Actor-Peer"] = self._agent
@@ -1331,21 +1333,21 @@ class _TurnUpload:
         client.post(f"/api/v1/sessions/{self.sid}/messages/batch",
                     {"messages": [{"role": "user", "parts": [{"type": "text", "text": self.user_content[:4000]}]}, assistant_message]})
 
-    def run(self) -> None:
+    def run(self) -> bool:
         try:
             self.post(self.provider._new_client())
-            return
+            return True
         except Exception as e:
             logger.debug("OpenViking sync_turn failed, reconnecting: %s", e)
         retry_client = None
         try:
             retry_client = self.provider._new_client()
             self.post(retry_client)
-            return
+            return True
         except Exception as retry_error:
             if retry_client is None or self.next_index >= len(self.batch_messages):
                 logger.warning("OpenViking sync_turn failed: %s", retry_error)
-                return
+                return False
             logger.warning("OpenViking structured sync retry failed; writing %d remaining messages individually: %s",
                            len(self.batch_messages) - self.next_index, retry_error)
         try:
@@ -1356,6 +1358,8 @@ class _TurnUpload:
                 self.next_index += 1
         except Exception as fallback_error:
             logger.warning("OpenViking sync_turn failed during individual-message fallback: %s", fallback_error)
+            return False
+        return True
 
 
 class OpenVikingMemoryProvider(MemoryProvider):
@@ -2253,15 +2257,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if not sid:
                 return
             self._turn_count += 1
-        self._mark_session_pending(sid)
+        generation = self._mark_session_pending(sid)
         upload = _TurnUpload(self, sid, batch_messages, user_content, assistant_content)
+
+        def upload_and_record():
+            from plugins.memory.openviking.commit_state import finish_upload
+            success = upload.run()
+            if generation is not None:
+                finish_upload(self._hermes_home, sid, self._commit_identity(), generation, success)
 
         def drop_empty() -> None:
             if not self._inflight_writers.get(sid):
                 self._inflight_writers.pop(sid, None)
 
         # Tracked in _inflight_writers[sid] so commits can drain every writer for that sid.
-        self._spawn_tracked("openviking-sync", upload.run, self._inflight_lock, lambda: self._inflight_writers.setdefault(sid, set()),
+        self._spawn_tracked("openviking-sync", upload_and_record, self._inflight_lock, lambda: self._inflight_writers.setdefault(sid, set()),
                             after_discard=drop_empty)
 
     # -- tracked worker threads ---------------------------------------------
@@ -2416,8 +2426,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 logger.debug("Skipping OpenViking pending-session recovery for owner %s; could not check run lock %s: %s", owner_run_id, path, e)
             return False, None
 
-    def _mark_session_pending(self, sid: str) -> None:
-        if not sid or self._has_committed_session(sid) or sid in self._pending_marked_sids:
+    def _commit_identity(self):
+        return {"endpoint": self._endpoint, "account": self._account,
+                "user_id": self._user_override or self._user, "actor_peer_id": self._agent}
+
+    def _commit_client(self, identity=None):
+        identity = identity or self._commit_identity()
+        if identity["endpoint"] != self._endpoint or identity["account"] != self._account:
+            raise PermissionError("OpenViking recovery connection identity changed")
+        return _VikingClient(self._endpoint, self._api_key, account=identity["account"],
+                             user=identity["user_id"], agent=identity["actor_peer_id"],
+                             use_request_identity=False)
+
+    def _mark_session_pending(self, sid: str):
+        if not sid:
             return
         path = self._state_path("pending", sid)
         if path is None:
@@ -2426,28 +2448,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.debug("Could not safely mark OpenViking session %s pending without a run lock", sid)
             return
         try:
-            from hermes_constants import mkdir_under_hermes_home
-            mkdir_under_hermes_home(path.parent)
-            atomic_json_write(path, {"session_id": sid, "owner_run_id": self._run_id}, mode=0o600)
+            from plugins.memory.openviking.commit_state import mark_pending
+            generation = mark_pending(self._hermes_home, sid, self._commit_identity(), self._run_id)
+            self._mark_session_committed(sid, committed=False)
             self._pending_marked_sids.add(sid)
+            return generation
         except Exception as e:
             logger.debug("Could not mark OpenViking session %s pending: %s", sid, e)
 
-    def _clear_pending_session(self, sid: str) -> None:
-        self._pending_marked_sids.discard(sid)
-        path = self._state_path("pending", sid)
-        try:
-            if path is not None:
-                path.unlink(missing_ok=True)
-        except Exception as e:
-            logger.debug("Could not clear OpenViking pending session %s: %s", sid, e)
-
-    def _pending_sessions(self) -> List[tuple[str, str]]:
+    def _pending_sessions(self) -> list:
         """(sid, owner_run_id) for every marker file; sid falls back to the file name."""
         directory = Path(self._hermes_home) / _PENDING_SESSIONS_RELATIVE_DIR if self._hermes_home else None
         if directory is None or not directory.is_dir():
             return []
-        sessions: List[tuple[str, str]] = []
+        sessions = []
         for path in sorted(directory.glob("*.json")):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
@@ -2455,8 +2469,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 raw = None
             raw = raw if isinstance(raw, dict) else {}
             sid = str(raw.get("session_id") or "").strip() or unquote(path.stem).strip()
-            if sid:
-                sessions.append((sid, str(raw.get("owner_run_id") or "").strip()))
+            if not sid or raw.get("status") == "completed":
+                continue
+            identity = raw.get("identity")
+            if not identity:
+                from plugins.memory.openviking.commit_state import trusted_owner
+                user = trusted_owner(self._hermes_home, sid)
+                if not user:
+                    logger.warning("OpenViking recovery deferred: unresolved owner session=%s", sid)
+                    continue
+                identity = {**self._commit_identity(), "user_id": user}
+            if identity.get("account") == self._account and identity.get("endpoint") == self._endpoint:
+                sessions.append((sid, str(raw.get("owner_run_id") or "").strip(), identity))
         return sessions
 
     def _claim_deferred_sid(self, sid: str, *, release: bool = False) -> bool:
@@ -2474,9 +2498,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """Commit sessions left pending by dead runs, one thread per former owner."""
         if not self._client:
             return
-        pending_by_owner: Dict[str, List[str]] = {}
-        for sid, owner_run_id in self._pending_sessions():
-            pending_by_owner.setdefault(owner_run_id, []).append(sid)
+        pending_by_owner = {}
+        for sid, owner_run_id, identity in self._pending_sessions():
+            pending_by_owner.setdefault(owner_run_id, []).append((sid, identity))
 
         for owner_run_id, sids in pending_by_owner.items():
             recoverable, owner_lock_file = self._claim_owner_run_for_recovery(owner_run_id)
@@ -2485,14 +2509,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
             def _recover_owner(pending_sids=tuple(sids), owner=owner_run_id, lock_file=owner_lock_file) -> None:
                 try:
-                    for pending_sid in pending_sids:
+                    for pending_sid, identity in pending_sids:
                         if not self._claim_deferred_sid(pending_sid):
                             continue
                         try:
-                            if self._has_committed_session(pending_sid):
-                                self._clear_pending_session(pending_sid)
-                            elif not self._shutting_down:
-                                self._commit_session(pending_sid, 0, context="during startup recovery", clear_missing=True)
+                            if not self._shutting_down:
+                                self._commit_session(pending_sid, 0, context="during startup recovery", identity=identity)
                         finally:
                             self._claim_deferred_sid(pending_sid, release=True)
                 finally:
@@ -2513,19 +2535,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception:
             return False
 
-    def _commit_session(self, sid: str, turn_count: int, *, context: str, clear_missing: bool = False) -> bool:
+    def _commit_session(self, sid: str, turn_count: int, *, context: str, clear_missing: bool = False, identity=None) -> bool:
         try:
-            self._client.post(f"/api/v1/sessions/{sid}/commit", hermes_session_commit_payload())
-            self._mark_session_committed(sid)
-            self._clear_pending_session(sid)
-            logger.info("OpenViking session %s committed %s (%d turns)", sid, context, turn_count)
-            return True
+            from plugins.memory.openviking.commit_state import commit_step
+            complete = commit_step(self._hermes_home, self._commit_client(identity), sid, hermes_session_commit_payload())
+            if complete:
+                self._mark_session_committed(sid)
+                logger.info("OpenViking extraction complete session=%s context=%s turns=%d", sid, context, turn_count)
+            return complete
         except Exception as e:
-            if clear_missing and _status_code_from_error(e) == 404:
-                self._clear_pending_session(sid)
-                logger.debug("OpenViking pending session %s no longer exists; dropped marker", sid)
-            else:
-                logger.warning("OpenViking session commit failed for %s: %s", sid, e)
+            logger.warning("OpenViking session commit pending for %s: %s", sid, e)
             return False
 
     def _finalize_session_async(self, sid: str, turn_count: int, *, context: str) -> None:
@@ -2994,6 +3013,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
         payload: Dict[str, Any] = {
             key: args[key] for key in ("reason", "to", "parent", "instruction", "wait", "timeout") if key in args and args[key] not in {None, ""}
         }
+        private_root = f"viking://user/{self._user_space()}/resources"
+        for key in ("to", "parent"):
+            if key in payload and not (
+                payload[key] == private_root or str(payload[key]).startswith(private_root + "/")
+            ):
+                return tool_error("Resource ingestion must target your own private resource namespace.")
+        if not payload.get("to") and not payload.get("parent"):
+            payload["parent"] = private_root
 
         parsed_url = urlparse(url)
         source_path = None

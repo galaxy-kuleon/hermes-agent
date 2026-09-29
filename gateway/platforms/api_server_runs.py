@@ -962,9 +962,24 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
-            agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+            from gateway.session_context import clear_session_vars
+            scope = run.scope or {}
+            tokens = self._bind_api_server_session(
+                chat_id=scope.get("chat_id", "") or run.session_id or "",
+                session_key=run.approval_session_key, session_id=run.session_id or "",
+                profile=run.request_profile or "", user_id=scope.get("user_id", ""),
+                user_name=scope.get("user_name", ""), user_role=scope.get("user_role", ""),
+                user_groups=scope.get("user_groups", ""),
+                browser_control_principal=run.browser_control_principal,
+                browser_control_transport_family=run.browser_control_transport_family,
+                session_history_delivery="1" if run.session_history_delivery else "")
+            try:
+                agent = self._create_agent(
+                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                    interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+            finally:
+                if tokens:
+                    clear_session_vars(tokens)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         self._mark_session_run_started(run.session_id)
