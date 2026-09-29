@@ -933,11 +933,15 @@ class AIAgent(
         fire against stale context. See #15218.
         """
         if interrupted or not (self._memory_manager and final_response and original_user_message):
+            if self._memory_manager:
+                self._memory_manager.notify_turn_state(state="skipped", session_id=self.session_id or "",
+                                                      reason="interrupted" if interrupted else "no completed content")
             return
         # Flatten multimodal parts to text (newline-joined for memory).
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
         response_text = _summarize_user_message_for_log(final_response, sep="\n")
         if not (user_text and response_text):
+            self._memory_manager.notify_turn_state(state="skipped", session_id=self.session_id or "", reason="empty flattened content")
             return
         try:
             sync_kwargs = {"session_id": self.session_id or "", **({"messages": messages} if messages is not None else {})}

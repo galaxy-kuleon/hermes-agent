@@ -2,14 +2,17 @@ import fcntl
 import json
 import logging
 import time
+from contextvars import ContextVar
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 from utils import atomic_json_write
 
 
 logger = logging.getLogger(__name__)
+current_turn = ContextVar("openviking_commit_turn", default=None)
 
 
 def pending_path(home, sid):
@@ -60,11 +63,31 @@ def bind_owner(record, identity, home, sid):
     record.update(session_id=sid, identity=identity)
 
 
+def begin_turn(home, sid, identity, turn_id, *, bind_context=False):
+    if bind_context:
+        current_turn.set((sid, turn_id))
+    with locked_record(home, sid) as record:
+        bind_owner(record, identity, home, sid)
+        turns = record.setdefault("turns", {})
+        if turn_id not in turns:
+            generation = int(record.get("generation", 0)) + 1
+            record["generation"] = generation
+            turns[turn_id] = {"generation": generation, "state": "awaiting_upload"}
+            record.setdefault("uploads", {})[str(generation)] = "pending"
+            if record.get("status") in {None, "completed"}:
+                record["status"] = "pending"
+
+
 def mark_pending(home, sid, identity, owner_run_id):
     with locked_record(home, sid) as record:
         bind_owner(record, identity, home, sid)
-        generation = int(record.get("generation", 0)) + 1
-        record.update(generation=generation, owner_run_id=owner_run_id)
+        turn = current_turn.get()
+        turn_id = turn[1] if turn and turn[0] == sid else uuid4().hex
+        turns = record.setdefault("turns", {})
+        intent = turns.get(turn_id, {})
+        generation = intent.get("generation") if intent.get("state") in {"awaiting_upload", "queued"} else int(record.get("generation", 0)) + 1
+        turns[turn_id] = {"generation": generation, "state": "uploading"}
+        record.update(generation=max(int(record.get("generation", 0)), generation), owner_run_id=owner_run_id)
         record.setdefault("uploads", {})[str(generation)] = "pending"
         if record.get("status") in {None, "completed"}:
             record["status"] = "pending"
@@ -75,6 +98,40 @@ def finish_upload(home, sid, identity, generation, success):
     with locked_record(home, sid) as record:
         bind_owner(record, identity, home, sid)
         record.setdefault("uploads", {})[str(generation)] = "ready" if success else "failed"
+        for turn in record.get("turns", {}).values():
+            if turn.get("generation") == generation:
+                turn["state"] = "ready" if success else "failed"
+
+
+def turn_state(home, identity, state, reason=""):
+    turn = current_turn.get()
+    if not turn:
+        return
+    sid, turn_id = turn
+    with locked_record(home, sid) as record:
+        bind_owner(record, identity, home, sid)
+        intent = record.get("turns", {}).get(turn_id)
+        if not intent:
+            generation = int(record.get("generation", 0)) + 1
+            record["generation"] = generation
+            intent = {"generation": generation, "state": "awaiting_upload"}
+            record.setdefault("turns", {})[turn_id] = intent
+            record.setdefault("uploads", {})[str(generation)] = "pending"
+            if record.get("status") == "completed":
+                record["status"] = "pending"
+        if intent.get("state") != "awaiting_upload":
+            return
+        intent.update(state=state, reason=reason)
+        if state == "skipped":
+            record.setdefault("uploads", {})[str(intent["generation"])] = "ready"
+
+
+def rotate_turn(home, identity, sid):
+    previous = current_turn.get()
+    if not previous or previous[0] == sid:
+        return
+    turn_state(home, identity, "skipped", "execution continued in session " + sid)
+    begin_turn(home, sid, identity, previous[1], bind_context=True)
 
 
 def _result(response):

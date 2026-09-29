@@ -548,6 +548,11 @@ class MemoryManager:
         params = _signature_params(provider.sync_turn)
         return params is None or _has_var_kwargs(params) or keyword in params
 
+    def notify_turn_state(self, *, state, session_id="", reason=""):
+        self._each_provider("memory turn lifecycle update failed", lambda provider:
+                            getattr(provider, "on_turn_state", lambda **kwargs: None)(
+                                state=state, session_id=session_id, reason=reason), level=logging.WARNING)
+
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[List[Dict[str, Any]]] = None,
                  turn_author: Optional[Dict[str, Any]] = None) -> None:
@@ -560,7 +565,9 @@ class MemoryManager:
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content:
+            self.notify_turn_state(state="skipped", session_id=session_id, reason="empty cleaned input")
             return
+        self.notify_turn_state(state="queued", session_id=session_id)
         optional_kwargs = {"messages": messages, "turn_author": turn_author}
 
         def _sync(provider: MemoryProvider) -> None:

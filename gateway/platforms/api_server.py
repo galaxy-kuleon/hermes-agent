@@ -5705,6 +5705,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "chat_id": chat_id or session_id or "", "session_id": session_id or "",
                     "gateway_session_key": gateway_session_key or ""})
                 agent = None
+                self._begin_memory_turn(session_id or "", user_id or "")
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
@@ -5808,6 +5809,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         if bind_declared_conversation:
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
+                    self._finish_memory_turn(user_id or "")
                     try:
                         clear_session_vars(tokens)
                     finally:
@@ -6695,18 +6697,53 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._persist_session_activity()
 
 
+    def _begin_memory_turn(self, session_id, user_id):
+        if not session_id or not user_id:
+            return
+        info = self._session_activity.get(session_id)
+        if info is None:
+            return
+        turn_id = uuid.uuid4().hex
+        info.update(memory_turn_id=turn_id, committed=False, last_seen=time.time())
+        self._persist_session_activity()
+        try:
+            from plugins.memory.openviking.commit_state import begin_turn, client_identity
+            begin_turn(self._session_activity_file().parent, session_id,
+                       client_identity(self._memory_commit_client(user_id)), turn_id, bind_context=True)
+        except Exception as exc:
+            info["memory_tracking_error"] = str(exc)
+            logger.warning("[api_server] memory intent pending session=%s error=%s", session_id, exc)
+
+
+    def _finish_memory_turn(self, user_id):
+        if not user_id:
+            return
+        try:
+            from plugins.memory.openviking.commit_state import turn_state, client_identity
+            turn_state(self._session_activity_file().parent, client_identity(self._memory_commit_client(user_id)),
+                       "skipped", "execution ended without an external upload")
+        except Exception as exc:
+            logger.warning("[api_server] memory turn remains unresolved user=%s error=%s", user_id, exc)
+
+
+    def _memory_commit_client(self, user_id):
+        from plugins.memory.openviking import _VikingClient, _resolve_connection_settings, _load_hermes_openviking_config
+        settings = _resolve_connection_settings(_load_hermes_openviking_config())
+        return _VikingClient(settings["endpoint"], settings["api_key"],
+                             account=settings["account"], user=user_id, agent=settings["agent"],
+                             use_request_identity=False)
+
+
     def _commit_openviking_session_sync(self, session_id: str, user_id: str) -> bool:
         if not user_id:
             return False
         try:
-            from plugins.memory.openviking import (
-                _VikingClient, _resolve_connection_settings, _load_hermes_openviking_config,
-                hermes_session_commit_payload)
-            from plugins.memory.openviking.commit_state import commit_step
-            settings = _resolve_connection_settings(_load_hermes_openviking_config())
-            client = _VikingClient(settings["endpoint"], settings["api_key"],
-                                  account=settings["account"], user=user_id, agent=settings["agent"],
-                                  use_request_identity=False)
+            from plugins.memory.openviking import hermes_session_commit_payload
+            from plugins.memory.openviking.commit_state import begin_turn, client_identity, commit_step
+            client = self._memory_commit_client(user_id)
+            turn_id = self._session_activity.get(session_id, {}).get("memory_turn_id")
+            if turn_id:
+                begin_turn(self._session_activity_file().parent, session_id, client_identity(client), turn_id)
             return commit_step(self._session_activity_file().parent, client, session_id,
                                hermes_session_commit_payload())
         except Exception as exc:
@@ -6766,6 +6803,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             "[api_server] auto-committed idle session %s (user=%s, chat=%s)",
                             sid, info.get("user_id", ""), info.get("chat_id", ""),
                         )
+                scanned = {sid for sid, _ in stale}
+                directory = self._session_activity_file().parent / "openviking" / "pending_sessions"
+                for path in directory.glob("*.json"):
+                    try:
+                        record = json.loads(path.read_text())
+                        sid = record.get("session_id")
+                        owner = (record.get("identity") or {}).get("user_id")
+                        if (sid and owner and sid not in scanned and record.get("status") != "completed"
+                                and self._active_session_runs.get(sid, 0) == 0
+                                and now - path.stat().st_mtime >= self.IDLE_COMMIT_SECONDS):
+                            await self._commit_session_async(sid, owner)
+                    except Exception as exc:
+                        logger.warning("[api_server] pending memory recovery unavailable file=%s error=%s", path.name, exc)
                 # P0: persist after every scan iteration that mutated the
                 # table — saves both committed-flag flips and gc removals.
                 if stale or gc_keys:

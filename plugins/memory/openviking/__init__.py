@@ -2274,6 +2274,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._spawn_tracked("openviking-sync", upload_and_record, self._inflight_lock, lambda: self._inflight_writers.setdefault(sid, set()),
                             after_discard=drop_empty)
 
+    def on_turn_state(self, *, state, session_id="", reason=""):
+        from plugins.memory.openviking.commit_state import turn_state, rotate_turn
+        if state == "queued" and session_id:
+            rotate_turn(self._hermes_home, self._commit_identity(), session_id)
+        turn_state(self._hermes_home, self._commit_identity(), state, reason)
+
     # -- tracked worker threads ---------------------------------------------
 
     def _spawn_tracked(self, name: str, body: Callable[[], None], lock: threading.Lock, workers: Callable[[], Set[threading.Thread]],
@@ -2454,7 +2460,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._pending_marked_sids.add(sid)
             return generation
         except Exception as e:
-            logger.debug("Could not mark OpenViking session %s pending: %s", sid, e)
+            logger.error("OpenViking upload tracking failed; session remains uncommitted session=%s error=%s", sid, e)
 
     def _pending_sessions(self) -> list:
         """(sid, owner_run_id) for every marker file; sid falls back to the file name."""

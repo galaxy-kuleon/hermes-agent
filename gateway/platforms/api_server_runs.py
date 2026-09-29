@@ -806,6 +806,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 user_role=scope.get("user_role", ""), user_groups=scope.get("user_groups", ""))
             if session_tokens:
                 resets.append((session_tokens, clear_session_vars))
+            self._begin_memory_turn(session_id or "", scope.get("user_id", ""))
             export_token = set_trusted_export_context({"platform": "api_server", "user_id": scope.get("user_id", ""),
                 "chat_id": scope.get("chat_id", "") or session_id, "session_id": session_id,
                 "gateway_session_key": run.gateway_session_key or ""})
@@ -828,6 +829,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                     _api_server._seed_agent_attachment_coverage(agent, effective_task_id)
                     r = agent.run_conversation(**kwargs)
         finally:
+            self._finish_memory_turn(scope.get("user_id", ""))
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
             self._memory_sessions.checkin(agent)
