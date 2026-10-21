@@ -1467,12 +1467,12 @@ def _session_was_rotated_by_compression(session_db: Any, session_id: str) -> boo
 
 def _emit_compression_attempt_telemetry(
     agent: Any, *, started_at: float, commit_status: str, split_status: str, failure_class: str | None = None,
-    commit_started_at: float | None = None,
+    commit_started_at: float | None = None, telemetry_snapshot: dict[str, Any] | None = None,
 ) -> None:
     """Emit one content-free JSON log line for a compression attempt."""
     with _swallow('failed to emit compression attempt telemetry: %s'):
         compressor = agent.context_compressor
-        telemetry = getattr(compressor, "_last_compression_telemetry", None)
+        telemetry = telemetry_snapshot if isinstance(telemetry_snapshot, dict) else getattr(compressor, "_last_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             telemetry = {}
         payload = dict(telemetry)
@@ -4124,6 +4124,7 @@ def compress_context(
     try:
         # Capture the verdict before rotation callbacks: lifecycle hooks may reset
         # compressor fields on rebind; record only after the full boundary commits.
+        _compression_attempt_telemetry = copy.deepcopy(getattr(agent.context_compressor, "_last_compression_telemetry", None))
         _compression_made_progress, _compression_used_fallback, _compression_feasibility_skip = (
             bool(getattr(agent.context_compressor, name, False))
             for name in ("_last_compression_made_progress", "_last_summary_fallback_used", "_last_feasibility_skip")
@@ -4208,7 +4209,7 @@ def compress_context(
         _emit_compression_attempt_telemetry(
             agent, started_at=attempt.started_at, commit_status=lifecycle.commit_status, split_status=split_status,
             failure_class=("session_split_failed" if split_status in {"failed_not_indexed", "aborted"} else None),
-            commit_started_at=commit.commit_started_at,
+            commit_started_at=commit.commit_started_at, telemetry_snapshot=_compression_attempt_telemetry,
         )
         return compressed, new_system_prompt
     finally:
