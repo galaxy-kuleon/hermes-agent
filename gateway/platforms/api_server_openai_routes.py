@@ -460,7 +460,7 @@ class _ResponsesStream:
             self.result = result
             self.usage = agent_usage or self.usage
             agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-            if agent_final and not self.final_text_parts:
+            if agent_final and (not self.final_text_parts or result.get("final_response_unstreamed")):
                 await self.emit_text_delta(agent_final)
                 self.emitted_coverage_footer = result.get("coverage_footer") if isinstance(result, dict) else None
             if agent_final and not self.final_response_text:
@@ -1328,7 +1328,7 @@ class OpenAICompatRoutesMixin:
             # Only when nothing readable reached the wire: a turn that streamed
             # normally is untouched.
             try:
-                if not _wire["content"] and not presentation_muted:
+                if (not _wire["content"] or (result or {}).get("final_response_unstreamed")) and not presentation_muted:
                     _late = ((result or {}).get("final_response") or "").strip()
                     _late_is_final_response = True
                     # final_response is user-facing by convention, not by

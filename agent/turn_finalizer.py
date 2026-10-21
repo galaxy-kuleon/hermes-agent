@@ -742,6 +742,10 @@ def finalize_turn(
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "final_response_unstreamed": (
+            str(_turn_exit_reason).startswith("max_iterations_reached(")
+            and not getattr(agent, "_response_was_previewed", False)
+        ),
         "model": agent.model,
         # requested_model / served_model: proxy-reported deployment or Hermes' own fallback route.
         **result_model_fields(agent),

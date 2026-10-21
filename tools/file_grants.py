@@ -149,9 +149,11 @@ def list_file_handles(task_id: str) -> list[tuple[str, str]]:
     short ``F`` handle so models do not retype UUIDs.
     """
     aliases = (_ALIASES.get() or {}).get(str(task_id or "default")) or {}
+    granted = (_GRANTS.get() or {}).get(str(task_id or "default")) or frozenset()
     by_path: dict[str, list[str]] = {}
     for name, target in aliases.items():
-        by_path.setdefault(target, []).append(name)
+        if target in granted:
+            by_path.setdefault(target, []).append(name)
 
     representatives = []
     for target, names in by_path.items():
