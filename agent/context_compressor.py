@@ -3631,6 +3631,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     def _record_summary_input_coverage(self, coverage: Dict[str, int]) -> None:
         """Expose lean sampling coverage without including transcript content in telemetry."""
+        logger.info("Compression summary input coverage: %s", json.dumps(coverage, sort_keys=True, separators=(",", ":")))
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             return
