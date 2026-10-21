@@ -887,7 +887,8 @@ async def _run_analysis(
 
 async def vision_analyze_tool(
     image_url: str, user_prompt: str, model: str = None,
-    task_id: Optional[str] = None, region: Optional[list] = None) -> str:
+    task_id: Optional[str] = None, region: Optional[list] = None,
+    pdf_trace: Optional[Path] = None) -> str:
     """Describe an image (URL, local path, data: URL) with the auxiliary vision LLM. ``user_prompt``
     is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/."""
     task_id = task_id or "default"
@@ -915,6 +916,9 @@ async def vision_analyze_tool(
         logger.info("Processing image with vision model...")
         call_kwargs = _aux_call_kwargs(messages, model, 120.0)
         _load_auxiliary_client()
+        if pdf_trace is not None:
+            from tools.vision_tools_pdf import save_pdf_trace
+            await asyncio.to_thread(save_pdf_trace, pdf_trace, "auxiliary-request", call_kwargs)
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
@@ -925,6 +929,8 @@ async def vision_analyze_tool(
                 len(image_data_url) / (1024 * 1024), _RESIZE_TARGET_BYTES / (1024 * 1024))
             image_data_url = await _resize_prepared(prepared, _scale_info)
             messages[0]["content"][1]["image_url"]["url"] = image_data_url
+            if pdf_trace is not None:
+                await asyncio.to_thread(save_pdf_trace, pdf_trace, "auxiliary-size-retry", call_kwargs)
             response = await async_call_llm(**call_kwargs)
         analysis = await _call_vision_llm(
             call_kwargs, "Vision LLM returned empty content, retrying once", response)
@@ -976,7 +982,7 @@ VISION_ANALYZE_SCHEMA = {
         # Dieted (#95681): routing mechanics (native attach vs aux-model text fallback) removed — the route
         # is automatic and the native path's own tool result says "you can see it natively now"; the schema
         # doesn't need to predict plumbing.
-        "Load an image into the conversation so you can see it. Call it "
+        "Read an image or one explicitly selected page of a local PDF. Call it "
         "any time the user references an image — then answer from what "
         "you see."
     ),
@@ -985,11 +991,16 @@ VISION_ANALYZE_SCHEMA = {
         "properties": {
             "image_url": {
                 "type": "string",
-                "description": "Image URL (http/https), local file path, or data: URL to load."
+                "description": "Image URL (http/https), local image/PDF path, authorized file handle, or image data: URL."
             },
             "question": {
                 "type": "string",
                 "description": "Your question or request about the image."
+            },
+            "page_number": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Required for a local PDF: one-based page number. The result reports page_count; each call reads only this page."
             },
             "region": {
                 "type": "array",
@@ -1027,6 +1038,30 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     task_id = kw.get("task_id") or "default"
     from tools.file_grants import resolve_grant_alias
     image_url = resolve_grant_alias(image_url, task_id=task_id)
+    parsed = urlparse(image_url)
+    local_pdf = parsed.scheme.lower() in {"", "file"} and Path(parsed.path).suffix.lower() == ".pdf"
+    if local_pdf:
+        acl_denial = _acl_local_vision_path_block(image_url, task_id)
+        if acl_denial:
+            return tool_error(acl_denial, success=False)
+        from tools.vision_tools_pdf import render_pdf_page, save_pdf_trace
+        try:
+            rendered = await asyncio.to_thread(render_pdf_page, parsed.path, args.get("page_number"))
+        except Exception as error:
+            return tool_error(str(error), success=False)
+        data = await asyncio.to_thread(rendered["image"].read_bytes)
+        data_url = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+        model = _configured_aux_model(("vision",), ("AUXILIARY_VISION_MODEL",))
+        prompt = f"Read PDF page {args['page_number']} of {rendered['source_page']['page_count']}.\n{question}"
+        result = await vision_analyze_tool(data_url, prompt, model, task_id=task_id,
+                                           region=region, pdf_trace=rendered["directory"])
+        payload = json.loads(result)
+        payload["source_page"] = rendered["source_page"]
+        await asyncio.to_thread(save_pdf_trace, rendered["directory"], "result", payload)
+        logger.info("PDF vision page result render_id=%s page=%s/%s success=%s",
+                    rendered["source_page"]["render_id"], args["page_number"],
+                    rendered["source_page"]["page_count"], payload.get("success"))
+        return json.dumps(payload, ensure_ascii=False)
     # No concurrency gate around the whole analysis — the CPU burst is bounded inside the
     # encode/resize step, so multi-image fan-out keeps full request concurrency.
     if _should_use_native_vision_fast_path():
