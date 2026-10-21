@@ -2713,8 +2713,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
         custom_providers: list | None = None,
         proactive_prune_protect_last_n: int | None = None,
+        preserve_tool_results: list[str] | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        self.preserve_tool_results = frozenset(preserve_tool_results or ())
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
         # Per-model context_length overrides live in custom_providers; without them deferred
@@ -3085,15 +3087,17 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             result[idx] = {**msg, "tool_calls": new_tcs}
         return modified
 
-    @staticmethod
     def _demote_tool_result_at(
-        result: List[Dict[str, Any]], idx: int, call_id_to_tool: Dict[str, tuple[str, str]],
+        self, result: List[Dict[str, Any]], idx: int, call_id_to_tool: Dict[str, tuple[str, str]],
         min_prune_chars: int, protected_skills: Optional[set[str]] = None,
     ) -> bool:
         """Replace the tool result at ``idx`` with a 1-line summary; True if modified.
         ``protected_skills`` (lower-cased) spares matching skill_view bodies; None (pressure pass) overrides the guard."""
         msg = result[idx]
         if msg.get("role") != "tool":
+            return False
+        tool_name, tool_args = call_id_to_tool.get(msg.get("tool_call_id", ""), (msg.get("tool_name", "unknown"), ""))
+        if tool_name in self.preserve_tool_results:
             return False
         content = msg.get("content", "")
         if isinstance(content, list) or (isinstance(content, dict) and content.get("_multimodal")):
@@ -3108,7 +3112,6 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             or _is_summary_stub(content) or len(content) <= min_prune_chars
         ):
             return False
-        tool_name, tool_args = call_id_to_tool.get(msg.get("tool_call_id", ""), ("unknown", ""))
         if protected_skills and tool_name == "skill_view":
             _skill = _json_dict(tool_args).get("name", "")
             if isinstance(_skill, str) and _skill.lower() in protected_skills:
@@ -3383,6 +3386,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
         from agent.agent_runtime_helpers import strip_think_blocks
         parts = []
+        tool_calls = _tool_calls_by_id(turns)
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content")
@@ -3393,7 +3397,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             # Strip inline <think>-style blocks: scratch work wastes summarizer context and risks being kept as fact.
             if role == "assistant" and content:
                 content = strip_think_blocks(None, content)
-            if len(content) > self._CONTENT_MAX:
+            tool_name = tool_calls.get(msg.get("tool_call_id", ""), (msg.get("tool_name", ""), ""))[0]
+            if len(content) > self._CONTENT_MAX and not (role == "tool" and tool_name in self.preserve_tool_results):
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             if role == "tool":
                 parts.append(f"[TOOL RESULT {msg.get('tool_call_id', '')}]: {content}")
@@ -3552,11 +3557,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 break
             protected.add(i)
         result = list(messages)
+        tool_calls = _tool_calls_by_id(messages)
         demoted = 0
         for i in range(tail_start, len(messages)):
             msg = messages[i]
             content = msg.get("content")
             if msg.get("role") != "tool" or i in protected or not isinstance(content, str):
+                continue
+            tool_name = tool_calls.get(msg.get("tool_call_id", ""), (msg.get("tool_name", ""), ""))[0]
+            if tool_name in self.preserve_tool_results:
                 continue
             if len(content) < _LEAN_TAIL_DEMOTE_MIN_CHARS or SKILL_PRUNED_MARKER_PREFIX in content or _is_summary_stub(content):
                 continue
@@ -3898,7 +3907,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _collect_ghosted_skill_names(turns_to_summarize) + _extract_pruned_skill_names(self._previous_summary or "")
         ))[:_MAX_PRUNED_SKILL_MARKERS]
         # Lean mode even-samples oversized input (one bounded request, never a second).
-        if getattr(self, "tail_mode", "lean") == "lean":
+        if self.preserve_tool_results:
+            records = self._serialize_records_for_summary(turns_to_summarize)
+            content_to_summarize = "\n\n".join(records)
+            input_chars = sum(len(record) for record in records)
+            self._record_summary_input_coverage({
+                "input_chars": input_chars, "sampled_chars": input_chars, "omitted_chars": 0,
+                "record_count": len(records), "sampled_record_count": len(records), "elided_record_count": 0,
+            })
+        elif getattr(self, "tail_mode", "lean") == "lean":
             records = self._serialize_records_for_summary(turns_to_summarize)
             content_to_summarize, coverage = self._sample_summary_records(records)
             self._record_summary_input_coverage(coverage)
