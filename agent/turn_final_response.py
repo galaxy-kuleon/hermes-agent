@@ -18,7 +18,6 @@ from agent.turn_stop_gates import apply_stop_gates
 from agent.message_sanitization import strip_model_tool_disclosures, strip_internal_deliberation_tail
 from agent.hk_legal_authority_gate import evaluate_hk_legal_answer
 from agent.memory_deletion_gate import evaluate_memory_deletion_answer
-from agent.file_receipt_truth_gate import evaluate_file_receipt_truth
 from agent.skill_source_gate import evaluate_skill_source_contract
 from agent.artifact_delivery import ensure_export_links_in_terminal_answer, latest_successful_export_content
 
@@ -552,84 +551,6 @@ def finish_text_response(
         final_msg.pop("api_content", None)
         final_msg["content"] = final_response
         final_msg["finish_reason"] = "memory_deletion_truth_corrected"
-
-    # A shortened tool preview is a UI concern, not evidence that
-    # the underlying document was partial. Keep terminal claims
-    # aligned with the structured read_file receipt and continue a
-    # requested packaging workflow instead of sending the user to
-    # reattach the same bytes in a fresh chat.
-    _file_receipt_truth_decision = evaluate_file_receipt_truth(
-        messages=messages,
-        current_turn_user_idx=current_turn_user_idx,
-        final_response=final_response or "",
-        attempts=file_receipt_truth_nudges,
-        import_files_available=(
-            "skill_manage" in agent.valid_tool_names
-        ),
-    )
-    if (
-        _file_receipt_truth_decision
-        and _file_receipt_truth_decision.action == "nudge"
-    ):
-        file_receipt_truth_nudges += 1
-        final_msg["finish_reason"] = "file_receipt_truth_required"
-        final_msg["_file_receipt_truth_synthetic"] = True
-        append_message(messages, final_msg)
-        append_message(
-            messages,
-            {
-                "role": "user",
-                "content": _file_receipt_truth_decision.message,
-                "_file_receipt_truth_synthetic": True,
-            },
-        )
-        agent._session_messages = messages
-        logger.warning(
-            "FILE_RECEIPT_TRUTH_GATE_EVIDENCE %s",
-            json.dumps(
-                {
-                    "action": "nudge",
-                    "attempt": file_receipt_truth_nudges,
-                    "session_id": getattr(agent, "session_id", None),
-                    "diagnostics": list(
-                        _file_receipt_truth_decision.diagnostics
-                    ),
-                    "candidate": final_response or "",
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-        )
-        agent._emit_status(
-            "↻ 文件 receipt 顯示完整 — 正在修正錯誤的截斷判斷並繼續"
-        )
-        final_response = None
-        return _verdict("continue")
-    if (
-        _file_receipt_truth_decision
-        and _file_receipt_truth_decision.action == "replace"
-    ):
-        logger.warning(
-            "FILE_RECEIPT_TRUTH_GATE_EVIDENCE %s",
-            json.dumps(
-                {
-                    "action": "replace",
-                    "attempt": file_receipt_truth_nudges,
-                    "session_id": getattr(agent, "session_id", None),
-                    "diagnostics": list(
-                        _file_receipt_truth_decision.diagnostics
-                    ),
-                    "candidate": final_response or "",
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-        )
-        final_response = _file_receipt_truth_decision.message
-        _promoted = None
-        final_msg.pop("api_content", None)
-        final_msg["content"] = final_response
-        final_msg["finish_reason"] = "file_receipt_truth_corrected"
 
     # ── Hong Kong statutory-law authority stop gate ───────
     # Prompt policy is insufficient when a stale user skill tells
