@@ -13,6 +13,7 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process_manage",
     "attachments", "read_file", "write_file", "patch", "search_files",
     "local_document_export", "hk_legal_authority",
+    "understand_info_in_files", "adjust_or_generate_docx", "legal_lookup", "verify_citation",
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
     "browser_navigate", "browser_snapshot", "browser_click",
@@ -125,7 +126,8 @@ TOOLSETS = {
         "File manipulation tools: read, write, patch (with fuzzy matching), and "
         "search (content + files)",
         ["attachments", "read_file", "write_file", "patch", "search_files",
-         "local_document_export", "hk_legal_authority"],
+         "local_document_export", "hk_legal_authority",
+         "understand_info_in_files", "adjust_or_generate_docx", "legal_lookup", "verify_citation"],
     ),
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),

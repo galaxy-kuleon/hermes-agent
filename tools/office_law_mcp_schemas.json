@@ -1,0 +1,206 @@
+{
+  "tools": [
+    {
+      "name": "understand_info_in_files",
+      "title": null,
+      "description": "Understand the content of one or more files (docx/doc/odt/rtf, xlsx/xls/ods/csv, pptx/ppt/odp, pdf both digital-born and scanned, and page images) and write a Markdown answer to output_result_markdown_file_path. Scanned or image-heavy pages are recognised with a local vision OCR model, large documents are paged with a local page selector, and every page keeps its file/page provenance in the output. files_paths: absolute or ~-relative paths. optional_query: what to extract or answer; empty means a complete faithful report. max_output_result_tokens: cap for the answer body (default 65536). Returns the markdown path plus per-file page coverage; read the markdown file after the call.",
+      "inputSchema": {
+        "properties": {
+          "files_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Files Paths",
+            "type": "array"
+          },
+          "output_result_markdown_file_path": {
+            "title": "Output Result Markdown File Path",
+            "type": "string"
+          },
+          "optional_query": {
+            "default": "",
+            "title": "Optional Query",
+            "type": "string"
+          },
+          "max_output_result_tokens": {
+            "default": 65536,
+            "title": "Max Output Result Tokens",
+            "type": "integer"
+          },
+          "pii_protection_mode": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pii Protection Mode"
+          }
+        },
+        "required": [
+          "files_paths",
+          "output_result_markdown_file_path"
+        ],
+        "type": "object",
+        "title": "understand_info_in_filesArguments"
+      },
+      "execution": null,
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "understand_info_in_filesDictOutput"
+      },
+      "icons": null,
+      "annotations": null,
+      "_meta": null
+    },
+    {
+      "name": "adjust_or_generate_docx",
+      "title": null,
+      "description": "Adjust an existing Word document or generate a new one from a demand, writing output_docx_file_path. source_doc_or_docx_file_path may be .docx or .doc (converted internally) or omitted to generate from scratch. any_demand_or_request_or_requirement is the instruction, in any language. pii_protection_mode keeps personal data on this machine while the request is processed. Returns the docx path and the applied operations.",
+      "inputSchema": {
+        "properties": {
+          "any_demand_or_request_or_requirement": {
+            "title": "Any Demand Or Request Or Requirement",
+            "type": "string"
+          },
+          "output_docx_file_path": {
+            "title": "Output Docx File Path",
+            "type": "string"
+          },
+          "pii_protection_mode": {
+            "default": true,
+            "title": "Pii Protection Mode",
+            "type": "boolean"
+          },
+          "source_doc_or_docx_file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Doc Or Docx File Path"
+          }
+        },
+        "required": [
+          "any_demand_or_request_or_requirement",
+          "output_docx_file_path"
+        ],
+        "type": "object",
+        "title": "adjust_or_generate_docxArguments"
+      },
+      "execution": null,
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "adjust_or_generate_docxDictOutput"
+      },
+      "icons": null,
+      "annotations": null,
+      "_meta": null
+    },
+    {
+      "name": "legal_lookup",
+      "title": "Hong Kong and Taiwan legal lookup",
+      "description": "Answer a question about Hong Kong or Taiwan law by reading official sources. Returns the answer plus citations whose quotes are audited against the fetched official text. Slow by design: expect tens of seconds to a few minutes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The legal question, in any language, as specific as possible"
+          },
+          "jurisdiction": {
+            "type": "string",
+            "enum": [
+              "hk",
+              "tw",
+              "both"
+            ],
+            "description": "hk = Hong Kong SAR, tw = Taiwan, both = answer each system separately"
+          },
+          "language": {
+            "type": "string",
+            "description": "Language for the answer, for example zh-Hant-HK, zh-Hant, en. Default follows the question"
+          },
+          "as_of_date": {
+            "type": "string",
+            "description": "Date the law should be stated as at, ISO 8601 (YYYY-MM-DD). Default today"
+          }
+        },
+        "required": [
+          "question",
+          "jurisdiction"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": {
+        "title": null,
+        "readOnlyHint": true,
+        "destructiveHint": null,
+        "idempotentHint": null,
+        "openWorldHint": true
+      },
+      "_meta": null
+    },
+    {
+      "name": "verify_citation",
+      "title": "Verify a Hong Kong or Taiwan legal citation",
+      "description": "Check whether a statute or case citation exists in Hong Kong or Taiwan law and says what is claimed, using the official sources. Returns a verdict plus the quoted official text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "citation": {
+            "type": "string",
+            "description": "Citation to verify, for example 'Cap. 57 s 17' or '勞動基準法第36條' or a case name"
+          },
+          "claim": {
+            "type": "string",
+            "description": "What the citation is claimed to establish, if you want that checked"
+          },
+          "jurisdiction": {
+            "type": "string",
+            "enum": [
+              "hk",
+              "tw",
+              "both"
+            ],
+            "description": "hk = Hong Kong SAR, tw = Taiwan, both = answer each system separately"
+          }
+        },
+        "required": [
+          "citation",
+          "jurisdiction"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "outputSchema": null,
+      "icons": null,
+      "annotations": {
+        "title": null,
+        "readOnlyHint": true,
+        "destructiveHint": null,
+        "idempotentHint": null,
+        "openWorldHint": true
+      },
+      "_meta": null
+    }
+  ]
+}
