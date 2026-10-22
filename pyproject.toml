@@ -134,11 +134,6 @@ dependencies = [
   # Browser CDP supervisor + browser_dialog import this directly. Keep core
   # so browser tool discovery doesn't fail on lean installs.
   "websockets==15.0.1; python_version >= '3.14'",
-  # Engine of the default browser_exec tool (the `browser-use` CLI is a thin
-  # wrapper over it). Pure Python, and its pins match Pillow/websockets above,
-  # so it rides in the main venv and every install, Desktop bundle included,
-  # ships it without a separate tool environment.
-  "browser-harness==0.1.13; python_version >= '3.14'",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1; python_version >= '3.14'",
   "fastapi>=0.104.0,<1; python_version >= '3.14'",
@@ -608,7 +603,6 @@ default-groups = []
 # where extras that only ever coexist on 3.14 (kittentts vs neutts) conflict.
 environments = ["python_version >= '3.14'"]
 override-dependencies = [
-  "pillow==13.0.0",
   # discord.py's latest published version, 2.7.1, pins pynacl at <1.6. however, pynacl 1.5.0 has known vulnerabilities.
   # discord.py has updated pynacl to 1.6 on `main`, but has not yet published a patch release.
   # so, we force-override this to pynacl 1.6. here.
