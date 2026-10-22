@@ -14,7 +14,7 @@ from typing import Any
 
 
 EXPORT_TOOL_NAME = "local_document_export"
-EXPORT_DELIVERY_TOOLS = {EXPORT_TOOL_NAME, 'understand_info_in_files', 'adjust_or_generate_docx'}
+EXPORT_DELIVERY_TOOLS = {EXPORT_TOOL_NAME}
 DOWNLOADS_HEADING = "下載檔案："
 
 
