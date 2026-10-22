@@ -217,7 +217,6 @@ RUN set -eu; \
     browser_bin="$(python3 -c 'from pm import installed_package; print(installed_package("chromium").binary)')"; \
     test -n "$browser_bin"; \
     "$browser_bin" --version; \
-    python3 -c 'import json; from pathlib import Path; stamp = json.loads(Path("/opt/hermes/install-stamp.json").read_text()); Path("/opt/hermes/.hermes_build_sha").write_text(stamp["commit"] + "\n")'; \
     mkdir -p /etc/hermes; \
     printf '%s' "$browser_bin" > /etc/hermes/agent-browser-executable-path
 
@@ -419,6 +418,7 @@ RUN set -eu; \
             > /opt/hermes/install-stamp.json; \
     fi; \
     python3 -c 'import json; from pathlib import Path; path = Path("/opt/hermes/install-stamp.json"); stamp = json.loads(path.read_text()); stamp["pmRuntime"] = "/opt/hermes/pm-runtime"; path.write_text(json.dumps(stamp) + "\n")'; \
+    python3 -c 'import json; from pathlib import Path; stamp = json.loads(Path("/opt/hermes/install-stamp.json").read_text()); Path("/opt/hermes/.hermes_build_sha").write_text(stamp["commit"] + "\n")'; \
     mkdir -p /etc/hermes; \
     python3 -c 'import json, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": stamp.get("baseVersion") or project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
