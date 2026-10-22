@@ -553,19 +553,22 @@ def _zip_xml(zf: zipfile.ZipFile, name: str, optional: bool = False) -> Any:
 
 
 def _extract_docx(path: str) -> str:
-    with _open_zip(path, "DOCX") as zf:
-        root = _zip_xml(zf, "word/document.xml")
-    w = f"{{{_NS_W}}}"
-    breaks = {f"{w}tab": "\t", f"{w}br": "\n", f"{w}cr": "\n"}
-    lines: list[str] = []
-    for para in root.iter(f"{w}p"):
-        # w:rt is the ruby (phonetic) guide over w:rubyBase; it annotates the text, it is not text.
-        guide = {n for rt in para.iter(f"{w}rt") for n in rt.iter()}
-        text = "".join(
-            (n.text or "") if n.tag == f"{w}t" else breaks.get(n.tag, "")
-            for n in para.iter() if n not in guide)
-        lines.extend(text.split("\n"))
-    return _joined(lines, "DOCX contains no extractable text")
+    import requests
+    from tools.legacy_office import _soffice_url, _timeout_seconds
+
+    source = Path(path)
+    try:
+        response = requests.post(
+            f"{_soffice_url()}/convert",
+            params={"to": "txt"},
+            files={"file": (source.name, source.read_bytes())},
+            timeout=_timeout_seconds(),
+        )
+        response.raise_for_status()
+        text = response.content.decode("utf-8-sig")
+    except (requests.RequestException, UnicodeDecodeError) as exc:
+        raise ExtractionError("Word native text extraction unavailable") from exc
+    return _joined(text.splitlines(), "DOCX contains no extractable text")
 
 
 def _xlsx_string_text(item: ET.Element, s: str) -> str:

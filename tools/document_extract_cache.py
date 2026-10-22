@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Bump this named contract revision whenever extraction semantics change in a
 # way that makes earlier text unsafe to reuse. Deployments may override it when
 # upgrading an out-of-process extractor such as Docling independently.
-DEFAULT_EXTRACT_CACHE_REVISION = "2026-08-23-v1"
+DEFAULT_EXTRACT_CACHE_REVISION = "2026-10-22-word-text-v2"
 EXTRACT_CACHE_REVISION = os.environ.get(
     "HERMES_DOCUMENT_EXTRACT_CACHE_REVISION",
     DEFAULT_EXTRACT_CACHE_REVISION,
