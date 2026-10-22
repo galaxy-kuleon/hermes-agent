@@ -15,6 +15,7 @@ from typing import Any
 
 EXPORT_TOOL_NAME = "local_document_export"
 EXPORT_DELIVERY_TOOLS = {EXPORT_TOOL_NAME}
+MCP_ARTIFACT_TOOLS = {'understand_info_in_files', 'adjust_or_generate_docx'}
 DOWNLOADS_HEADING = "下載檔案："
 
 
@@ -83,7 +84,7 @@ def latest_successful_export_content(
 
 
 def latest_successful_export_markdown(
-    messages: list[Any], *, current_turn_user_idx: int
+    messages: list[Any], *, current_turn_user_idx: int, mentioned_in: str = ""
 ) -> str:
     """Return the latest successful export links after the current user row."""
     if current_turn_user_idx < 0:
@@ -93,7 +94,7 @@ def latest_successful_export_markdown(
     for message in messages[current_turn_user_idx + 1 :]:
         if not isinstance(message, dict):
             continue
-        if message.get("role") != "tool" or message.get("name") not in EXPORT_DELIVERY_TOOLS:
+        if message.get("role") != "tool" or message.get("name") not in EXPORT_DELIVERY_TOOLS | MCP_ARTIFACT_TOOLS:
             continue
         try:
             payload = json.loads(str(message.get("content") or ""))
@@ -102,6 +103,15 @@ def latest_successful_export_markdown(
         if not isinstance(payload, dict) or payload.get("success") is not True:
             continue
         markdown = payload.get("markdown")
+        if isinstance(markdown, str) and message.get("name") in MCP_ARTIFACT_TOOLS:
+            mentioned_links = []
+            for line in markdown.splitlines():
+                _, separator, target = line.rpartition("](")
+                if line.lstrip().startswith("[") and separator and target.endswith(")"):
+                    target = target[:-1]
+                    if target in mentioned_in and f"]({target})" not in mentioned_in:
+                        mentioned_links.append(line.strip())
+            markdown = "\n".join(mentioned_links)
         if isinstance(markdown, str) and markdown.strip():
             latest = markdown.strip()
     return latest
@@ -121,7 +131,7 @@ def ensure_export_links_in_terminal_answer(
     """
     response = str(final_response or "")
     markdown = latest_successful_export_markdown(
-        messages, current_turn_user_idx=current_turn_user_idx
+        messages, current_turn_user_idx=current_turn_user_idx, mentioned_in=response
     )
     if not markdown:
         return response, ""
