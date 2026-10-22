@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterator, Optional
 
-import yaml
+import hermes_yaml as yaml
 
 from hermes_constants import get_bundled_skills_dir, get_hermes_home
 from tools.skill_state import (

@@ -220,6 +220,9 @@ def _write_to_spillover(content: str, filename: str):
         except OSError:
             pass
         return None
+    from tools.file_grants import register_tool_result_file
+
+    register_tool_result_file(path)
     _prune_spillover_once()
     return str(path)
 

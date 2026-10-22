@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import yaml
+import hermes_yaml as yaml
 
 # The four skill permissions.
 READ = "read"

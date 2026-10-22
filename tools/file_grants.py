@@ -22,6 +22,7 @@ _GRANTS: ContextVar[dict[str, frozenset[str]] | None] = ContextVar(
     "local_file_grants",
     default=None,
 )
+_TOOL_RESULTS: ContextVar[set[str] | None] = ContextVar("local_tool_result_files", default=None)
 # Short handle -> canonical path, per task. Attached-file paths are ~190
 # characters of nested UUIDs; asking a model to retype one verbatim for every
 # file is a transcription task it measurably fails (observed live: spliced
@@ -77,6 +78,7 @@ def file_grant_scope(
     updated = dict(current)
     updated[task_key] = frozenset(_canonical_path(path) for path in paths)
     grants_token = _GRANTS.set(updated)
+    results_token = _TOOL_RESULTS.set(set())
 
     current_aliases = _ALIASES.get() or {}
     updated_aliases = dict(current_aliases)
@@ -104,8 +106,15 @@ def file_grant_scope(
                     )
             yield
     finally:
+        _TOOL_RESULTS.reset(results_token)
         _ALIASES.reset(alias_token)
         _GRANTS.reset(grants_token)
+
+
+def register_tool_result_file(path: str | Path) -> None:
+    results = _TOOL_RESULTS.get()
+    if results is not None:
+        results.add(_canonical_path(path))
 
 
 def resolve_grant_alias(value: str | Path, *, task_id: str) -> str:
@@ -266,7 +275,8 @@ def resolve_file_grant(
     canonical_path = _canonical_path(resolved)
     scopes = _GRANTS.get()
     task_key = str(task_id or "default")
-    if scopes is None or canonical_path in (scopes.get(task_key) or ()):
+    generated_read = operation in {"read", "search"} and canonical_path in (_TOOL_RESULTS.get() or ())
+    if scopes is None or canonical_path in (scopes.get(task_key) or ()) or generated_read:
         return canonical_path, None
     return None, (
         f"Local file access not granted for {operation}: {path!s}. "
