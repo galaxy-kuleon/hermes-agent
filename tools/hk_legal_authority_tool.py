@@ -42,11 +42,11 @@ ZIP_EOCD_SEARCH_BYTES = 65_557
 HKLM_NAMESPACE = "http://www.xml.gov.hk/schemas/hklm/1.0"
 DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
 _CHAPTER_RE = re.compile(r"^[0-9]{1,4}[A-Z]{0,3}$")
-_PROVISION_RE = re.compile(r"^(?:s|r)?([0-9]{1,4}[A-Z]?)$", re.IGNORECASE)
+_PROVISION_RE = re.compile(r"^(?:s|r)?([0-9]{1,4}[A-Z]*)$", re.IGNORECASE)
 _LABELED_PROVISION_RE = re.compile(
     r"^(?:(?:sch(?:edule)?\.?\s*\d+[A-Z]?\s*[,;:\-]?\s*)?)"
     r"(?:section|sec(?:tion)?|s|rule|r)\.?\s*"
-    r"([0-9]{1,4}[A-Z]?)(?:\s*\([0-9A-Za-z]+\))*\s*$",
+    r"([0-9]{1,4}[A-Z]*)(?:\s*\([0-9A-Za-z]+\))*\s*$",
     re.IGNORECASE,
 )
 _SPACE_RE = re.compile(r"\s+")
