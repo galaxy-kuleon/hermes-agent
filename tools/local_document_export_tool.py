@@ -422,6 +422,36 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
         return _json_error(str(exc))
 
 
+def publish_document_bytes(filename: str, data: bytes) -> dict[str, Any]:
+    context = get_trusted_export_context()
+    user_id, chat_id = context.get('user_id'), context.get('chat_id')
+    key = _signing_key()
+    if not user_id or not chat_id or not key:
+        raise ValueError('Authenticated document delivery is unavailable')
+    if Path(filename).name != filename or Path(filename).suffix.lower() not in ('.docx', '.md'):
+        raise ValueError('Only generated Word documents or Markdown reports may be delivered')
+    if filename.lower().endswith('.docx'):
+        validate_docx_bytes(data)
+    now = _utc_now()
+    expires_at = _format_utc(now + timedelta(hours=_env_int('LOCAL_EXPORT_TTL_HOURS', DEFAULT_TTL_HOURS)))
+    owner_hash = owner_hash_for_scope(user_id, chat_id)
+    artifact_id = uuid.uuid4().hex
+    directory = _export_root() / owner_hash / artifact_id
+    directory.mkdir(parents=True, exist_ok=False)
+    (directory / filename).write_bytes(data)
+    checksum = _sha256(data)
+    signature = build_artifact_signature(key=key, version=SIGNATURE_VERSION, user_id=user_id,
+        chat_id=chat_id, artifact_id=artifact_id, filename=filename, sha256=checksum, expires_at=expires_at)
+    entry = {'format': Path(filename).suffix.lstrip('.'), 'filename': filename, 'size': len(data),
+        'sha256': checksum, 'expires_at': expires_at, 'signature': signature,
+        'public_document': True, 'url': _artifact_url(artifact_id, filename, expires_at, signature)}
+    _write_atomic_json(directory / 'manifest.json', {'artifact_id': artifact_id, 'created_at': _format_utc(now),
+        'expires_at': expires_at, 'signature_version': SIGNATURE_VERSION,
+        'owner': {'user_id': user_id, 'chat_id': chat_id, 'owner_hash': owner_hash, 'platform': context.get('platform', ''), 'session_id': context.get('session_id', '')},
+        'artifacts': [entry]})
+    return {name: value for name, value in entry.items() if name not in ('signature', 'public_document')}
+
+
 def _find_manifest(root: Path, artifact_id: str) -> Path | None:
     if not _ARTIFACT_ID_RE.match(artifact_id):
         return None
@@ -445,7 +475,7 @@ def resolve_local_export_download(
     if not filename or "/" in filename or "\\" in filename:
         return {"ok": False, "status": 400, "error": "invalid filename"}
     lowered = filename.lower()
-    if lowered == "manifest.json" or lowered.endswith(".md"):
+    if lowered == "manifest.json":
         return {"ok": False, "status": 403, "error": "requested file is not downloadable"}
 
     root = _export_root()
@@ -467,6 +497,8 @@ def resolve_local_export_download(
     entry = next((item for item in artifacts if item.get("filename") == filename), None)
     if not entry:
         return {"ok": False, "status": 404, "error": "file not found in manifest"}
+    if lowered.endswith('.md') and entry.get('public_document') is not True:
+        return {"ok": False, "status": 403, "error": "requested file is not downloadable"}
     if expires != entry.get("expires_at"):
         return {"ok": False, "status": 403, "error": "artifact expiry mismatch"}
 

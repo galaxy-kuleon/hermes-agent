@@ -9,7 +9,7 @@ import httpx
 
 from hermes_constants import get_hermes_home
 from tools.file_grants import resolve_file_grant, register_tool_result_file
-from tools.local_document_export_tool import get_trusted_export_context
+from tools.local_document_export_tool import get_trusted_export_context, publish_document_bytes
 from tools.registry import registry
 
 
@@ -44,7 +44,8 @@ async def invoke(name, arguments, task_id):
         destination = directory / Path(artifact['name']).name
         destination.write_bytes(data)
         register_tool_result_file(destination)
-        artifacts.append({'path': str(destination), 'sha256': artifact['sha256']})
+        published = publish_document_bytes(destination.name, data)
+        artifacts.append({'path': str(destination), **published})
     return json.dumps({'result': body['result'], 'artifacts': artifacts}, ensure_ascii=False)
 
 
