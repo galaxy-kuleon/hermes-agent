@@ -59,5 +59,6 @@ for schema in SCHEMAS:
     registry.register(name=schema['name'], toolset='file_read',
         schema={'name': schema['name'], 'description': schema['description'] + ' Files are authorized attachment handles or exact granted paths; returned artifacts are saved locally for read_file and delivery.', 'parameters': schema['inputSchema']},
         handler=make_handler(schema['name']),
+        is_async=True,
         check_fn=lambda: bool(os.environ.get('KG_NATIVE_MCP_SETTINGS') and os.environ.get('ORIGIN_PI_API_KEY')),
         description=schema['description'])
