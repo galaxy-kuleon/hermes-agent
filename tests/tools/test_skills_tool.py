@@ -14,7 +14,7 @@ from tools.skills_tool import (
     _parse_frontmatter,
     _parse_tags,
     _get_category_from_path,
-    _find_all_skills,
+    find_all_skills,
     skill_matches_platform,
     skills_list,
     skill_view,
@@ -43,15 +43,6 @@ description: Description for {name}.
 """
     (skill_dir / "SKILL.md").write_text(content)
     return skill_dir
-
-
-def test_skill_view_schema_is_the_only_skill_file_reader():
-    assert "only tool for reading SKILL.md" in skills_tool_module.SKILL_VIEW_SCHEMA[
-        "description"
-    ]
-    assert "never guess an unlisted path" in skills_tool_module.SKILL_VIEW_SCHEMA[
-        "description"
-    ]
 
 
 def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Path:
@@ -210,7 +201,7 @@ class TestGetCategoryFromPath:
 
 
 # ---------------------------------------------------------------------------
-# _find_all_skills
+# find_all_skills
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +238,7 @@ class TestFindAllSkills:
                 encoding="utf-8",
             )
 
-            skills = _find_all_skills()
+            skills = find_all_skills()
 
         assert {s["name"] for s in skills} == {"skill-a", "skill-b", "axolotl"}
         assert [s["category"] for s in skills if s["name"] == "axolotl"] == ["mlops"]
@@ -266,7 +257,7 @@ class TestFindAllSkills:
         )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skills = {s["name"]: s for s in _find_all_skills()}
+            skills = {s["name"]: s for s in find_all_skills()}
 
         # If no description in frontmatter, the first non-header line is used.
         assert skills["no-desc"]["description"] == "First paragraph."
@@ -281,7 +272,7 @@ class TestFindAllSkills:
         _make_skill(external_category.parent, "knowledge-brain", category="linked")
 
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
-            skills = _find_all_skills()
+            skills = find_all_skills()
 
         assert [s["name"] for s in skills] == ["knowledge-brain"]
         assert skills[0]["category"] == "linked"
@@ -293,14 +284,14 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
-    def test_empty_does_not_create_read_only_platform_directory(self, tmp_path):
+    def test_empty_creates_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
             raw = skills_list()
         result = json.loads(raw)
         assert result["success"] is True
         assert result["skills"] == []
-        assert not skills_dir.exists()
+        assert skills_dir.exists()
 
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -312,19 +303,6 @@ class TestSkillsList:
         assert all_result["count"] == 2
         assert filtered["count"] == 1
         assert filtered["skills"][0]["name"] == "skill-a"
-
-    def test_frontmatter_category_is_authoritative_for_flat_user_skill(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "hk-legal",
-                frontmatter_extra="category: legal\n",
-            )
-            filtered = json.loads(skills_list(category="legal"))
-
-        assert filtered["count"] == 1
-        assert filtered["skills"][0]["name"] == "hk-legal"
-        assert filtered["skills"][0]["category"] == "legal"
 
     def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"
@@ -419,102 +397,10 @@ class TestSkillView:
 
         assert existing["success"] is True
         assert "Endpoint info" in existing["content"]
-        assert existing["content_complete"] is True
-        assert existing["content_chars"] == len(existing["content"])
         assert missing["success"] is False
         # The skill view advertises what else can be opened.
         assert skill["linked_files"] is not None
         assert "references" in skill["linked_files"]
-
-    def test_missing_file_returns_declared_cross_skill_view_example(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "selector",
-                body=(
-                    "Load the source with "
-                    'skill_view(name="catalog", '
-                    'file_path="references/class-N.md").'
-                ),
-            )
-            missing = json.loads(
-                skill_view("selector", file_path="data/class_14.json")
-            )
-            loaded = json.loads(skill_view("selector"))
-
-        assert missing["success"] is False
-        assert missing["declared_skill_view_examples"] == [
-            {"name": "catalog", "file_path": "references/class-N.md"}
-        ]
-        assert "do not invent a local path" in missing["hint"]
-        assert "terminal access" in missing["hint"]
-        assert loaded["source_contract"] == {
-            "required_before_answer": True,
-            "instruction": (
-                "Load every relevant declared skill_view source before the final "
-                "answer. Replace placeholders from the user's request. Do not "
-                "substitute memory, local-path guesses, attachments, terminal "
-                "access, or a prior run for these sources."
-            ),
-            "declared_skill_view_examples": [
-                {"name": "catalog", "file_path": "references/class-N.md"}
-            ],
-            "answer_contract": None,
-        }
-        assert list(loaded).index("source_contract") < list(loaded).index("content")
-
-    def test_view_exposes_only_explicit_answer_contract_rules(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "selector",
-                body=(
-                    "For **Classes 1–34**, choose **20 items at most** per class.\n"
-                    "For **Class 35** regarding wholesaling and retailing, choose "
-                    "**5 items at most**.\n"
-                    "For **classes 1–34** pick **17 items at most** for the business, "
-                    "and however pick **3 items** which can cover more subgroups; "
-                    "the three items preferably cover **3 different subgroups**.\n"
-                    "**Always list every chosen item**.\n"
-                    "Items must be chosen ONLY from the database. NEVER invent "
-                    "items, wording, or codes.\n"
-                    "Relevant items:\nCoverage items:\nTotal: [X] items\n"
-                    'skill_view(name="catalog", file_path="references/class-N.md")'
-                ),
-            )
-            loaded = json.loads(skill_view("selector"))
-
-        assert loaded["source_contract"]["answer_contract"] == {
-            "class_1_34_max_items": 20,
-            "class_35_wholesale_retail_max_items": 5,
-            "class_1_34_relevant_max_items": 17,
-            "class_1_34_coverage_items": 3,
-            "class_1_34_coverage_distinct_subgroups": 3,
-            "list_every_chosen_item": True,
-            "require_total": True,
-            "require_relevant_and_coverage_sections": True,
-            "require_authoritative_item_wording": True,
-            "coverage_must_add_new_subgroups": True,
-        }
-
-    def test_missing_file_omits_unsafe_declared_examples(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "selector",
-                body=(
-                    'skill_view(name="catalog", file_path="../secret.md")\n'
-                    'skill_view(name="catalog", file_path="/etc/passwd")\n'
-                    'skill_view(name="bad name", file_path="references/a.md")'
-                ),
-            )
-            missing = json.loads(
-                skill_view("selector", file_path="data/class_14.json")
-            )
-
-        assert missing["success"] is False
-        assert "declared_skill_view_examples" not in missing
-        assert missing["hint"] == "Use one of the available file paths listed above"
 
     def test_view_file_path_directory_returns_available_files(self, tmp_path):
         """Requesting a directory (e.g. 'references') must not raise.
@@ -693,12 +579,12 @@ class TestSkillMatchesPlatform:
 
 
 # ---------------------------------------------------------------------------
-# _find_all_skills — platform filtering integration
+# find_all_skills — platform filtering integration
 # ---------------------------------------------------------------------------
 
 
 class TestFindAllSkillsPlatformFiltering:
-    """Test that _find_all_skills respects the platforms field."""
+    """Test that find_all_skills respects the platforms field."""
 
     def test_discovery_filters_on_platform(self, tmp_path):
         # Host-native: a skill tagged only for a platform that is never the
@@ -709,13 +595,13 @@ class TestFindAllSkillsPlatformFiltering:
             _make_skill(
                 tmp_path, "cross-plat", frontmatter_extra=f"platforms: [plan9, {sys.platform}]\n"
             )
-            names = {s["name"] for s in _find_all_skills()}
+            names = {s["name"] for s in find_all_skills()}
 
         assert names == {"universal-skill", "cross-plat"}
 
 
 # ---------------------------------------------------------------------------
-# _find_all_skills — env-var prerequisites must not change the listing
+# find_all_skills — env-var prerequisites must not change the listing
 # ---------------------------------------------------------------------------
 
 
@@ -738,7 +624,7 @@ class TestFindAllSkillsSecureSetup:
                 frontmatter_extra="prerequisites:\n  env_vars: [MY_PRESENT_KEY]\n",
             )
             _make_skill(tmp_path, "simple-skill")
-            skills = _find_all_skills()
+            skills = find_all_skills()
 
         assert {s["name"] for s in skills} == {"needs-key", "has-key", "simple-skill"}
         for skill in skills:
@@ -993,68 +879,47 @@ class TestSkillViewCollisionDetection:
             ),
         )
 
-    def test_caller_owned_skill_shadows_same_named_platform_skill(self, tmp_path):
-        """A user's editable copy is the deterministic bare-name winner."""
-        from agent.skill_namespaces import bind_skill_namespace_user
+    @pytest.mark.parametrize("winner_tier, loser_tier, winner_rel, loser_rel, lookup", [
+        # The original 59da8ec4e scenario (nested local + top-level external) used to refuse; the
+        # documented precedence now picks local, matching skills_list / the prompt index / slash.
+        ("local", "external", "foundations/runtime/explore-codebase", "explore-codebase", "explore-codebase"),
+        # Same relative path in both roots: on main no identifier could load either copy.
+        ("local", "external", "productivity/xdup", "productivity/xdup", "productivity/xdup"),
+        ("local", "external", "productivity/xdup", "productivity/xdup", "xdup"),
+        ("create_dir", "external", "brain/note", "note", "note"),
+        ("local", "create_dir", "note", "brain/note", "note"),
+        ("project", "local", "deploy", "ops/deploy", "deploy"),
+    ])
+    def test_higher_tier_wins_cross_directory_collision(
+            self, tmp_path, caplog, winner_tier, loser_tier, winner_rel, loser_rel, lookup):
+        """project > local > create_dir > external: the higher tier loads, the shadowed copy is
+        reported by skills_list neither as a row nor as a guess, and a warning names it."""
+        from agent import skill_utils
+        tiers = {t: tmp_path / t for t in ("project", "local", "create_dir", "external")}
+        for root in tiers.values():
+            root.mkdir()
+        for tier, rel in ((winner_tier, winner_rel), (loser_tier, loser_rel)):
+            *cat, leaf = rel.split("/")
+            _make_skill(tiers[tier], leaf, category="/".join(cat) or None,
+                        frontmatter_extra=f"x-tier: {tier}\n", body=f"{tier.upper()} VERSION")
+        p1, p2 = self._patch_dirs(tiers["local"], [tiers["external"]])
+        with p1, p2, caplog.at_level("WARNING"), \
+                patch.object(skill_utils, "get_skill_create_dir", return_value=tiers["create_dir"]), \
+                patch.object(skill_utils, "get_project_skills_dirs", return_value=[tiers["project"]]), \
+                patch.object(skill_utils, "iter_project_skill_files",
+                             lambda d: skill_utils.iter_skill_index_files(d, "SKILL.md")):
+            skills_tool_module._SKILLS_CACHE.clear()
+            skill_utils._SHADOW_CHECKED.clear()
+            result = json.loads(skill_view(lookup))
+            listed = json.loads(skills_list())["skills"]
 
-        platform_dir = tmp_path / "platform"
-        user_base = tmp_path / "user-skills"
-        user_dir = user_base / "alice"
-        platform_dir.mkdir()
-        user_dir.mkdir(parents=True)
-        _make_skill(platform_dir, "shared-law", body="PLATFORM VERSION")
-        _make_skill(user_dir, "shared-law", body="USER WORKING COPY")
-
-        with (
-            patch("tools.skills_tool.SKILLS_DIR", platform_dir),
-            patch(
-                "agent.skill_namespaces.get_user_skills_base_dir",
-                return_value=user_base,
-            ),
-            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
-            bind_skill_namespace_user("alice"),
-        ):
-            bare = json.loads(skill_view("shared-law"))
-            platform = json.loads(skill_view("platform:shared-law"))
-
-        assert bare["success"] is True
-        assert bare["namespace"] == "user"
-        assert bare["qualified_name"] == "user:shared-law"
-        assert "USER WORKING COPY" in bare["content"]
-        assert platform["success"] is True
-        assert platform["namespace"] == "platform"
-        assert "PLATFORM VERSION" in platform["content"]
-
-    def test_nested_local_collides_with_top_level_external(self, tmp_path):
-        """The original bug scenario: nested local + top-level external,
-        same name. Now refuses with both paths surfaced."""
-        local_dir = tmp_path / "local"
-        external_dir = tmp_path / "external"
-        local_dir.mkdir()
-        external_dir.mkdir()
-
-        _make_skill(
-            local_dir,
-            "explore-codebase",
-            category="foundations/runtime",
-            body="LOCAL VERSION",
-        )
-        _make_skill(external_dir, "explore-codebase", body="EXTERNAL VERSION")
-
-        p1, p2 = self._patch_dirs(local_dir, [external_dir])
-        with p1, p2:
-            raw = skill_view("explore-codebase")
-
-        result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous skill name 'explore-codebase'" in result["error"]
-        assert "matches" in result
-        assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
-        assert "hint" in result
-
+        assert result["success"] is True, result
+        assert f"{winner_tier.upper()} VERSION" in result["content"]
+        assert f"{loser_tier.upper()} VERSION" not in result["content"]
+        leaf = winner_rel.rsplit("/", 1)[-1]
+        assert [s["name"] for s in listed if s["name"].endswith(leaf)] == [leaf]
+        assert any("shadowed" in r.getMessage() and str(tiers[loser_tier]) in r.getMessage()
+                   for r in caplog.records)
 
     def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
         """Supporting reference docs named <skill>.md are not skills.
@@ -1088,7 +953,7 @@ class TestSkillViewCollisionDetection:
 
         result = json.loads(raw)
         assert result["success"] is True
-        assert result["path"] == "creative/sketch/SKILL.md"
+        assert result["path"] == os.path.join("creative", "sketch", "SKILL.md")
         assert "REAL SKETCH SKILL" in result["content"]
 
 
@@ -1222,7 +1087,8 @@ class TestSameRootDuplicationResolves:
             result = json.loads(skill_view("dup"))
 
         assert result["success"] is False, result
-        assert "Ambiguous" in result["error"]
+        assert "Ambiguous skill name 'dup': use one of cat-a/dup, cat-b/dup" in result["error"]
+        assert result["load_names"] == ["cat-a/dup", "cat-b/dup"]
         assert len(result["matches"]) == 2
 
 

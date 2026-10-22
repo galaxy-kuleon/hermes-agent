@@ -646,7 +646,7 @@ class TestShutdownSettleWindow:
         """
         import tools.process_registry as _pr
         import tools.terminal_tool as _tt
-        import tools.terminal_tool_lifecycle as terminal_tool_lifecycle
+        from tools import terminal_tool_lifecycle
 
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01  # force the drain-timeout path
@@ -656,7 +656,11 @@ class TestShutdownSettleWindow:
 
         settled_at_kill: list = []
 
-        def _spy_kill_all(task_id=None):
+        def _spy_kill_all(task_id=None, **kwargs):
+            # kwargs carry kill_all's keyword-only args; the shutdown sweep
+            # passes source="gateway_shutdown" (#41225) so persisted jobs are
+            # still killed on host exit.
+            assert kwargs.get("source") == "gateway_shutdown", kwargs
             settled_at_kill.append(api.settled)
             return 0
 
@@ -691,7 +695,7 @@ class TestShutdownSettleWindow:
         """
         import tools.process_registry as _pr
         import tools.terminal_tool as _tt
-        import tools.terminal_tool_lifecycle as terminal_tool_lifecycle
+        from tools import terminal_tool_lifecycle
 
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01

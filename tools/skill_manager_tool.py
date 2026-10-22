@@ -20,7 +20,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
+import hermes_yaml as yaml
 
 from hermes_constants import get_hermes_home, display_hermes_home
 from utils import atomic_write_text, is_truthy_value
@@ -31,9 +31,10 @@ from agent.skill_utils import (
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT)
 from tools.skill_manager_guards import (
-    _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
-    _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
-    _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
+    _background_review_write_guard, _org_mirror_write_guard, _maybe_auto_propose_org_edit,
+    _background_review_delete_guard, _background_review_preflight, _background_review_read_before_write_guard,
+    _containing_skills_root, _curator_consolidation_delete_guard, _is_path_redirect, _pinned_guard,
+    _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
@@ -122,15 +123,6 @@ VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-fr
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
 _NAME_RULE = "Use lowercase letters, numbers, hyphens, dots, and underscores."
-
-
-def _display_create_dir() -> str:
-    """Skill-creation dir for schema/instruction text; follows ``skills.create_dir``."""
-    try:
-        from agent.skill_utils import display_skill_create_dir
-        return display_skill_create_dir()
-    except Exception:
-        return f"{display_hermes_home()}/skills/"
 
 
 # --- Validation helpers -------------------------------------------------------
@@ -818,10 +810,10 @@ def _find_skill(name: str, namespace: Optional[str] = None) -> Optional[Dict[str
     return None
 
 
-def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
+def _find_skill_in_other_profiles(name: str) -> list[tuple[str, Path]]:
     """``(profile, skill_dir)`` pairs for OTHER profiles holding ``name`` (so the not-found
     error can explain a wrong-profile mistake). Fail-quiet."""
-    matches: List[Tuple[str, Path]] = []
+    matches: list[tuple[str, Path]] = []
     try:
         from hermes_constants import get_default_hermes_root
         root = get_default_hermes_root()
@@ -831,7 +823,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
     active_dir = _active.resolve() if _active.exists() else _active
     # Every profile's skills dir EXCEPT the active one (already searched). A candidate whose
     # path cannot be resolved is skipped (not a fatal error); is_dir() checks stay unguarded.
-    candidates: List[Tuple[str, Path]] = []
+    candidates: list[tuple[str, Path]] = []
     with suppress(OSError, RuntimeError):
         if (root / "skills").resolve() != active_dir:
             candidates.append(("default", root / "skills"))
@@ -906,28 +898,26 @@ def _resolve_supporting_file(skill_dir: Path, file_path: str):
     return (None, _err(err)) if err else (target, None)
 
 
-def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
-                      org_guard: bool = True):
-    """Find the skill; run the org-mirror (unless ``org_guard=False``) and background-review
-    write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
+def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
+    """Find the skill; a delete also runs the background-review delete guard -> ``(skill_dir, None)``
+    | ``(None, error_dict)``."""
     existing = _find_skill(name)
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
-    guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
-             or _background_review_write_guard(name, skill_dir, action))
+    guard = _background_review_delete_guard(name, skill_dir) if action == "delete" else None
     return (None, guard) if guard else (skill_dir, None)
 
 
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
-                   content: str) -> Optional[Dict[str, Any]]:
+                   content: str) -> Optional[dict[str, Any]]:
     """Read-before-write guard (existing targets only), atomic write, then the security scan;
     a blocked scan restores the original (or unlinks a new file). Error dict or None."""
     original = None
     if target.exists():
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
-        original = target.read_text(encoding="utf-8")
+        original = target.read_text(encoding="utf-8-sig")
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
@@ -941,14 +931,7 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
     return _err(scan_error)
 
 
-def _attach_org_note(result: Dict[str, Any], name: str, skill_dir: Path) -> Dict[str, Any]:
-    if org_note := _maybe_auto_propose_org_edit(name, skill_dir):
-        result["org_sharing"] = org_note
-        result["message"] = f"{result['message']} {org_note}"
-    return result
-
-
-def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Dict[str, Any]:
+def _add_description_prompt_preview(result: dict[str, Any], content: str) -> dict[str, Any]:
     fm, _ = _parse_frontmatter(content)
     if is_skill_description_truncated_for_prompt(fm):
         result["system_prompt_preview"] = (
@@ -957,7 +940,7 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Dic
     return result
 
 
-def _attach_lint_findings(result: Dict[str, Any], skill_md: Path, before: Optional[str] = None) -> None:
+def _attach_lint_findings(result: dict[str, Any], skill_md: Path, before: Optional[str] = None) -> None:
     """Attach ADVISORY authoring findings (hard rejects already ran in _validate_frontmatter).
     With ``before`` (the pre-write content) only rules the write INTRODUCED are attached, so a
     patch reports the line it crossed rather than re-listing the skill's standing findings."""
@@ -1594,7 +1577,7 @@ def _remove_file(
 # --- Main entry point ---------------------------------------------------------
 
 # Set while replaying an approved staged skill write so skill_manage() does not re-gate it.
-_skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+_skill_gate_bypass: _ctxvars.ContextVar[bool] = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False)
 
 
@@ -1672,7 +1655,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 _FLAT_OP_KEYS = ('content', 'category', 'file_path', 'file_content', 'old_string', 'new_string', 'absorbed_into', 'operations', 'namespace', 'requirements_confirmed', 'source_paths', 'reference_subdir')
 
 
-def _skill_manage_from(payload: Dict[str, Any], **extra) -> str:
+def _skill_manage_from(payload: dict[str, Any], **extra) -> str:
     """Call ``skill_manage`` with the flat-shape fields (and absorbed_into/operations) of ``payload``."""
     return skill_manage(
         action=payload.get("action", ""), name=payload.get("name", ""),
@@ -1790,7 +1773,7 @@ _ACTION_HANDLERS = {
 def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
                     session_id, ledger_before) -> None:
     """Best-effort post-mutation side effects (never break the tool): ledger, prompt-cache
-    clear, curator telemetry, debounced sync push."""
+    clear, curator telemetry (which fires ``on_skill_lifecycle`` for plugins)."""
     with suppress(Exception):
         from tools import skill_ledger as _ledger
         _post = _find_skill(name)
@@ -1822,9 +1805,6 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
             bump_patch(name, action=action, task_id=task_id, session_id=session_id)
         elif action == "delete" and not result.get("_archived"):
             forget(name)
-    # Only AFTER the write gate passed (staged writes returned early): never push un-reviewed content.
-    with suppress(Exception):
-        _maybe_debounced_sync_push(name)
 
 
 def _skill_manage_single(
@@ -2188,13 +2168,13 @@ def skill_manage(
 
 # --- OpenAI Function-Calling Schema -------------------------------------------
 
-def _skill_manage_description(create_dir: str) -> str:
+def _skill_manage_description() -> str:
     return (
         "Create, update, or delete skills — your procedural memory for "
         "recurring task types. The call is an operations array (a single "
         "edit is a list of one); it applies atomically — any failure rolls "
         "every touched skill back. Ops: create (full SKILL.md; lands in "
-        f"{create_dir}; must precede that skill's other "
+        "the profile's skills directory or configured skills.create_dir; must precede that skill's other "
         "ops), patch (targeted old_string/new_string fix — preferred; "
         "content alone REPLACES the whole file, read it via skill_view() "
         "first), write_file/remove_file (supporting files), delete (sole "
@@ -2205,13 +2185,6 @@ def _skill_manage_description(create_dir: str) -> str:
         "rule per lesson, references/ named by topic (extend before adding). "
         "skill_view() shows format conventions."
     )
-
-
-def _skill_manage_schema_overrides() -> dict:
-    """Rebuild the create-dir hint from the ACTIVE profile at every get_definitions(): the
-    multiplexed gateway serves every profile from one process, so a path baked in at import
-    would name the launch profile's skills dir for everyone else (#95685)."""
-    return {"description": _skill_manage_description(_display_create_dir())}
 
 
 _NAME = {"type": "string"}
@@ -2240,7 +2213,7 @@ _UPSTREAM_SKILL_MANAGE_SCHEMA = {
     # ONE advertised call shape (memory-tool pattern): the call IS an operations
     # array. The legacy flat shape (top-level action/name/content/...) is still
     # ACCEPTED for old transcripts and staged-write replay, but not advertised.
-    "description": _skill_manage_description("the profile's skills.create_dir"),
+    "description": _skill_manage_description(),
     "parameters": {
         "type": "object",
         "properties": {

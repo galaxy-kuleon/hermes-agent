@@ -17,12 +17,9 @@ These tests guard the schema against regressing back to a shape strict
 backends reject.
 """
 
-
 from tools.memory_tool import MEMORY_SCHEMA
 
-
 _FORBIDDEN_TOP_LEVEL_KEYS = ("allOf", "anyOf", "oneOf", "enum", "not")
-
 
 def test_memory_schema_has_no_forbidden_top_level_combinators():
     """OpenAI's Codex backend rejects these at the top level of parameters."""
@@ -33,11 +30,3 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
             "Codex backend (chatgpt.com/backend-api/codex). Per-action "
             "required-field checks belong in the runtime handler, not the schema."
         )
-
-
-def test_memory_schema_keeps_task_errors_and_matter_facts_out_of_profile_memory():
-    description = MEMORY_SCHEMA["description"]
-
-    assert "your own mistakes" in description
-    assert "transient case/matter facts" in description
-    assert "session context engine" in description

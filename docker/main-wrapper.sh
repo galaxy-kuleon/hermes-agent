@@ -69,8 +69,6 @@ export HOME="${HERMES_CONTAINER_HOME:-/opt/data}"
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
 cd "$HOME"
-# shellcheck disable=SC1091
-. /opt/hermes/.venv/bin/activate
 
 # Restore the original working directory before handing off to
 # the user's command so `hermes chat` starts in the Docker -w
