@@ -46,7 +46,14 @@ async def invoke(name, arguments, task_id):
         register_tool_result_file(destination)
         published = publish_document_bytes(destination.name, data)
         artifacts.append({'path': str(destination), **published})
-    return json.dumps({'result': body['result'], 'artifacts': artifacts}, ensure_ascii=False)
+    result = {'result': body['result'], 'artifacts': artifacts}
+    if artifacts:
+        links = []
+        for artifact in artifacts:
+            label = artifact['filename'].replace('\\', '\\\\').replace('[', '\\[').replace(']', '\\]')
+            links.append(f"[下載 {label}]({artifact['url']})")
+        result.update(success=True, markdown='\n'.join(links))
+    return json.dumps(result, ensure_ascii=False)
 
 
 def make_handler(name):

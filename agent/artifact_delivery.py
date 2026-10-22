@@ -14,6 +14,7 @@ from typing import Any
 
 
 EXPORT_TOOL_NAME = "local_document_export"
+EXPORT_DELIVERY_TOOLS = {EXPORT_TOOL_NAME, 'understand_info_in_files', 'adjust_or_generate_docx'}
 DOWNLOADS_HEADING = "下載檔案："
 
 
@@ -92,7 +93,7 @@ def latest_successful_export_markdown(
     for message in messages[current_turn_user_idx + 1 :]:
         if not isinstance(message, dict):
             continue
-        if message.get("role") != "tool" or message.get("name") != EXPORT_TOOL_NAME:
+        if message.get("role") != "tool" or message.get("name") not in EXPORT_DELIVERY_TOOLS:
             continue
         try:
             payload = json.loads(str(message.get("content") or ""))
