@@ -55,10 +55,13 @@ def make_handler(name):
 
 
 SCHEMAS = json.loads(Path(__file__).with_name('office_law_mcp_schemas.json').read_text())['tools']
+CONFIG = json.loads(Path(os.environ['KG_NATIVE_MCP_SETTINGS']).read_text()) if os.environ.get('KG_NATIVE_MCP_SETTINGS') else {'servers': {}}
+TIMEOUTS = {name: entry['timeout_seconds'] for entry in CONFIG['servers'].values() for name in entry['tools']}
 for schema in SCHEMAS:
     registry.register(name=schema['name'], toolset='file_read',
         schema={'name': schema['name'], 'description': schema['description'] + ' Files are authorized attachment handles or exact granted paths; returned artifacts are saved locally for read_file and delivery.', 'parameters': schema['inputSchema']},
         handler=make_handler(schema['name']),
         is_async=True,
+        execution_timeout=TIMEOUTS.get(schema['name']),
         check_fn=lambda: bool(os.environ.get('KG_NATIVE_MCP_SETTINGS') and os.environ.get('ORIGIN_PI_API_KEY')),
         description=schema['description'])
