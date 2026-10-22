@@ -217,6 +217,7 @@ RUN set -eu; \
     browser_bin="$(python3 -c 'from pm import installed_package; print(installed_package("chromium").binary)')"; \
     test -n "$browser_bin"; \
     "$browser_bin" --version; \
+    python3 -c 'import json; from pathlib import Path; stamp = json.loads(Path("/opt/hermes/install-stamp.json").read_text()); Path("/opt/hermes/.hermes_build_sha").write_text(stamp["commit"] + "\n")'; \
     mkdir -p /etc/hermes; \
     printf '%s' "$browser_bin" > /etc/hermes/agent-browser-executable-path
 
@@ -407,14 +408,19 @@ RUN mkdir -p /opt/hermes/bin && \
 # checkout) and /opt/data (the mutable HERMES_HOME volume).  Its `revision`
 # is read from the install stamp; the fallback stamp's all-zero commit maps
 # to null.
+ARG HERMES_GIT_SHA=
+ARG HERMES_BASE_VERSION=0.22.4
 RUN set -eu; \
+    if [ ! -f /opt/hermes/install-stamp.json ] && [ -n "$HERMES_GIT_SHA" ]; then \
+        /opt/hermes/.venv/bin/python scripts/write_install_stamp.py --output /opt/hermes/install-stamp.json --commit "$HERMES_GIT_SHA" --base-version "$HERMES_BASE_VERSION" --source docker --distribution docker --update-mechanism external; \
+    fi; \
     if [ ! -f /opt/hermes/install-stamp.json ]; then \
         printf '{"schemaVersion":2,"commit":"0000000000000000000000000000000000000000","distribution":"docker","source":"fallback","updateMechanism":"external"}\n' \
             > /opt/hermes/install-stamp.json; \
     fi; \
     python3 -c 'import json; from pathlib import Path; path = Path("/opt/hermes/install-stamp.json"); stamp = json.loads(path.read_text()); stamp["pmRuntime"] = "/opt/hermes/pm-runtime"; path.write_text(json.dumps(stamp) + "\n")'; \
     mkdir -p /etc/hermes; \
-    python3 -c 'import json, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    python3 -c 'import json, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": stamp.get("baseVersion") or project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
