@@ -4,12 +4,13 @@ import json
 import os
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
 from hermes_constants import get_hermes_home
 from tools.file_grants import resolve_file_grant, register_tool_result_file
-from tools.local_document_export_tool import get_trusted_export_context, publish_document_bytes
+from tools.local_document_export_tool import get_trusted_export_context, publish_document_bytes, owner_hash_for_scope, _export_root
 from tools.registry import registry
 
 
@@ -73,3 +74,38 @@ for schema in SCHEMAS:
         execution_timeout=TIMEOUTS.get(schema['name']),
         check_fn=lambda: bool(os.environ.get('KG_NATIVE_MCP_SETTINGS') and os.environ.get('ORIGIN_PI_API_KEY')),
         description=schema['description'])
+
+
+async def read_office_report(args, **kwargs):
+    context = get_trusted_export_context()
+    if not context.get('user_id') or not context.get('chat_id'):
+        return json.dumps({'error': 'Authenticated conversation context required'})
+    try:
+        path = urlsplit(args['artifact_url']).path
+        prefix, marker, tail = path.partition('/v1/artifacts/')
+        if not marker:
+            raise ValueError('Artifact URL required')
+        artifact_id = uuid.UUID(tail.split('/')[0]).hex
+        directory = _export_root() / owner_hash_for_scope(context['user_id'], context['chat_id']) / artifact_id
+        manifest = json.loads((directory / 'manifest.json').read_text())
+        owner = manifest['owner']
+        if owner['user_id'] != context['user_id'] or owner['chat_id'] != context['chat_id']:
+            raise ValueError('Conversation scope differs')
+        entry = next(item for item in manifest['artifacts'] if item['format'] == 'md')
+        filename = entry['filename']
+        if Path(filename).name != filename:
+            raise ValueError('Invalid artifact filename')
+        data = (directory / filename).read_bytes()
+        if hashlib.sha256(data).hexdigest() != entry['sha256']:
+            raise ValueError('Artifact byte identity changed')
+        return json.dumps({'success': True, 'filename': filename, 'sha256': entry['sha256'], 'text': data.decode('utf-8')}, ensure_ascii=False)
+    except (OSError, ValueError, KeyError, StopIteration):
+        return json.dumps({'error': 'Report is unavailable in this conversation; retained work was not changed'})
+
+
+registry.register(name='read_office_report', toolset='file_read',
+    schema={'name': 'read_office_report', 'description': 'Read the complete Markdown report produced by Office MCP in this conversation, including earlier turns. Pass its returned artifact URL. Ownership and byte identity are checked.',
+        'parameters': {'type': 'object', 'properties': {'artifact_url': {'type': 'string'}}, 'required': ['artifact_url']}},
+    handler=read_office_report, is_async=True,
+    check_fn=lambda: bool(os.environ.get('KG_NATIVE_MCP_SETTINGS')),
+    description='Read a saved Office MCP report in the authenticated conversation')
