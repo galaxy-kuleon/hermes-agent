@@ -326,16 +326,11 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
         owner_hash = owner_hash_for_scope(user_id, chat_id)
         artifact_id = uuid.uuid4().hex
         artifact_dir = root / owner_hash / artifact_id
-        artifact_dir.mkdir(parents=True, exist_ok=False)
+        artifact_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
 
-        debug_keep_source = os.environ.get("LOCAL_EXPORT_DEBUG_KEEP_SOURCE", "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
         source_path = artifact_dir / f"{stem}.source.md"
-        if debug_keep_source:
-            source_path.write_text(markdown, encoding="utf-8")
+        source_path.write_text(markdown, encoding="utf-8")
+        source_path.chmod(0o600)
         try:
             docx_bytes = _post_markdown_to_docx(markdown)
             validate_docx_bytes(docx_bytes)
@@ -378,7 +373,6 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
                 )
                 markdown_links.append(f"[Download {filename}]({url})")
 
-            source_path.unlink(missing_ok=True)
             manifest = {
                 "artifact_id": artifact_id,
                 "created_at": _format_utc(now),
@@ -393,7 +387,13 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
                 },
                 "source_content_sha256": source_content_sha256,
                 "source_markdown_sha256": source_markdown_sha256,
-                "artifacts": artifact_entries,
+                "artifacts": artifact_entries + [{
+                    "format": "md",
+                    "filename": source_path.name,
+                    "size": source_path.stat().st_size,
+                    "sha256": source_markdown_sha256,
+                    "public_document": False,
+                }],
             }
             _write_atomic_json(artifact_dir / "manifest.json", manifest)
             return json.dumps(
@@ -415,8 +415,6 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
                 }
             )
         except Exception as exc:
-            if not debug_keep_source:
-                shutil.rmtree(artifact_dir, ignore_errors=True)
             return _json_error(str(exc))
     except Exception as exc:
         return _json_error(str(exc))

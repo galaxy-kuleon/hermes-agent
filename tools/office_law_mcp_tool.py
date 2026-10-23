@@ -104,8 +104,8 @@ async def read_office_report(args, **kwargs):
 
 
 registry.register(name='read_office_report', toolset='file_read',
-    schema={'name': 'read_office_report', 'description': 'Read the complete Markdown report produced by Office MCP in this conversation, including earlier turns. Pass its returned artifact URL. Ownership and byte identity are checked.',
+    schema={'name': 'read_office_report', 'description': 'Read a saved Markdown report or the exact Markdown source used to generate a Word/PDF report in this conversation, including earlier turns. Pass its returned artifact URL. Ownership and byte identity are checked. Source text does not verify the rendered layout.',
         'parameters': {'type': 'object', 'properties': {'artifact_url': {'type': 'string'}}, 'required': ['artifact_url']}},
     handler=read_office_report, is_async=True,
     check_fn=lambda: bool(os.environ.get('KG_NATIVE_MCP_SETTINGS')),
-    description='Read a saved Office MCP report in the authenticated conversation')
+    description='Read a saved report or generated-document source in the authenticated conversation')
