@@ -98,7 +98,7 @@ async def read_office_report(args, **kwargs):
         data = (directory / filename).read_bytes()
         if hashlib.sha256(data).hexdigest() != entry['sha256']:
             raise ValueError('Artifact byte identity changed')
-        return json.dumps({'success': True, 'filename': filename, 'sha256': entry['sha256'], 'text': data.decode('utf-8')}, ensure_ascii=False)
+        return f"Report: {filename}\nSHA256: {entry['sha256']}\n\n" + data.decode('utf-8')
     except (OSError, ValueError, KeyError, StopIteration):
         return json.dumps({'error': 'Report is unavailable in this conversation; retained work was not changed'})
 
