@@ -108,8 +108,8 @@
     },
     {
       "name": "legal_lookup",
-      "title": "Hong Kong and Taiwan legal lookup",
-      "description": "Answer a question about Hong Kong or Taiwan law by reading official sources. Returns the answer plus citations whose quotes are audited against the fetched official text. Slow by design: expect tens of seconds to a few minutes.",
+      "title": "Mainland China, Macau, Hong Kong and Taiwan legal lookup",
+      "description": "Answer a question about the law of Mainland China, Macau, Hong Kong or Taiwan by reading official sources. Returns the answer plus citations whose quotes are audited against the fetched official text. Slow by design: expect tens of seconds to a few minutes.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -119,12 +119,7 @@
           },
           "jurisdiction": {
             "type": "string",
-            "enum": [
-              "hk",
-              "tw",
-              "both"
-            ],
-            "description": "hk = Hong Kong SAR, tw = Taiwan, both = answer each system separately"
+            "description": "One or more of cn (Mainland China), mo (Macau), hk (Hong Kong), tw (Taiwan), comma separated, for example \"cn,hk\". Aliases: all, both (hk+tw), china, mainland, macau, macao, taiwan."
           },
           "language": {
             "type": "string",
@@ -173,12 +168,7 @@
           },
           "jurisdiction": {
             "type": "string",
-            "enum": [
-              "hk",
-              "tw",
-              "both"
-            ],
-            "description": "hk = Hong Kong SAR, tw = Taiwan, both = answer each system separately"
+            "description": "One or more of cn (Mainland China), mo (Macau), hk (Hong Kong), tw (Taiwan), comma separated, for example \"cn,hk\". Aliases: all, both (hk+tw), china, mainland, macau, macao, taiwan."
           }
         },
         "required": [
