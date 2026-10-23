@@ -260,6 +260,8 @@ def _build_source_markdown(content: str, title: str) -> str:
     clean_title = str(title).strip()
     if not clean_title:
         return content
+    if content and content.splitlines()[0] == f"# {clean_title}":
+        return content
     return f"# {clean_title}\n\n{content.lstrip()}"
 
 
