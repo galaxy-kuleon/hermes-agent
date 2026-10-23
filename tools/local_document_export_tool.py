@@ -10,7 +10,6 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import tempfile
 import uuid
 import zipfile
@@ -30,7 +29,6 @@ DEFAULT_PUBLIC_BASE_URL = "http://localhost:8642"
 DEFAULT_TTL_HOURS = 24
 DEFAULT_MAX_CHARS = 500_000
 MAX_FILENAME_STEM = 80
-MAX_CLEANUP_MANIFESTS = 500
 _EXPORT_CONTEXT: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
     "hermes_local_document_export_context", default={}
 )
@@ -243,23 +241,6 @@ def _write_atomic_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def _cleanup_expired_exports(root: Path, now: datetime) -> None:
-    if not root.exists():
-        return
-    checked = 0
-    for manifest_path in root.glob("*/*/manifest.json"):
-        checked += 1
-        if checked > MAX_CLEANUP_MANIFESTS:
-            break
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            expires_at = _parse_utc(str(manifest.get("expires_at") or ""))
-        except Exception:
-            continue
-        if expires_at <= now:
-            shutil.rmtree(manifest_path.parent, ignore_errors=True)
-
-
 def _artifact_url(artifact_id: str, filename: str, expires_at: str, sig: str) -> str:
     quoted_filename = parse.quote(filename, safe="")
     expires_epoch = int(_parse_utc(expires_at).timestamp())
@@ -319,7 +300,6 @@ def local_document_export(args: dict[str, Any] | str, task_id: str | None = None
 
         root = _export_root()
         now = _utc_now()
-        _cleanup_expired_exports(root, now)
         ttl_hours = max(1, _env_int("LOCAL_EXPORT_TTL_HOURS", DEFAULT_TTL_HOURS))
         expires_at = _format_utc(now + timedelta(hours=ttl_hours))
 
