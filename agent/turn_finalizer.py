@@ -770,31 +770,23 @@ def finalize_turn(
             final_response = _delivered.get("final_response")
             _coverage_footer = _delivered.get("coverage_footer") or ""
             _coverage_snapshot = _delivered.get("attachment_coverage")
+            if _coverage_snapshot is not None:
+                logger.info(
+                    "attachment_direct_reads task_id=%s total=%s read=%s partial=%s unreadable=%s pending=%s",
+                    effective_task_id,
+                    _coverage_snapshot["total"],
+                    len(_coverage_snapshot["read"]),
+                    len(_coverage_snapshot["partial"]),
+                    len(_coverage_snapshot["unreadable"]),
+                    len(_coverage_snapshot["pending"]),
+                )
             _coverage_status = _delivered.get("coverage_status") or "skipped"
             _persistent_body = _delivered.get("persistent_assistant_body")
             if _persistent_body is None:
                 _persistent_body = final_response
         except Exception as _cov_err:
             logger.warning("attachment coverage finalizer failed: %s", _cov_err)
-            try:
-                from tools.attachment_ledger import (
-                    COVERAGE_UNAVAILABLE_TEXT,
-                    is_active as _cov_is_active,
-                )
-
-                # Fail closed for ANY terminal path including interrupted.
-                if _cov_is_active(effective_task_id):
-                    _coverage_footer = COVERAGE_UNAVAILABLE_TEXT
-                    text = final_response or ""
-                    final_response = (
-                        (text.rstrip() + "\n" + _coverage_footer)
-                        if text
-                        else _coverage_footer
-                    )
-                    _coverage_status = "unavailable"
-                    _persistent_body = final_response
-            except Exception:
-                pass
+            _coverage_status = "unavailable"
 
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)

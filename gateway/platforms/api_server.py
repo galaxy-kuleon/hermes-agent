@@ -1129,60 +1129,21 @@ def _merge_api_system_prompts(configured: Any, request_prompt: Any) -> str:
 def emit_chat_completion_coverage_suffix(
     result: dict | None, emitted_coverage_footer: str | None = None
 ) -> str:
-    """Production adapter: coverage text for chat-completions SSE terminal.
+    from tools.attachment_ledger import terminal_coverage_suffix
 
-    Mutation target (U1D all-exit gate): tests must call this function; replacing
-    its body with ``return ""`` must red application-boundary harness.
-    """
-    from tools.attachment_ledger import (
-        COVERAGE_INTERRUPTED_NOTE,
-        COVERAGE_UNAVAILABLE_TEXT,
-        terminal_coverage_suffix,
-    )
-
-    if not isinstance(result, dict):
-        # The agent task raised or was interrupted, so there is no result to
-        # read coverage from. Silence here reads as "nothing was missed", which
-        # is the one thing this turn cannot claim: an interrupted audit is
-        # exactly when the reader most needs to know how far it got. Say we do
-        # not know instead.
-        return (
-            "\n"
-            + COVERAGE_UNAVAILABLE_TEXT.rstrip()
-            + "\n"
-            + COVERAGE_INTERRUPTED_NOTE
-        )
     return terminal_coverage_suffix(
         result, emitted_coverage_footer=emitted_coverage_footer
-    ) or ""
+    )
 
 
 def emit_responses_coverage_suffix(
     result: dict | None, emitted_coverage_footer: str | None = None
 ) -> str:
-    """Production adapter: coverage text for Responses SSE terminal.
+    from tools.attachment_ledger import terminal_coverage_suffix
 
-    Mutation target: same as emit_chat_completion_coverage_suffix.
-    """
-    from tools.attachment_ledger import (
-        COVERAGE_INTERRUPTED_NOTE,
-        COVERAGE_UNAVAILABLE_TEXT,
-        terminal_coverage_suffix,
-    )
-
-    if not isinstance(result, dict):
-        # Same all-exit reason as the chat-completions adapter: no result means
-        # the turn ended by exception or interruption, and staying silent would
-        # let that read as complete coverage.
-        return (
-            "\n"
-            + COVERAGE_UNAVAILABLE_TEXT.rstrip()
-            + "\n"
-            + COVERAGE_INTERRUPTED_NOTE
-        )
     return terminal_coverage_suffix(
         result, emitted_coverage_footer=emitted_coverage_footer
-    ) or ""
+    )
 
 
 _LEGAL_DOCX_PUBLISH_TOOL = "mcp__legal_docx__publish"

@@ -600,13 +600,6 @@ def finalize_attachment_coverage(
     interrupted: bool = False,
     fail_closed: bool = True,
 ) -> tuple[str | None, dict[str, Any]]:
-    """Last-step coverage gate (must run after plugins / explainers).
-
-    **Interrupted turns still get coverage** (U1D batch-1): interrupt is when
-    the user most needs to know what was / was not read — not a reason to omit.
-
-    Returns ``(response_text, meta)`` with footer / snapshot / status.
-    """
     meta: dict[str, Any] = {
         "footer": "",
         "snapshot": None,
@@ -616,54 +609,16 @@ def finalize_attachment_coverage(
     if not is_active(task_id):
         return final_response, meta
 
-    text = final_response if final_response is not None else ""
     try:
         from tools.file_grants import list_file_handles
 
         handles = list(list_file_handles(task_id) or [])
+        meta["snapshot"] = coverage_snapshot(handles, task_id=task_id)
+        meta["snapshot"]["scope"] = "direct_reader_extents"
+        meta["status"] = "observed_direct_reads"
     except Exception:
-        if fail_closed:
-            footer = COVERAGE_UNAVAILABLE_TEXT
-            if interrupted:
-                footer = footer.rstrip() + "\n" + COVERAGE_INTERRUPTED_NOTE
-            # This is the one authoritative finalizer call. Model prose that
-            # happens to contain a coverage heading is not proof that this
-            # mechanism-produced footer was appended.
-            text = (text.rstrip() + "\n" + footer) if text else footer
-            meta.update(footer=footer, status="unavailable")
-            return text, meta
-        return final_response, meta
-
-    if not handles:
-        meta["status"] = "complete"
-        return final_response, meta
-
-    try:
-        snap = coverage_snapshot(handles, task_id=task_id)
-        meta["snapshot"] = snap
-        footer = build_coverage_footer(
-            handles, task_id=task_id, interrupted=bool(interrupted)
-        )
-    except Exception:
-        if fail_closed:
-            footer = COVERAGE_UNAVAILABLE_TEXT
-            if interrupted:
-                footer = footer.rstrip() + "\n" + COVERAGE_INTERRUPTED_NOTE
-            # This is the one authoritative finalizer call. Model prose that
-            # happens to contain a coverage heading is not proof that this
-            # mechanism-produced footer was appended.
-            text = (text.rstrip() + "\n" + footer) if text else footer
-            meta.update(footer=footer, status="unavailable")
-            return text, meta
-        return final_response, meta
-
-    if not footer:
-        meta["status"] = "complete"
-        return final_response, meta
-
-    text = (text.rstrip() + "\n" + footer) if text else footer
-    meta.update(footer=footer, status="ok")
-    return text, meta
+        meta["status"] = "unavailable"
+    return final_response, meta
 
 
 def terminal_coverage_suffix(
@@ -671,19 +626,7 @@ def terminal_coverage_suffix(
     *,
     emitted_coverage_footer: str | None = None,
 ) -> str:
-    """Return the structured footer unless this exact footer was emitted.
-
-    ``emitted_coverage_footer`` is provenance supplied by the writer after a
-    successful mechanism-owned write. Arbitrary model text is never inspected.
-    """
-    if not isinstance(result, dict):
-        return ""
-    footer = result.get("coverage_footer") or ""
-    if not isinstance(footer, str) or not footer.strip():
-        return ""
-    if emitted_coverage_footer == footer:
-        return ""
-    return footer if footer.startswith("\n") else "\n" + footer.lstrip("\n")
+    return ""
 
 
 def deliver_coverage_to_persistent_body(
@@ -696,49 +639,22 @@ def deliver_coverage_to_persistent_body(
     failed: bool = False,
     fail_closed: bool = True,
 ) -> dict[str, Any]:
-    """Single production adapter: finalize coverage → persistent assistant body.
-
-    Used by:
-      * turn_finalizer (always, including interrupted)
-      * chat-completions streaming terminal (before stop/[DONE])
-      * Responses streaming terminal
-      * non-stream JSON responses (body = final_response)
-
-    Returns dict with final_response, coverage_footer, coverage_status,
-    stream_suffix, persistent_assistant_body (A-channel truth for DB/reload).
-
-    Mutation target: production must call this by name (DELIVER_COVERAGE_FN);
-    replacing it with identity that omits footer must red boundary tests.
-    """
     text, meta = finalize_attachment_coverage(
         final_response,
         task_id=task_id,
         interrupted=bool(interrupted),
         fail_closed=fail_closed,
     )
-    footer = (meta or {}).get("footer") or ""
-    status = (meta or {}).get("status") or "skipped"
-    result = {
+    return {
         "final_response": text,
-        "coverage_footer": footer,
-        "attachment_coverage": (meta or {}).get("snapshot"),
-        "coverage_status": status,
+        "coverage_footer": "",
+        "attachment_coverage": meta.get("snapshot"),
+        "coverage_status": meta.get("status", "skipped"),
         "interrupted": bool(interrupted),
         "failed": bool(failed),
+        "stream_suffix": "",
+        "persistent_assistant_body": text if text is not None else "",
     }
-    if stream:
-        suffix = terminal_coverage_suffix(result)
-        result["stream_suffix"] = suffix
-        # Persistent body: prefer full final_response (includes footer);
-        # if model streamed partial text without footer, body is still final_response.
-        persistent = text if text is not None else ""
-        if not persistent and suffix:
-            persistent = (streamed_text or "") + suffix
-        result["persistent_assistant_body"] = persistent
-    else:
-        result["stream_suffix"] = ""
-        result["persistent_assistant_body"] = text if text is not None else ""
-    return result
 
 
 __all__ = [
